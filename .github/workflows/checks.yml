@@ -29,7 +29,11 @@ jobs:
       - name: Local CLI contracts
         run: cargo +1.98.0 test --locked -p melissa-cli
       - name: Repository and recovery regressions
-        run: cargo +1.98.0 test --locked -p melissa-repository --lib --test repository_contracts --test read_error_observations -p melissa-recovery --test real_effects --test resume
+        run: cargo +1.98.0 test --locked -p melissa-repository --lib --test repository_contracts --test read_error_observations --test incremental_parse -p melissa-recovery --test real_effects --test resume
+      - name: Native process fixture
+        run: cargo +1.98.0 build --locked -p melissa-windows-executor --bins
+      - name: Bounded host processes and admission
+        run: cargo +1.98.0 test --locked -p melissa-windows-executor --test host_capture -p melissa-execution-broker --test broker_integration
   portable-tests:
     # Test targets that need neither the Windows handle-pinned filesystem nor
     # Docker Desktop; without this job their crates are only compiled in CI.
@@ -47,7 +51,9 @@ jobs:
       - name: Workflow tests
         run: cargo +1.98.0 test --locked -p melissa-workflow --test attenuation --test comparison --test coordinator --test serial_tools --test shared_ledger --test complete_native_race
       - name: Skill context tests
-        run: cargo +1.98.0 test --locked -p melissa-skill-context --test package_runtime --test context_state --test retrieval --test registry_versions
+        run: cargo +1.98.0 test --locked -p melissa-skill-context --test package_runtime --test context_state --test retrieval --test registry_versions --test incremental_context
+      - name: Native context and protocol contracts
+        run: cargo +1.98.0 test --locked -p melissa-model-gateway --lib --test context_compiler --test history_bounds --test reviewed_origin_policy --test agent_loop --test anthropic_protocol --test openai_protocol
       - name: Build-test unit tests
         run: cargo +1.98.0 test --locked -p melissa-build-test --lib
       - name: Web development protocol tests
