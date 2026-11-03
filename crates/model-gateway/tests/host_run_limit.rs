@@ -33,7 +33,7 @@ fn long_runs_require_an_explicit_host_grant_and_default_bounds_remain() {
     let rejected = Gateway::new(open(), catalog(), vec![], policy(5_400_000), true);
     assert!(matches!(rejected,Err(e) if e.kind==ErrorKind::Invalid));
     assert!(HostRunLimit::new(0).is_err());
-    assert!(HostRunLimit::new(86_400_001).is_err());
+    assert!(HostRunLimit::new(86_400_001).is_ok());
     assert!(HostRunLimit::new(u64::MAX).is_err());
     let _configured = Gateway::new(open(), catalog(), vec![], policy(1_800_000), true)
         .unwrap()

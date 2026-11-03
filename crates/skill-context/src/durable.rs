@@ -1,10 +1,11 @@
 //! Quota/ownership-aware encrypted Journal continuation, shared by native Gateway.
 use crate::{Namespace, Result, digest, json, require};
 use melissa_core_contracts::{TaskState, design::SkillPin};
-use melissa_local_store::{ArtifactRequest, LocalStore, StoreError};
+use melissa_local_store::{ArtifactRequest, LocalStore, StoreError, journal::ModelRequestState};
 use melissa_model_gateway::{
     ErrorKind, GatewayError,
-    continuation::{ContinuationStore, Phase, TurnCheckpoint},
+    continuation::{ContinuationStore, Phase, TurnCheckpoint, TurnCheckpointView},
+    transcript::{Manifest, MessageLog},
 };
 use serde::{Deserialize, Serialize};
 use std::sync::{
@@ -29,6 +30,8 @@ struct Envelope {
     freshness: Freshness,
     charged_cost: u64,
     known_requests: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transcript: Option<Manifest>,
 }
 pub struct JournalContinuation {
     task: String,
@@ -36,6 +39,7 @@ pub struct JournalContinuation {
     sequence: u64,
     refresh: Box<dyn Fn() -> Result<Freshness> + Send>,
     cancelled: Arc<AtomicBool>,
+    messages: MessageLog,
 }
 impl JournalContinuation {
     pub fn new(
@@ -50,9 +54,10 @@ impl JournalContinuation {
             sequence: 0,
             refresh,
             cancelled,
+            messages: MessageLog::default(),
         }
     }
-    fn current(&self, store: &LocalStore) -> Result<(Freshness, u64, u64)> {
+    fn current(&self, store: &LocalStore, pending: Option<&str>) -> Result<(Freshness, u64, u64)> {
         require(
             !self.cancelled.load(Ordering::Acquire),
             "continuation cancelled or authority revoked",
@@ -77,9 +82,20 @@ impl JournalContinuation {
         )?;
         let b = store.journal().model_budget(&self.task)?;
         require(
-            b.active_requests == 0 && b.unknown_requests == 0 && !b.budget_exceeded,
+            b.active_requests == u64::from(pending.is_some())
+                && b.unknown_requests == 0
+                && !b.budget_exceeded,
             "unsettled model ledger blocks continuation",
         )?;
+        if let Some(id) = pending {
+            let request = store.journal().model_request(id)?;
+            require(
+                request.reservation.task_id == self.task
+                    && request.state == ModelRequestState::Reserved
+                    && request.dispatched_at_unix_ms.is_none(),
+                "pending checkpoint requires its exact never-dispatched reservation",
+            )?;
+        }
         let f = (self.refresh)()?;
         f.namespace.validate()?;
         require(
@@ -111,29 +127,32 @@ impl ContinuationStore for JournalContinuation {
                 task == self.task && run == self.run,
                 "continuation host identity mismatch",
             )?;
-            let (fresh, cost, requests) = self.current(store)?;
+            let (fresh, cost, requests) = self.current(store, None)?;
             match store.artifact_metadata(task, &format!("model-run:{run}:result")) {
                 Ok(_) => return Err(crate::Error("terminal run cannot be replayed".into())),
                 Err(StoreError::NotFound(_)) => {}
                 Err(e) => return Err(e.into()),
             }
+            let (sequence, checkpoint) = store
+                .journal()
+                .latest_checkpoint_in_series(task, &format!("gateway-cp:{run}:"))?;
+            self.sequence = sequence;
             let mut latest = None;
-            loop {
-                match store.journal().checkpoint(&self.cp(self.sequence), task) {
-                    Ok(c) => {
-                        let bytes = store.get_artifact(task, &c.artifact_id)?;
-                        require(
-                            c.data["digest"].as_str() == Some(digest(&bytes).as_str()),
-                            "checkpoint index/content mismatch",
-                        )?;
-                        latest = Some(json::<Envelope>(&bytes)?);
-                        self.sequence += 1;
-                    }
-                    Err(StoreError::NotFound(_)) => break,
-                    Err(e) => return Err(e.into()),
-                }
+            if let Some(c) = checkpoint {
+                let bytes = store.get_artifact(task, &c.artifact_id)?;
+                require(
+                    c.data["digest"].as_str() == Some(digest(&bytes).as_str()),
+                    "checkpoint index/content mismatch",
+                )?;
+                latest = Some(json::<Envelope>(&bytes)?);
             }
-            if let Some(e) = latest {
+            if let Some(mut e) = latest {
+                if let Some(manifest) = &e.transcript {
+                    require(e.state.messages.is_empty(), "ambiguous native transcript")?;
+                    e.state.messages = MessageLog::restore(store, task, run, manifest)
+                        .map_err(|e| crate::Error(e.to_string()))?;
+                    self.messages.adopt(manifest);
+                }
                 require(
                     e.state.binding_digest == binding
                         && e.freshness == fresh
@@ -169,10 +188,19 @@ impl ContinuationStore for JournalContinuation {
         store: &mut LocalStore,
         state: &TurnCheckpoint,
     ) -> melissa_model_gateway::Result<()> {
+        self.publish_view(store, &TurnCheckpointView::from(state))
+    }
+    fn publish_view(
+        &mut self,
+        store: &mut LocalStore,
+        state: &TurnCheckpointView<'_>,
+    ) -> melissa_model_gateway::Result<()> {
         (||->Result<()>{
-            let(fresh,cost,requests)=self.current(store)?;
+            let pending = (state.phase == Phase::InferencePending).then(|| format!("model:{}:{}", self.run, state.result.request_ids.len() + 1));
+            let(fresh,cost,requests)=self.current(store, pending.as_deref())?;
             require(state.result.task_id==self.task&&state.result.run_id==self.run,"checkpoint task mismatch")?;
-            let e=Envelope{state:state.clone(),freshness:fresh,charged_cost:cost,known_requests:requests};let bytes=serde_json::to_vec(&e)?;
+            let transcript = self.messages.save(store, &self.task, &self.run, state.messages).map_err(|e|crate::Error(e.to_string()))?;
+            let e=Envelope{state:state.metadata(),transcript:Some(transcript),freshness:fresh,charged_cost:cost,known_requests:requests};let bytes=serde_json::to_vec(&e)?;
             let id=self.cp(self.sequence);let artifact=format!("{id}:artifact");
             let meta=store.put_artifact(&ArtifactRequest{artifact_id:artifact.clone(),task_id:self.task.clone(),content_type:"application/json".into(),logical_type:"gateway.native_continuation".into(),schema_version:"melissa.gateway-continuation/v1".into(),retain_until_ms:0,legal_hold:false},&bytes)?;
             let v=store.journal().task(&self.task)?.record.version;

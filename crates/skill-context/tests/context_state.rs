@@ -42,6 +42,51 @@ fn request() -> PackRequest {
         skills: vec![],
     }
 }
+
+#[test]
+fn oversized_checkpoint_cannot_publish_a_record_that_restore_rejects() {
+    let dir = tempfile::tempdir().unwrap();
+    let cas = Cas::open(
+        dir.path(),
+        StoreKey::from_bytes([206; 32]),
+        64 * 1024 * 1024,
+    )
+    .unwrap();
+    let good = save(&cas, &"previous checkpoint").unwrap();
+    let before = cas.list().unwrap().len();
+    // Escaping expands JSON; checking raw string length alone is insufficient.
+    let oversized = "\n".repeat(MAX_STATE_BYTES / 2);
+    assert!(save(&cas, &oversized).is_err());
+    assert_eq!(cas.list().unwrap().len(), before);
+    assert_eq!(
+        restore::<String>(&cas, &good).unwrap(),
+        "previous checkpoint"
+    );
+}
+
+#[test]
+fn memory_proposals_reject_duplicate_and_oversized_sources_before_mutation() {
+    let s = source("src/a.rs", "evidence");
+    let mut book = MemoryBook::default();
+    assert!(validate_memory_sources([&s, &s]).is_err());
+    assert!(
+        book.propose("m", namespace(), "key", "claim", vec![s.clone(), s.clone()])
+            .is_err()
+    );
+    assert!(book.records().is_empty());
+    let big = source("src/b.rs", &"x".repeat(MAX_MEMORY_SOURCE_BYTES));
+    assert!(validate_memory_sources([&big]).is_ok());
+    assert!(validate_memory_sources([&big, &s]).is_err());
+    let many: Vec<_> = (0..=MAX_MEMORY_SOURCES)
+        .map(|i| source(&format!("src/{i}"), ""))
+        .collect();
+    assert!(validate_memory_sources(&many).is_err());
+    assert!(
+        book.propose("m", namespace(), "key", "claim", vec![s])
+            .is_ok()
+    );
+    assert_eq!(book.records().len(), 1);
+}
 fn checkpoint() -> (Checkpoint, ResumeState, Registry, SkillPolicy) {
     let (reg, policy, pins) = setup();
     let mut r = request();
@@ -294,6 +339,35 @@ fn model_memory_is_a_proposal_until_an_explicit_fresh_host_review() {
     assert_eq!(b.search(&sc, "answer").len(), 1);
 }
 #[test]
+fn renewed_observation_keeps_review_digest_but_changed_content_still_blocks_acceptance() {
+    let mut src = source("s", "fact");
+    let mut book = MemoryBook::default();
+    let expected = book
+        .propose("m", namespace(), "k", "claim", vec![src.clone()])
+        .unwrap();
+    src.observed_at_ms = 5;
+    src.valid_until_ms = 200;
+    book.revalidate(&namespace(), &[src.clone()]);
+    let mut changed = book.clone();
+    book.review(
+        "m",
+        &expected,
+        &scope(&[src.clone()]),
+        true,
+        "e",
+        &BTreeSet::new(),
+    )
+    .unwrap();
+    src.content = "different fact".into();
+    src.digest = digest(src.content.as_bytes());
+    changed.revalidate(&namespace(), &[src.clone()]);
+    assert!(
+        changed
+            .review("m", &expected, &scope(&[src]), true, "e", &BTreeSet::new())
+            .is_err()
+    );
+}
+#[test]
 fn stale_cross_project_and_engagement_memory_never_become_verified_facts() {
     let src = source("s", "fact");
     let sc = scope(std::slice::from_ref(&src));
@@ -373,6 +447,33 @@ fn admission() -> CacheAdmission {
         deterministic_readonly: true,
         cancelled: false,
     }
+}
+#[test]
+fn cache_evicts_old_entries_and_oversized_results_do_not_poison_persistence() {
+    let mut cache = Cache::default();
+    let first = key(CacheKind::Retrieval);
+    cache
+        .put(first.clone(), vec![255; 256 * 1024], 1, 1000, &admission())
+        .unwrap();
+    for i in 2..10 {
+        let mut k = first.clone();
+        k.input_digest = digest(format!("{i}").as_bytes());
+        cache
+            .put(k, vec![255; 256 * 1024], i, 1000, &admission())
+            .unwrap();
+    }
+    assert!(cache.get(&first, 10, &admission()).unwrap().is_none());
+    assert!(encode_state(&cache).unwrap().len() < 4 * 1024 * 1024);
+    cache
+        .put(
+            first.clone(),
+            vec![255; 4 * 1024 * 1024],
+            10,
+            1000,
+            &admission(),
+        )
+        .unwrap();
+    assert!(cache.get(&first, 11, &admission()).unwrap().is_none());
 }
 #[test]
 fn all_seven_cache_types_bind_sources_and_every_execution_dependency() {

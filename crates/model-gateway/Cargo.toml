@@ -20,6 +20,7 @@ tokio.workspace = true
 futures-util.workspace = true
 url.workspace = true
 jsonschema.workspace = true
+tokenizers = { version = "=0.22.2", default-features = false, features = ["onig"] }
 
 [dev-dependencies]
 tempfile.workspace = true

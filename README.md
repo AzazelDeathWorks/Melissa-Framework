@@ -29,6 +29,8 @@ hazırlayın; anahtarınızı ortam değişkeninde veya proje dışındaki özel
 
 Rust ve Cargo gerekir. İşletim sistemi ve izole çalışma ortamına bağlı testlerin ek gereksinimleri vardır. Başlangıç kontrolleri:
 
+İzole test ortamını hazırlamak için [worker imajı ve yardımcı program kurulumu](scripts/toolchains/README.md) belgesini kullanın.
+
 ```text
 cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets

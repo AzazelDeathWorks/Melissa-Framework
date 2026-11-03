@@ -113,7 +113,7 @@ impl Repository {
         ];
         excluded.extend(excluded_prefixes);
         Ok(Self {
-            root: paths::pin(root, true, false)?,
+            root: paths::pin_root(root)?,
             limits,
             excluded,
             package_capture: false,
@@ -142,7 +142,7 @@ impl Repository {
     pub fn open_for_git(root: &Path, limits: Limits) -> Result<Self> {
         limits.validate()?;
         Ok(Self {
-            root: paths::pin(root, true, false)?,
+            root: paths::pin_root(root)?,
             limits,
             excluded: vec![".git".into()],
             package_capture: false,
@@ -154,7 +154,7 @@ impl Repository {
     pub fn open_for_package(root: &Path, limits: Limits) -> Result<Self> {
         limits.validate()?;
         Ok(Self {
-            root: paths::pin(root, true, false)?,
+            root: paths::pin_root(root)?,
             limits,
             excluded: vec![],
             package_capture: true,
@@ -172,6 +172,11 @@ impl Repository {
         if path.split('/').any(|s| s.eq_ignore_ascii_case(".git")) {
             return Err(Error::Denied("Git metadata is outside file capability"));
         }
+        if self.excluded.iter().any(|p| paths::beneath(path, p)) {
+            return Err(Error::Denied(
+                "path is outside repository source visibility",
+            ));
+        }
         Ok(())
     }
     pub(crate) fn lock(&self, path: &str, write: bool) -> Result<Pinned> {
@@ -187,6 +192,7 @@ impl Repository {
         pin: &mut Pinned,
         path: &str,
     ) -> Result<(FileVersion, Vec<u8>)> {
+        self.check_path(path)?;
         if pin.file.metadata()?.len() > self.limits.max_file_bytes {
             return Err(Error::Quota("file bytes"));
         }
@@ -309,6 +315,9 @@ impl Repository {
         cancel: &AtomicBool,
     ) -> Result<WorkerInput> {
         self.validate_snapshot(source, cancel)?;
+        melissa_container_executor::Snapshot::preflight(
+            source.files.iter().map(|f| (f.path.as_str(), f.bytes)), self.limits.max_total_bytes,
+        ).map_err(|_| Error::Quota("worker transfer preflight: file count, bytes, reserved path or ustar path capacity"))?;
         let mut files = std::collections::BTreeMap::new();
         for f in &source.files {
             check_cancel(cancel)?;
@@ -341,25 +350,32 @@ impl Repository {
         self.validate_snapshot(snapshot, cancel)?;
         let mut hits = Vec::new();
         let mut truncated = false;
+        // Linear-time substring search; comparing every window cost
+        // file size x needle length (up to 64 KiB) with no cancel point.
+        let finder = memchr::memmem::Finder::new(needle);
         for observed in &snapshot.files {
             check_cancel(cancel)?;
             let (version, bytes) = self.read(&observed.path)?;
             if version != *observed {
                 return Err(Error::Stale("search file changed"));
             }
-            for (pos, w) in bytes.windows(needle.len()).enumerate() {
-                if w == needle {
-                    if hits.len() == self.limits.max_search_hits {
-                        truncated = true;
-                        break;
-                    }
-                    hits.push(SearchHit {
-                        path: version.path.clone(),
-                        digest: version.digest.clone(),
-                        byte_offset: pos,
-                        line: bytes[..pos].iter().filter(|b| **b == b'\n').count() + 1,
-                    });
+            let (mut start, mut line, mut counted) = (0, 1, 0);
+            // Restart one byte past each hit so overlapping matches are kept.
+            while let Some(pos) = find_chunked(&bytes, start, &finder, needle.len(), cancel)? {
+                check_cancel(cancel)?;
+                if hits.len() == self.limits.max_search_hits {
+                    truncated = true;
+                    break;
                 }
+                line += memchr::memchr_iter(b'\n', &bytes[counted..pos]).count();
+                counted = pos;
+                hits.push(SearchHit {
+                    path: version.path.clone(),
+                    digest: version.digest.clone(),
+                    byte_offset: pos,
+                    line,
+                });
+                start = pos + 1;
             }
             if truncated {
                 break;
@@ -370,5 +386,62 @@ impl Repository {
             truncated,
             snapshot_digest: snapshot.digest.clone(),
         })
+    }
+}
+
+fn find_chunked(
+    bytes: &[u8],
+    start: usize,
+    finder: &memchr::memmem::Finder<'_>,
+    needle_len: usize,
+    cancel: &AtomicBool,
+) -> Result<Option<usize>> {
+    let mut cursor = start;
+    while cursor < bytes.len() {
+        check_cancel(cancel)?;
+        let end = bytes
+            .len()
+            .min(cursor.saturating_add(256 * 1024 + needle_len - 1));
+        if let Some(found) = finder.find(&bytes[cursor..end]) {
+            return Ok(Some(cursor + found));
+        }
+        if end == bytes.len() {
+            break;
+        }
+        cursor += 256 * 1024;
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+    #[test]
+    fn chunk_boundaries_overlaps_and_cancellation_preserve_literal_search() {
+        let cancel = AtomicBool::new(false);
+        let finder = memchr::memmem::Finder::new(b"aaa");
+        assert_eq!(
+            find_chunked(b"aaaa", 0, &finder, 3, &cancel).unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            find_chunked(b"aaaa", 1, &finder, 3, &cancel).unwrap(),
+            Some(1)
+        );
+        let mut bytes = vec![b'x'; 600_000];
+        bytes[262_143..262_146].copy_from_slice(b"aaa");
+        assert_eq!(
+            find_chunked(&bytes, 0, &finder, 3, &cancel).unwrap(),
+            Some(262_143)
+        );
+        assert_eq!(
+            find_chunked(&bytes, 262_144, &finder, 3, &cancel).unwrap(),
+            None
+        );
+        cancel.store(true, std::sync::atomic::Ordering::Release);
+        assert!(matches!(
+            find_chunked(&bytes, 0, &finder, 3, &cancel),
+            Err(Error::Cancelled)
+        ));
     }
 }

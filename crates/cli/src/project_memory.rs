@@ -17,7 +17,7 @@ use melissa_skill_context::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::atomic::AtomicBool,
 };
@@ -61,6 +61,14 @@ pub struct ProjectMemory {
     sequence: u64,
     pub book: MemoryBook,
     before: String,
+    record_refs: BTreeMap<String, String>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryManifest {
+    schema_version: String,
+    namespace: Namespace,
+    records: BTreeMap<String, String>,
 }
 fn review_digest(book: &MemoryBook) -> Result<String> {
     let mut value = serde_json::to_value(book).map_err(|_| Error::Store)?;
@@ -88,7 +96,8 @@ impl ProjectMemory {
         if store_dir.exists() && !store_dir.join("store.sqlite3").is_file() {
             return Err(Error::Store);
         }
-        let mut store = LocalStore::open(&store_dir, key, StoreConfig::default())?;
+        let mut store = LocalStore::open(&store_dir, key, StoreConfig::default())?
+            .with_pinned_cas_inventory()?;
         let owner = format!("project-memory:{id}");
         match store.journal().task(&owner) {
             Ok(t) if t.contract.workspace_ref != ns.project => return Err(Error::Store),
@@ -108,22 +117,48 @@ impl ProjectMemory {
             Err(e) => return Err(e.into()),
         }
         let mut book = MemoryBook::default();
-        let mut sequence = 0;
-        loop {
-            match store
-                .journal()
-                .checkpoint(&format!("project-book:{sequence}"), &owner)
-            {
-                Ok(cp) => {
-                    let raw = store.get_artifact(&owner, &cp.artifact_id)?;
-                    if cp.data["digest"] != digest(&raw) || cp.data["namespace"] != json!(ns) {
+        let mut record_refs = BTreeMap::new();
+        let (sequence, latest) = store
+            .journal()
+            .latest_checkpoint_in_series(&owner, "project-book:")?;
+        if let Some(cp) = latest {
+            let raw = store.get_artifact(&owner, &cp.artifact_id)?;
+            if cp.data["digest"] != digest(&raw) || cp.data["namespace"] != json!(ns) {
+                return Err(Error::Store);
+            }
+            let value: Value = decode(&raw)?;
+            if value.get("schema_version").is_some() {
+                let manifest: MemoryManifest = decode(&raw)?;
+                if manifest.schema_version != "melissa.project-memory-manifest/v1"
+                    || manifest.namespace != ns
+                {
+                    return Err(Error::Store);
+                }
+                let mut records = serde_json::Map::new();
+                let mut total = 0usize;
+                for (id, reference) in &manifest.records {
+                    if !reference.starts_with("project-record:") {
                         return Err(Error::Store);
                     }
-                    book = decode(&raw)?;
-                    sequence += 1;
+                    let raw_record = store.get_artifact(&owner, reference)?;
+                    total = total.checked_add(raw_record.len()).ok_or(Error::Store)?;
+                    if total > melissa_skill_context::MAX_STATE_BYTES
+                        || reference
+                            != &format!("project-record:{}", blake3::hash(&raw_record).to_hex())
+                    {
+                        return Err(Error::Store);
+                    }
+                    let record: Value = decode(&raw_record)?;
+                    if record["id"] != *id {
+                        return Err(Error::Store);
+                    }
+                    records.insert(id.clone(), record);
                 }
-                Err(StoreError::NotFound(_)) => break,
-                Err(e) => return Err(e.into()),
+                book =
+                    serde_json::from_value(json!({"records":records})).map_err(|_| Error::Store)?;
+                record_refs = manifest.records;
+            } else {
+                book = decode(&raw)?;
             }
         }
         if book.records().values().any(|r| r.namespace != ns) {
@@ -141,11 +176,10 @@ impl ProjectMemory {
             sequence,
             book,
             before,
+            record_refs,
         })
     }
     pub fn save(&mut self, ns: &Namespace) -> Result {
-        let raw = bytes(&self.book)?;
-        let hash = digest(&raw);
         let review_hash = review_digest(&self.book)?;
         if review_hash == self.before {
             return Ok(());
@@ -153,6 +187,47 @@ impl ProjectMemory {
         if self.book.records().values().any(|r| &r.namespace != ns) {
             return Err(Error::Store);
         }
+        // Validate the reconstructed book envelope before publishing any part.
+        melissa_skill_context::encode_state(&self.book).map_err(|_| Error::Store)?;
+        let mut refs = BTreeMap::new();
+        for (id, record) in self.book.records() {
+            let mut value = serde_json::to_value(record).map_err(|_| Error::Store)?;
+            // Freshness is re-observed from current sources, not trusted from
+            // persisted timestamps. Keep unchanged record objects reusable.
+            for source in value["sources"].as_array_mut().ok_or(Error::Store)? {
+                source["observed_at_ms"] = json!(0);
+                source["valid_until_ms"] = json!(0);
+            }
+            let bytes = melissa_skill_context::encode_state(&value).map_err(|_| Error::Store)?;
+            let reference = format!("project-record:{}", blake3::hash(&bytes).to_hex());
+            if self.record_refs.get(id) != Some(&reference) {
+                match self.store.artifact_metadata(&self.owner, &reference) {
+                    Ok(_) => {
+                        if self.store.get_artifact(&self.owner, &reference)? != bytes {
+                            return Err(Error::Store);
+                        }
+                    }
+                    Err(StoreError::NotFound(_)) => crate::app::put(
+                        &mut self.store,
+                        &self.owner,
+                        &reference,
+                        "memory.record",
+                        &bytes,
+                    )?,
+                    Err(e) => return Err(e.into()),
+                }
+                self.store
+                    .pin_artifact(&self.owner, &reference, "project-memory:records")?;
+            }
+            refs.insert(id.clone(), reference);
+        }
+        let raw = melissa_skill_context::encode_state(&MemoryManifest {
+            schema_version: "melissa.project-memory-manifest/v1".into(),
+            namespace: ns.clone(),
+            records: refs.clone(),
+        })
+        .map_err(|_| Error::Store)?;
+        let hash = digest(&raw);
         let id = format!("project-book:{}", self.sequence);
         let artifact = format!("{id}:bytes");
         crate::app::put(
@@ -172,6 +247,7 @@ impl ProjectMemory {
         )?;
         self.sequence += 1;
         self.before = review_hash;
+        self.record_refs = refs;
         Ok(())
     }
 }
@@ -259,4 +335,64 @@ impl App {
 pub struct Location {
     pub home: PathBuf,
     pub key: StoreKey,
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_reuses_unchanged_records_and_reopens_latest_book_without_auto_acceptance() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("source");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("main.py"), "value = 1\n").unwrap();
+        let repo = Repository::open(&root, Limits::default(), vec![]).unwrap();
+        let home = temp.path().join("home");
+        let key = StoreKey::from_bytes([213; 32]);
+        let ns = namespace(&repo);
+        let mut memory = ProjectMemory::open(&home, key.clone(), &repo).unwrap();
+        let current = sources(&repo).unwrap();
+        memory
+            .book
+            .propose("first", ns.clone(), "value", "one", current.clone())
+            .unwrap();
+        memory.save(&ns).unwrap();
+        let original_ref = memory.record_refs["first"].clone();
+        let sequence = memory.sequence;
+        memory.save(&ns).unwrap();
+        assert_eq!(memory.sequence, sequence);
+        memory
+            .book
+            .propose("second", ns.clone(), "format", "python", current)
+            .unwrap();
+        memory.save(&ns).unwrap();
+        assert_eq!(memory.record_refs["first"], original_ref);
+        let manifest_count = memory.sequence;
+        drop(memory);
+        let mut memory = ProjectMemory::open(&home, key.clone(), &repo).unwrap();
+        assert_eq!(memory.sequence, manifest_count);
+        assert_eq!(memory.book.records().len(), 2);
+        assert!(
+            memory
+                .book
+                .records()
+                .values()
+                .all(|r| r.status == melissa_skill_context::state::MemoryStatus::Proposed)
+        );
+        memory.save(&ns).unwrap();
+        assert_eq!(memory.sequence, manifest_count);
+        memory.book.delete(&ns, "second").unwrap();
+        memory.save(&ns).unwrap();
+        assert_eq!(memory.record_refs["first"], original_ref);
+        drop(memory);
+        let memory = ProjectMemory::open(&home, key, &repo).unwrap();
+        assert_eq!(memory.book.records()["first"].claim, "one");
+        assert_eq!(
+            memory.book.records()["second"].status,
+            melissa_skill_context::state::MemoryStatus::Deleted
+        );
+        assert!(memory.book.records()["second"].claim.is_empty());
+        assert_eq!(memory.record_refs["first"], original_ref);
+    }
 }

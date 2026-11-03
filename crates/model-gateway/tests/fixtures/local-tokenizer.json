@@ -1,0 +1,11 @@
+{
+  "version": "1.0",
+  "truncation": {"direction": "Right", "max_length": 2, "strategy": "LongestFirst", "stride": 0},
+  "padding": {"strategy": {"Fixed": 128}, "direction": "Right", "pad_to_multiple_of": null, "pad_id": 0, "pad_type_id": 0, "pad_token": "[UNK]"},
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "WhitespaceSplit"},
+  "post_processor": null,
+  "decoder": null,
+  "model": {"type": "WordLevel", "vocab": {"[UNK]": 0, "world": 1, "again": 2}, "unk_token": "[UNK]"}
+}

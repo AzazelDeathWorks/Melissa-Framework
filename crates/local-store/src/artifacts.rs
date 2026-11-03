@@ -62,6 +62,7 @@ impl LocalStore {
         // coexist without borrowing the public journal mutably.
         let _guard = self.file_guard()?;
         let mut connection = self.connect()?;
+        connection.journal.task(&request.task_id)?;
         let tx = connection
             .journal
             .conn
@@ -85,16 +86,12 @@ impl LocalStore {
             ));
         }
         let digest = digest_for(bytes);
-        let inventory = self.cas.list_with_parallelism(
-            self.instance
-                .inventory_readers
-                .load(std::sync::atomic::Ordering::Acquire),
-        )?;
+        let inventory = self.publication_inventory()?;
         let used = inventory.iter().try_fold(0_u64, |sum, blob| {
             sum.checked_add(blob.stored_bytes)
                 .ok_or_else(|| StoreError::Integrity("CAS inventory byte overflow".into()))
         })?;
-        let additional = if inventory.iter().any(|blob| blob.digest == digest) {
+        let additional = if inventory.iter().any(|b| b.digest == digest) {
             0
         } else {
             stored_len_for_plain(bytes.len() as u64)?
@@ -280,6 +277,7 @@ impl LocalStore {
         integer(now_ms)?;
         let cutoff = now_ms.saturating_sub(orphan_grace_ms);
         let _guard = self.file_guard()?;
+        self.release_inventory_pins()?;
         let mut connection = self.connect()?;
         let tx = connection
             .journal

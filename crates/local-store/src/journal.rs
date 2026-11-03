@@ -223,6 +223,23 @@ pub(crate) fn decode<T: DeserializeOwned>(
 
 impl Journal {
     pub fn open(path: &Path, key: StoreKey, limits: JournalLimits) -> StoreResult<Self> {
+        Self::open_checked(path, key, limits, true)
+    }
+    /// Only LocalStore's already verified, exclusively leased session may use
+    /// this path. Schema/key checks remain; consumed rows authenticate on read.
+    pub(crate) fn connect_session(
+        path: &Path,
+        key: StoreKey,
+        limits: JournalLimits,
+    ) -> StoreResult<Self> {
+        Self::open_checked(path, key, limits, false)
+    }
+    fn open_checked(
+        path: &Path,
+        key: StoreKey,
+        limits: JournalLimits,
+        full: bool,
+    ) -> StoreResult<Self> {
         limits.validate()?;
         let mut conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_millis(limits.busy_timeout_ms))?;
@@ -240,6 +257,11 @@ impl Journal {
         }
         let _: u64 = conn.query_row(&format!("PRAGMA max_page_count={pages}"), [], |r| r.get(0))?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if !full && version != 4 {
+            return Err(StoreError::Integrity(
+                "leased journal schema changed".into(),
+            ));
+        }
         let table_count: i64 = conn.query_row(
             "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
             [],
@@ -366,7 +388,9 @@ impl Journal {
             (limits.max_payload_bytes + 128).min(i32::MAX as usize) as i32,
         )?;
         let journal = Self { conn, key, limits };
-        journal.integrity_check()?;
+        if full {
+            journal.integrity_check()?;
+        }
         Ok(journal)
     }
     pub fn create_task(&mut self, contract: &TaskContractV1) -> StoreResult<StoredTask> {
@@ -1124,6 +1148,35 @@ impl Journal {
         require_reference(&tx, task_id, "checkpoint", checkpoint_id, &artifact)?;
         tx.commit()?;
         Ok(cp)
+    }
+    /// Locate a contiguous host-numbered checkpoint series without loading
+    /// every historical artifact. The selected checkpoint is authenticated.
+    pub fn latest_checkpoint_in_series(
+        &self,
+        task_id: &str,
+        prefix: &str,
+    ) -> StoreResult<(u64, Option<Checkpoint>)> {
+        if prefix.is_empty() {
+            return Err(StoreError::Invalid("empty checkpoint prefix".into()));
+        }
+        self.task(task_id)?;
+        let mut stmt = self.conn.prepare("SELECT checkpoint_id FROM checkpoints WHERE task_id=?1 AND substr(checkpoint_id,1,length(?2))=?2 ORDER BY length(checkpoint_id),checkpoint_id")?;
+        let ids = stmt
+            .query_map(params![task_id, prefix], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (n, id) in ids.iter().enumerate() {
+            if id != &format!("{prefix}{n}") {
+                return Err(StoreError::Integrity(
+                    "checkpoint series has gaps or invalid identities".into(),
+                ));
+            }
+        }
+        Ok((
+            ids.len() as u64,
+            ids.last()
+                .map(|id| self.checkpoint(id, task_id))
+                .transpose()?,
+        ))
     }
     pub fn events(&self, task_id: &str) -> StoreResult<Vec<JournalEvent>> {
         self.events_on(&self.conn, task_id)

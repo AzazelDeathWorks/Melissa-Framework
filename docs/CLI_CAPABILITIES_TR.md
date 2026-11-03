@@ -29,6 +29,70 @@ dosyalar `unsupported_files` listesinde açıkça gösterilir.
 
 Hindsight kurulmadı veya bağlanmadı. Buradaki bellek mevcut yerel çekirdeği kullanır.
 
+### Uzun oturum ve kayıt davranışı
+
+Görev süresiyle tek API isteğinin bekleme süresi ayrıdır. `request_timeout_ms`
+varsayılanı 30 dakikadır; bu değer bütün görevi 30 dakikada kesmez.
+
+Her gönderimden önce gerçek protokol gövdesi hazırlanıp denetlenir. Sistem,
+görev, skill metinleri, araç/çıktı şemaları ve sağlayıcının opaque continuation
+alanları değiştirilmez. Bağlam dolduğunda eski araç gözlemleri, tam içerikleri
+şifreli kayıtta tutularak çalışma görünümünde referansla temsil edilebilir.
+`history_read` aynı görev/oturumdaki kaydın istenen aralığını geri getirir.
+Son gözlemler ve araç çağrısı/sonucu eşleşmeleri korunur; gerekli içerik hâlâ
+sığmıyorsa istek gönderilmeden açıklayıcı hata döner.
+
+Varsayılan sayım UTF-8 gövdesi ve protokol payı üzerinden muhafazakâr bir
+kontroldür; gerçek model tokenizer ölçümü veya fatura değildir. Çekirdek tam
+endpoint/model için kayıtlı tokenizer adaptörünü destekler. Bu adaptör yoksa
+maliyet rezervasyonu model kapasitesini esas almaya devam eder. Görseller için
+eşleşen sayıcı yoksa rapor `not_measured_multimodal` yazar; görseli küçültmez
+ve doğrulanmış token kapasitesi iddiasında bulunmaz.
+
+İsteğe bağlı `local_tokenizer` ayarıyla yerel bir Hugging Face `tokenizer.json`
+dosyası bağlanabilir: `{"path":"C:/MelissaPrivate/tokenizer.json","blake3":"DOSYANIN_64_KARAKTER_KUCUK_HARF_BLAKE3_OZETI"}`.
+Dosyayı güvenilir model yayımından ayrıca temin edin; uygulama dosya indirmez,
+uzak Python kodu çalıştırmaz ve model anahtarı okumaz. Import ve çalıştırmada
+dosya özeti doğrulanır. Endpoint, protokol, model veya özet değişirse yürütme
+politikasının kimliği de değişir. Alan eklenmezse eski ayar özeti korunur.
+
+`wire_token_measurement`, tüm native JSON metninin gerçek tokenizer ile
+sayımıdır; sağlayıcının chat template'iyle oluşturduğu **model girdisi token
+sayısı değildir**. Bu nedenle kapasiteyi veya maliyet rezervasyonunu azaltmaz;
+çıktı token ayarını da değiştirmez. Dosya içindeki truncation ve padding sayım
+için kapatılır. Görsel/opaque continuation bulunan isteklerde ölçüm yapılmaz.
+32 MiB üzerindeki tokenizer dosyaları reddedilir; 2 MiB üzerindeki JSON için
+yalnız bu ek ölçüm atlanır, istek kırpılmaz. Bu sınırlar model bağlam limiti değildir.
+
+Yerel dosyanın özetini `cargo run -p melissa-model-gateway --example measure_wire -- --digest C:/MelissaPrivate/tokenizer.json`
+ile alın. Çevrimdışı JSON sayımını denemek için aynı örneğe sırasıyla tokenizer
+yolu, özet ve native request JSON yolu verin. Örnekte HTTP bağlantısı kurulmaz.
+`config show` seçili tokenizer özetini ve `native_wire_only` ölçüm türünü gösterir.
+
+Tam geçmiş tek bir büyüyen JSON dosyası yerine değişmez mesaj nesneleri ve
+manifestlerle saklanır. Önceki tam checkpoint biçimi okunmaya devam eder.
+Çalıştırma politikası değişmiş eski aktif görevlerin devam girişimi ise
+reddedilir; kayıt okunabilmesi, eski yürütme yetkisinin yeni politikaya
+otomatik taşındığı anlamına gelmez.
+Proje belleği de kaynak dosyalarını kopyalamak yerine kaynak kimliği/özeti
+tutar; değişen kayıtlar ayrı nesneler halinde yazılır. Kaynak yeniliği her
+yeniden açılışta doğrulanır. Bellek kullanan ajan oturumu açıkken çakışan
+yerel bellek incelemesi beklemelidir; aynı anda iki yazıcının değişiklikleri
+birbirinin üzerine yazılmaz.
+
+Arama sonucu tam dosya değildir: kaynak özeti, özgün byte aralığı ve sınırlı
+alıntı içerir. Toplam kodlanmış sonuç 256 KiB ile sınırlıdır; devamı açık
+dosya/aralık okumasıyla alınır. Ayrıştırma ve FTS indeksi oturum içinde
+yalnız değişen dosyalar için güncellenir. İçerik özeti doğrulaması devam eder;
+bu özellik bütün dosya okumalarının kaldırıldığı anlamına gelmez.
+
+Windows CLI deposunda doğrulanmış kayıtlar yazma/silmeyi engelleyen dosya
+tutamaçlarıyla yeniden kullanılır. Yeni dosyalar doğrulanır; GC önce bu geçici
+tutamaçları bırakır. Diğer platformlarda tam doğrulama yolu kullanılır.
+Worker aktarımı en çok 1024 dosya/64 MiB kabul eder ve kopyalama öncesinde
+denetlenir. Ustar aktarımı 155 byte önek/100 byte son ad alanına sığan uzun
+yolları destekler; desteklenmeyen yol veya boyut açık hata olarak kalır.
+
 ## Görev hazırlamak
 
 ```powershell

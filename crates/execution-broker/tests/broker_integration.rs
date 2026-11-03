@@ -50,10 +50,10 @@ fn fixture_config(mode: &str, config: StoreConfig) -> Fixture {
     let project = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     // A real isolated PE fixture; copy removes Cargo's shared hard-link identity.
     fs::copy(
-        project.join("target/debug/melissa-executor-probe.exe"),
+        std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("melissa-executor-probe.exe"),
         &executable,
     )
-    .expect("build melissa-executor-probe first with scripts/verify-code03.ps1");
+    .expect("build melissa-executor-probe with cargo build -p melissa-windows-executor --bins using the same target/profile");
     let mut task: TaskContractV1 = serde_json::from_slice(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../tests/fixtures/code01/wire/task-contract-v1.json"
@@ -603,7 +603,17 @@ fn policy_revocation_during_real_execution_stops_and_persists_tree() {
             &AtomicBool::new(false),
         )
         .unwrap();
-    let pids = revoke.join().unwrap();
+    let pids = revoke.join().unwrap_or_else(|_| {
+        panic!(
+            "tree fixture failed: {:?}; stderr={}",
+            result.observation.error_category,
+            result
+                .report
+                .as_ref()
+                .map(|r| String::from_utf8_lossy(&r.stderr).into_owned())
+                .unwrap_or_default()
+        )
+    });
     assert_eq!(result.observation.status, ObservationStatus::Cancelled);
     assert_eq!(
         result.observation.error_category.as_deref(),
@@ -700,7 +710,17 @@ fn durable_revocation_watcher_stops_an_already_running_process_tree() {
             &AtomicBool::new(false),
         )
         .unwrap();
-    let pids = thread.join().unwrap();
+    let pids = thread.join().unwrap_or_else(|_| {
+        panic!(
+            "tree fixture failed: {:?}; stderr={}",
+            result.observation.error_category,
+            result
+                .report
+                .as_ref()
+                .map(|r| String::from_utf8_lossy(&r.stderr).into_owned())
+                .unwrap_or_default()
+        )
+    });
     assert_eq!(result.observation.status, ObservationStatus::Cancelled);
     assert_eq!(
         result.observation.error_category.as_deref(),
@@ -728,7 +748,17 @@ fn permit_expiry_stops_real_processes_and_is_distinct_from_task_timeout() {
             &AtomicBool::new(false),
         )
         .unwrap();
-    let pids = thread.join().unwrap();
+    let pids = thread.join().unwrap_or_else(|_| {
+        panic!(
+            "tree fixture failed: {:?}; stderr={}",
+            result.observation.error_category,
+            result
+                .report
+                .as_ref()
+                .map(|r| String::from_utf8_lossy(&r.stderr).into_owned())
+                .unwrap_or_default()
+        )
+    });
     assert_eq!(
         result.observation.error_category.as_deref(),
         Some("permit_expired")
@@ -749,7 +779,13 @@ fn orphan_cleanup_cannot_be_mistaken_for_successful_completion() {
     assert_eq!(result.observation.status, ObservationStatus::Failed);
     assert_eq!(
         result.observation.error_category.as_deref(),
-        Some("orphan_descendants")
+        Some("orphan_descendants"),
+        "stderr={}",
+        result
+            .report
+            .as_ref()
+            .map(|r| String::from_utf8_lossy(&r.stderr).into_owned())
+            .unwrap_or_default()
     );
     let report = result.report.unwrap();
     assert!(report.tree_confirmed_stopped && report.descendant_cleanup_required);

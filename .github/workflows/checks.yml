@@ -2,7 +2,7 @@ name: Checks
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, 'fix/**']
 permissions:
   contents: read
 jobs:
@@ -20,6 +20,10 @@ jobs:
         run: rustup toolchain install 1.98.0 --profile minimal --component rustfmt
       - name: Formatting
         run: cargo +1.98.0 fmt --all -- --check
+      - name: Native process fixture
+        run: cargo +1.98.0 build --locked -p melissa-windows-executor --bins
+      - name: Bounded host processes and admission
+        run: cargo +1.98.0 test --locked --no-fail-fast -p melissa-windows-executor --test host_capture -p melissa-execution-broker --test broker_integration
       - name: Compile
         run: cargo +1.98.0 check --locked --workspace --all-targets
       - name: Contract and storage tests
@@ -28,6 +32,36 @@ jobs:
         run: cargo +1.98.0 test --locked -p melissa-model-gateway --test reviewed_origin_policy
       - name: Local CLI contracts
         run: cargo +1.98.0 test --locked -p melissa-cli
+      - name: Repository and recovery regressions
+        run: cargo +1.98.0 test --locked -p melissa-repository --lib --test repository_contracts --test read_error_observations --test incremental_parse -p melissa-recovery --test real_effects --test resume
+      - name: Continuation reservation boundary without Docker
+        run: cargo +1.98.0 test --locked -p melissa-skill-context --test native_runtime durable_gateway_resume_reopens_encrypted_journal_without_repeating_a_settled_tool_or_budget -- --exact
+      - name: Shared workflow continuation and checkpoint ownership
+        run: cargo +1.98.0 test --locked -p melissa-workflow --test workflow
+  portable-tests:
+    # Test targets that need neither the Windows handle-pinned filesystem nor
+    # Docker Desktop; without this job their crates are only compiled in CI.
+    runs-on: ubuntu-latest
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal
+      - name: Workflow tests
+        run: cargo +1.98.0 test --locked -p melissa-workflow --test attenuation --test comparison --test coordinator --test serial_tools --test shared_ledger --test complete_native_race
+      - name: Skill context tests
+        run: cargo +1.98.0 test --locked -p melissa-skill-context --test package_runtime --test context_state --test retrieval --test registry_versions --test incremental_context
+      - name: Native context and protocol contracts
+        run: cargo +1.98.0 test --locked -p melissa-model-gateway --lib --test context_compiler --test local_tokenizer --test history_bounds --test reviewed_origin_policy --test agent_loop --test anthropic_protocol --test openai_protocol
+      - name: Build-test unit tests
+        run: cargo +1.98.0 test --locked -p melissa-build-test --lib
+      - name: Web development protocol tests
+        run: cargo +1.98.0 test --locked -p melissa-web-development --lib --test protocol
   secrets:
     runs-on: ubuntu-latest
     steps:

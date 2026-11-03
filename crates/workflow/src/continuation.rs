@@ -11,7 +11,8 @@ use crate::{
 use melissa_local_store::{ArtifactRequest, LocalStore, StoreError};
 use melissa_model_gateway::{
     ErrorKind, GatewayError,
-    continuation::{ContinuationStore, Phase, TurnCheckpoint},
+    continuation::{ContinuationStore, Phase, TurnCheckpoint, TurnCheckpointView},
+    transcript::{Manifest, MessageLog},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -25,11 +26,14 @@ struct Envelope {
     known_cost: u64,
     known_input: u64,
     known_output: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transcript: Option<Manifest>,
 }
 pub struct WorkflowContinuation {
     owner: SharedScheduler,
     packet: WorkPacket,
     sequence: u64,
+    messages: MessageLog,
 }
 fn gateway(e: crate::Error) -> GatewayError {
     GatewayError::new(ErrorKind::Store, e.to_string())
@@ -40,12 +44,17 @@ impl WorkflowContinuation {
             owner,
             packet,
             sequence: 0,
+            messages: MessageLog::default(),
         }
     }
     fn cp(&self, n: u64) -> String {
         format!("workflow-turn:{}:{n}", self.packet.lease.run)
     }
-    fn current(&self, store: &LocalStore) -> Result<(u64, u64, u64, BTreeSet<String>)> {
+    fn current(
+        &self,
+        store: &LocalStore,
+        pending: Option<&str>,
+    ) -> Result<(u64, u64, u64, BTreeSet<String>)> {
         lock(&self.owner)?.check(&self.packet.lease)?;
         let budget = store
             .journal()
@@ -64,15 +73,30 @@ impl WorkflowContinuation {
             .collect::<Vec<_>>();
         require(
             own.iter().all(|r| {
-                !matches!(
-                    r.state,
-                    melissa_local_store::journal::ModelRequestState::Reserved
-                        | melissa_local_store::journal::ModelRequestState::Dispatched
-                        | melissa_local_store::journal::ModelRequestState::OutcomeUnknown
-                )
+                (pending == Some(r.reservation.request_id.as_str())
+                    && r.state == melissa_local_store::journal::ModelRequestState::Reserved
+                    && r.dispatched_at_unix_ms.is_none())
+                    || !matches!(
+                        r.state,
+                        melissa_local_store::journal::ModelRequestState::Reserved
+                            | melissa_local_store::journal::ModelRequestState::Dispatched
+                            | melissa_local_store::journal::ModelRequestState::OutcomeUnknown
+                    )
             }),
             Kind::Uncertain,
             "own model request is unsettled",
+        )?;
+        require(
+            pending.is_none_or(|id| {
+                own.iter().any(|r| {
+                    r.reservation.request_id == id
+                        && r.state == melissa_local_store::journal::ModelRequestState::Reserved
+                        && r.dispatched_at_unix_ms.is_none()
+                        && r.reservation.profile_id == self.packet.node.profile
+                })
+            }),
+            Kind::Uncertain,
+            "pending checkpoint has no owned reservation",
         )?;
         let mut invocations = std::collections::BTreeMap::new();
         let tool_prefix = format!("model-tool:{}:", self.packet.lease.run);
@@ -92,7 +116,10 @@ impl WorkflowContinuation {
             budget.known_cost_micro_usd,
             budget.known_input_tokens,
             budget.known_output_tokens,
-            own.into_iter().map(|r| r.reservation.request_id).collect(),
+            own.into_iter()
+                .map(|r| r.reservation.request_id)
+                .filter(|id| pending != Some(id.as_str()))
+                .collect(),
         ))
     }
 }
@@ -110,30 +137,37 @@ impl ContinuationStore for WorkflowContinuation {
                 Kind::Authority,
                 "continuation task/run mismatch",
             )?;
-            let (cost, input, output, ids) = self.current(store)?;
+            let (cost, input, output, ids) = self.current(store, None)?;
             match store.artifact_metadata(task, &format!("model-run:{run}:result")) {
                 Ok(_) => return Err(error(Kind::Conflict, "terminal run cannot be replayed")),
                 Err(StoreError::NotFound(_)) => {}
                 Err(e) => return Err(e.into()),
             }
+            let (next, checkpoint) = store
+                .journal()
+                .latest_checkpoint_in_series(task, &format!("workflow-turn:{run}:"))?;
+            self.sequence = next;
             let mut last = None;
-            loop {
-                match store.journal().checkpoint(&self.cp(self.sequence), task) {
-                    Ok(cp) => {
-                        let bytes = store.get_artifact(task, &cp.artifact_id)?;
-                        require(
-                            cp.data["digest"] == digest(&bytes),
-                            Kind::Store,
-                            "continuation index/content mismatch",
-                        )?;
-                        last = Some(serde_json::from_slice::<Envelope>(&bytes)?);
-                        self.sequence += 1;
-                    }
-                    Err(StoreError::NotFound(_)) => break,
-                    Err(e) => return Err(e.into()),
-                }
+            if let Some(cp) = checkpoint {
+                let bytes = store.get_artifact(task, &cp.artifact_id)?;
+                require(
+                    cp.data["digest"] == digest(&bytes),
+                    Kind::Store,
+                    "continuation index/content mismatch",
+                )?;
+                last = Some(serde_json::from_slice::<Envelope>(&bytes)?);
             }
-            if let Some(last) = last {
+            if let Some(mut last) = last {
+                if let Some(manifest) = &last.transcript {
+                    require(
+                        last.state.messages.is_empty(),
+                        Kind::Store,
+                        "ambiguous transcript checkpoint",
+                    )?;
+                    last.state.messages = MessageLog::restore(store, task, run, manifest)
+                        .map_err(|e| error(Kind::Store, &e.to_string()))?;
+                    self.messages.adopt(manifest);
+                }
                 let own_ids = last
                     .state
                     .result
@@ -169,8 +203,22 @@ impl ContinuationStore for WorkflowContinuation {
         store: &mut LocalStore,
         state: &TurnCheckpoint,
     ) -> melissa_model_gateway::Result<()> {
+        self.publish_view(store, &TurnCheckpointView::from(state))
+    }
+    fn publish_view(
+        &mut self,
+        store: &mut LocalStore,
+        state: &TurnCheckpointView<'_>,
+    ) -> melissa_model_gateway::Result<()> {
         (|| -> Result<_> {
-            let (cost, input, output, ids) = self.current(store)?;
+            let pending = (state.phase == Phase::InferencePending).then(|| {
+                format!(
+                    "model:{}:{}",
+                    self.packet.lease.run,
+                    state.result.request_ids.len() + 1
+                )
+            });
+            let (cost, input, output, ids) = self.current(store, pending.as_deref())?;
             require(
                 state.result.task_id == self.packet.parent_task.task_id
                     && state.result.run_id == self.packet.lease.run
@@ -185,7 +233,17 @@ impl ContinuationStore for WorkflowContinuation {
                 "checkpoint does not cover own native request history",
             )?;
             let e = Envelope {
-                state: state.clone(),
+                state: state.metadata(),
+                transcript: Some(
+                    self.messages
+                        .save(
+                            store,
+                            &state.result.task_id,
+                            &state.result.run_id,
+                            state.messages,
+                        )
+                        .map_err(|e| error(Kind::Store, &e.to_string()))?,
+                ),
                 handoff_digest: digest(&serde_json::to_vec(&self.packet)?),
                 known_cost: cost,
                 known_input: input,

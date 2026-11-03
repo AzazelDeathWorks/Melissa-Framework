@@ -6,7 +6,6 @@ use regex::Regex;
 use serde::Serialize;
 use std::{
     path::{Path, PathBuf},
-    process::Command,
     sync::atomic::AtomicBool,
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -70,12 +69,18 @@ impl AuditTool {
         if digest(&bytes) != self.digest {
             return Err(Error::Stale("audit tool changed"));
         }
-        let output = Command::new(&self.executable)
-            .args(["audit", "--json", "--deny", "warnings", "--file"])
-            .arg(repo.root_path().join("Cargo.lock"))
-            .current_dir(repo.root_path())
-            .output()
-            .map_err(|_| Error::Denied("native audit launch"))?;
+        let mut arguments = ["audit", "--json", "--deny", "warnings", "--file"]
+            .map(str::to_owned)
+            .to_vec();
+        arguments.push(
+            repo.root_path()
+                .join("Cargo.lock")
+                .to_str()
+                .ok_or(Error::Invalid("Unicode lock path required"))?
+                .into(),
+        );
+        let output =
+            crate::host_process::capture(&self.executable, &arguments, repo.root_path(), cancel)?;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -94,7 +99,7 @@ impl AuditTool {
             std::str::from_utf8(&output.stdout).map_err(|_| Error::Invalid("audit UTF8"))?,
         )
         .map_err(|_| Error::Invalid("audit JSON"))?;
-        if !output.status.success()
+        if output.exit_code != 0
             || value["vulnerabilities"]["count"].as_u64() != Some(0)
             || !value["vulnerabilities"]["list"]
                 .as_array()

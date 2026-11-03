@@ -35,14 +35,33 @@ pub struct Settings {
     pub credential: Credential,
     pub context_tokens: u64,
     pub max_output_tokens: u64,
+    #[serde(
+        default = "default_request_timeout",
+        skip_serializing_if = "is_default_request_timeout"
+    )]
+    pub request_timeout_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_tokenizer: Option<melissa_model_gateway::local_tokenizer::LocalTokenizerConfig>,
     pub capabilities: Capabilities,
     pub json_object: bool,
     pub native_json_schema: bool,
     pub single_attempt: bool,
     pub rate_card: RateCard,
 }
+fn default_request_timeout() -> u64 {
+    1_800_000
+}
+fn is_default_request_timeout(value: &u64) -> bool {
+    *value == default_request_timeout()
+}
 impl Settings {
     pub fn validate(&self) -> Result {
+        if let Some(config) = &self.local_tokenizer {
+            config
+                .validate()
+                .map_err(|_| Error::Usage("Yerel tokenizer yolu/özeti geçersiz."))?;
+            absolute(&config.path)?;
+        }
         if self.schema_version != "melissa.cli-settings/v1"
             || self.provider_id.is_empty()
             || self.provider_id.len() > 64
@@ -55,6 +74,8 @@ impl Settings {
             || self.context_tokens == 0
             || self.max_output_tokens == 0
             || self.max_output_tokens >= self.context_tokens
+            || self.request_timeout_ms == 0
+            || self.request_timeout_ms > 1_800_000
             || !self.capabilities.tool_calling
             || !self.capabilities.streaming
             || !(self.json_object || self.native_json_schema)
@@ -142,6 +163,25 @@ impl Settings {
     pub fn digest(&self) -> Result<String> {
         Ok(digest(&bytes(self)?))
     }
+    pub(crate) fn context_compiler(
+        &self,
+    ) -> Result<melissa_model_gateway::context_compiler::ContextCompiler> {
+        let compiler = melissa_model_gateway::context_compiler::ContextCompiler::default();
+        match &self.local_tokenizer {
+            Some(config) => Ok(compiler.with_wire_tokenizer(
+                melissa_model_gateway::local_tokenizer::LocalWireTokenizer::load(
+                    config,
+                    &self.endpoint,
+                    self.protocol,
+                    &self.model,
+                )
+                .map_err(|_| {
+                    Error::Usage("Yerel tokenizer açılamadı veya özeti/biçimi geçersiz.")
+                })?,
+            )),
+            None => Ok(compiler),
+        }
+    }
 }
 impl App {
     pub fn configure(&self, path: &Path) -> Result<Value> {
@@ -154,6 +194,8 @@ impl App {
         let (_, data) = repo.read(path.file_name().and_then(|s| s.to_str()).ok_or(Error::Io)?)?;
         let value: Settings = decode(&data)?;
         value.validate()?;
+        // Validate the pinned public artifact without resolving any API key.
+        let _ = value.context_compiler()?;
         let encoded = self.key.seal(&bytes(&value)?, b"melissa.cli.settings.v1")?;
         let temp = self.home.join(format!("settings-{}.tmp", nonce()?));
         let mut file = fs::OpenOptions::new()
@@ -180,13 +222,54 @@ impl App {
     pub fn configuration(&self) -> Result<Value> {
         let s = self.settings()?;
         Ok(
-            json!({"command":"config show","settings_digest":s.digest()?,"provider":s.provider_id,"model":s.model,"endpoint":s.endpoint,"protocol":s.protocol,"context_tokens":s.context_tokens,"max_output_tokens":s.max_output_tokens,"capabilities":s.capabilities,"json_object":s.json_object,"native_json_schema":s.native_json_schema,"credential":"[REDACTED: reference only]","secret_resolved":false}),
+            json!({"command":"config show","settings_digest":s.digest()?,"provider":s.provider_id,"model":s.model,"endpoint":s.endpoint,"protocol":s.protocol,"context_tokens":s.context_tokens,"max_output_tokens":s.max_output_tokens,"capabilities":s.capabilities,"json_object":s.json_object,"native_json_schema":s.native_json_schema,"local_tokenizer":s.local_tokenizer.as_ref().map(|c| json!({"blake3":c.blake3,"measurement":"native_wire_only"})),"credential":"[REDACTED: reference only]","secret_resolved":false}),
         )
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn optional_tokenizer_preserves_legacy_digest_and_binds_new_approvals() {
+        let mut s: Settings = serde_json::from_slice(include_bytes!(
+            "../../../examples/cli/settings.template.json"
+        ))
+        .unwrap();
+        let legacy = s.digest().unwrap();
+        assert!(
+            serde_json::to_value(&s)
+                .unwrap()
+                .get("local_tokenizer")
+                .is_none()
+        );
+        assert_eq!(
+            s.context_compiler().unwrap().policy_id(),
+            "native-context/v1:utf8-framing"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer.json");
+        let bytes = include_bytes!("../../model-gateway/tests/fixtures/local-tokenizer.json");
+        std::fs::write(&path, bytes).unwrap();
+        s.local_tokenizer = Some(
+            melissa_model_gateway::local_tokenizer::LocalTokenizerConfig {
+                path: path.clone(),
+                blake3: blake3::hash(bytes).to_hex().to_string(),
+            },
+        );
+        let selected = s.digest().unwrap();
+        assert_ne!(legacy, selected);
+        assert!(
+            s.context_compiler()
+                .unwrap()
+                .policy_id()
+                .contains("hf-wire-observation/v1:")
+        );
+        std::fs::write(path, b"{}").unwrap();
+        assert!(s.context_compiler().is_err());
+        // Resolution of the deliberately invalid template credential never ran.
+        s.local_tokenizer = None;
+        assert_eq!(s.digest().unwrap(), legacy);
+    }
     #[test]
     fn explicit_vision_uses_compatible_high_detail_without_resolving_credentials() {
         let mut s: Settings = serde_json::from_slice(include_bytes!(

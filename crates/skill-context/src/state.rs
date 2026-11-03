@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub fn save<T: Serialize>(cas: &Cas, record: &T) -> Result<String> {
-    let bytes = serde_json::to_vec(record)?;
+    let bytes = crate::encode_state(record)?;
     let blob = cas.put(&bytes)?;
     Ok(format!("blake3:{}", blob.digest))
 }
@@ -117,14 +117,64 @@ pub struct Memory {
     pub namespace: Namespace,
     pub key: String,
     pub claim: String,
-    pub sources: Vec<Source>,
+    #[serde(deserialize_with = "read_memory_sources")]
+    pub sources: Vec<crate::retrieval::SourceRef>,
     pub status: MemoryStatus,
     pub review_evidence_ref: Option<String>,
+}
+fn memory_review_digest(record: &Memory) -> Result<String> {
+    // Re-observation renews freshness without changing the proposed fact.
+    // Identity, version, content digest, status and claim remain hash-bound;
+    // review separately requires every source to be current and unexpired.
+    let mut stable = record.clone();
+    for source in &mut stable.sources {
+        source.observed_at_ms = 0;
+        source.valid_until_ms = 0;
+    }
+    Ok(digest(&serde_json::to_vec(&stable)?))
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryBook {
     records: BTreeMap<String, Memory>,
+}
+fn read_memory_sources<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> std::result::Result<Vec<crate::retrieval::SourceRef>, D::Error> {
+    use serde::de::Error as _;
+    let mut values = Vec::<serde_json::Value>::deserialize(de)?;
+    let mut result = Vec::with_capacity(values.len());
+    for value in &mut values {
+        // Read legacy books losslessly from immutable artifacts, verifying any
+        // embedded content before converting it to provenance. New books omit it.
+        if value.get("content").is_some() {
+            let old: Source = serde_json::from_value(value.clone()).map_err(D::Error::custom)?;
+            old.validate().map_err(D::Error::custom)?;
+            result.push(old.reference());
+        } else {
+            result.push(serde_json::from_value(value.take()).map_err(D::Error::custom)?);
+        }
+    }
+    Ok(result)
+}
+/// Host allocation bounds, checked on borrowed sources before cloning content.
+pub const MAX_MEMORY_SOURCES: usize = 128;
+pub const MAX_MEMORY_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+pub fn validate_memory_sources<'a>(sources: impl IntoIterator<Item = &'a Source>) -> Result<()> {
+    let mut ids = BTreeSet::new();
+    let mut total = 0usize;
+    for source in sources {
+        require(ids.len() < MAX_MEMORY_SOURCES, "too many memory sources")?;
+        require(ids.insert(&source.id), "duplicate memory source")?;
+        total = total
+            .checked_add(source.content.len())
+            .ok_or_else(|| crate::Error("memory source size overflow".into()))?;
+        require(
+            total <= MAX_MEMORY_SOURCE_BYTES,
+            "memory source bytes exceed host envelope",
+        )?;
+    }
+    require(!ids.is_empty(), "memory sources required")
 }
 impl MemoryBook {
     pub fn records(&self) -> &BTreeMap<String, Memory> {
@@ -175,7 +225,7 @@ impl MemoryBook {
                                 && s.version == old.version
                                 && s.digest == old.digest
                         })
-                        .cloned()
+                        .map(Source::reference)
                 })
                 .collect();
             if let Some(sources) = refreshed {
@@ -193,17 +243,36 @@ impl MemoryBook {
         claim: &str,
         sources: Vec<Source>,
     ) -> Result<String> {
+        self.propose_borrowed(
+            id,
+            namespace,
+            key,
+            claim,
+            &sources.iter().collect::<Vec<_>>(),
+        )
+    }
+    pub fn propose_borrowed(
+        &mut self,
+        id: &str,
+        namespace: Namespace,
+        key: &str,
+        claim: &str,
+        sources: &[&Source],
+    ) -> Result<String> {
         namespace.validate()?;
+        validate_memory_sources(sources.iter().copied())?;
         require(
             !id.trim().is_empty()
+                && id.len() <= 512
                 && !key.trim().is_empty()
+                && key.len() <= 1024
                 && !claim.trim().is_empty()
                 && claim.len() <= 65536
                 && !self.records.contains_key(id)
                 && !sources.is_empty(),
             "invalid or duplicate memory proposal",
         )?;
-        for s in &sources {
+        for s in sources {
             s.validate()?;
             require(s.namespace == namespace, "memory source namespace mismatch")?;
         }
@@ -212,12 +281,16 @@ impl MemoryBook {
             namespace,
             key: key.into(),
             claim: claim.into(),
-            sources,
+            sources: sources.iter().map(|s| s.reference()).collect(),
             status: MemoryStatus::Proposed,
             review_evidence_ref: None,
         };
-        let hash = digest(&serde_json::to_vec(&record)?);
+        let hash = memory_review_digest(&record)?;
         self.records.insert(id.into(), record);
+        if let Err(error) = crate::encode_state(self) {
+            self.records.remove(id);
+            return Err(error);
+        }
         Ok(hash)
     }
     /// Host review decision only; semantic truth is the reviewer's responsibility.
@@ -237,10 +310,11 @@ impl MemoryBook {
             .ok_or_else(|| crate::Error("memory not found".into()))?;
         require(
             record.status == MemoryStatus::Proposed
-                && digest(&serde_json::to_vec(record)?) == expected
+                && (memory_review_digest(record)? == expected
+                    || digest(&serde_json::to_vec(record)?) == expected)
                 && record.namespace == scope.namespace
                 && !evidence_ref.trim().is_empty()
-                && record.sources.iter().all(|s| scope.allows(s)),
+                && record.sources.iter().all(|s| scope.allows_ref(s)),
             "stale/unreviewable memory proposal",
         )?;
         let conflicts: BTreeSet<_> = self
@@ -281,7 +355,7 @@ impl MemoryBook {
             .filter(|r| {
                 r.namespace == scope.namespace
                     && r.status == MemoryStatus::Accepted
-                    && r.sources.iter().all(|s| scope.allows(s))
+                    && r.sources.iter().all(|s| scope.allows_ref(s))
                     && (r.key.contains(query) || r.claim.contains(query))
             })
             .collect()
@@ -398,9 +472,48 @@ impl Cache {
                 && expires > now,
             "unsafe cache insertion",
         )?;
+        // Derived cache is disposable. Bound its serialized footprint so a
+        // large result cannot make a previously readable checkpoint unwritable.
+        const MAX_CACHE_BYTES: usize = 4 * 1024 * 1024;
+        const MAX_CACHE_ENTRIES: usize = 256;
+        let identity = key.digest()?;
+        self.entries
+            .retain(|id, e| id != &identity && e.expires_ms > now);
+        let cost = serde_json::to_vec(&key)?
+            .len()
+            .saturating_add(bytes.len().saturating_mul(4))
+            .saturating_add(512);
+        if cost > MAX_CACHE_BYTES {
+            return Ok(());
+        }
+        while self.entries.len() >= MAX_CACHE_ENTRIES
+            || self
+                .entries
+                .values()
+                .map(|e| {
+                    e.bytes
+                        .len()
+                        .saturating_mul(4)
+                        .saturating_add(serde_json::to_vec(&e.key).map_or(0, |b| b.len()))
+                        .saturating_add(512)
+                })
+                .sum::<usize>()
+                .saturating_add(cost)
+                > MAX_CACHE_BYTES
+        {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.created_ms)
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
         let d = digest(&bytes);
         self.entries.insert(
-            key.digest()?,
+            identity,
             CacheEntry {
                 key,
                 created_ms: now,

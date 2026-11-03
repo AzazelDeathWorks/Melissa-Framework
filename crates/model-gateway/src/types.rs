@@ -176,12 +176,20 @@ impl TurnRequest {
     }
     pub fn validate_with_limits(&self, limits: RequestLimits) -> Result<()> {
         limits.validate()?;
+        self.validate_structure()?;
+        serde_json::to_writer(&mut HistoryByteLimit(limits.max_history_bytes), self)
+            .map_err(|_| GatewayError::invalid("request total bytes"))?;
+        Ok(())
+    }
+    /// Validate identities and complete tool pairs before compiling a bounded
+    /// working view from a longer durable transcript.
+    pub fn validate_structure(&self) -> Result<()> {
         if self.model.trim().is_empty()
             || self.model.len() > 256
             || self.model.chars().any(char::is_control)
             || self.system_prompt.len() > 1024 * 1024
             || self.messages.is_empty()
-            || self.messages.len() > 256
+            || self.messages.len() > RequestLimits::MAX_MESSAGES
             || self.tools.len() > 64
             || self.max_output_tokens == 0
             || self.max_output_tokens > 1_000_000
@@ -249,10 +257,6 @@ impl TurnRequest {
         if !pending.is_empty() {
             return Err(GatewayError::invalid("missing tool result"));
         }
-        // Count without allocating another complete, potentially oversized
-        // transcript. The writer rejects before accepting any bytes over quota.
-        serde_json::to_writer(&mut HistoryByteLimit(limits.max_history_bytes), self)
-            .map_err(|_| GatewayError::invalid("request total bytes"))?;
         Ok(())
     }
 }
@@ -271,6 +275,9 @@ impl Default for RequestLimits {
     }
 }
 impl RequestLimits {
+    /// Covers the gateway's 4096 turns and 4096 tools without an unrelated
+    /// 256-message ceiling. Serialized history remains independently bounded.
+    pub const MAX_MESSAGES: usize = 16_384;
     pub const MAX_HISTORY_BYTES: usize = 64 * 1024 * 1024;
     pub fn validate(&self) -> Result<()> {
         if self.max_history_bytes == 0 || self.max_history_bytes > Self::MAX_HISTORY_BYTES {
