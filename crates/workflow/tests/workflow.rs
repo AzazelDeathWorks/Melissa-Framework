@@ -772,15 +772,26 @@ async fn pending_checkpoint_is_not_a_safe_resume_even_with_zero_provider_dispatc
             .is_err()
     );
     assert_eq!(server.requests.load(Ordering::SeqCst), 0);
-    assert!(
-        owner
-            .lock()
-            .unwrap()
-            .store()
-            .journal()
-            .model_requests(TASK)
-            .unwrap()
-            .is_empty()
+    // Preflight and reservation precede Pending; the injected publication
+    // failure is retained as a known-zero, never-dispatched ledger record.
+    let guard = owner.lock().unwrap();
+    let requests = guard.store().journal().model_requests(TASK).unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].state,
+        melissa_local_store::journal::ModelRequestState::NeverDispatched
+    );
+    assert!(requests[0].dispatched_at_unix_ms.is_none());
+    let budget = guard.store().journal().model_budget(TASK).unwrap();
+    assert_eq!(
+        (
+            budget.active_requests,
+            budget.unknown_requests,
+            budget.charged_cost_micro_usd,
+            budget.charged_input_tokens,
+            budget.charged_output_tokens
+        ),
+        (0, 0, 0, 0, 0)
     );
 }
 

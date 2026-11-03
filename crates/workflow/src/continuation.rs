@@ -50,7 +50,11 @@ impl WorkflowContinuation {
     fn cp(&self, n: u64) -> String {
         format!("workflow-turn:{}:{n}", self.packet.lease.run)
     }
-    fn current(&self, store: &LocalStore) -> Result<(u64, u64, u64, BTreeSet<String>)> {
+    fn current(
+        &self,
+        store: &LocalStore,
+        pending: Option<&str>,
+    ) -> Result<(u64, u64, u64, BTreeSet<String>)> {
         lock(&self.owner)?.check(&self.packet.lease)?;
         let budget = store
             .journal()
@@ -69,15 +73,30 @@ impl WorkflowContinuation {
             .collect::<Vec<_>>();
         require(
             own.iter().all(|r| {
-                !matches!(
-                    r.state,
-                    melissa_local_store::journal::ModelRequestState::Reserved
-                        | melissa_local_store::journal::ModelRequestState::Dispatched
-                        | melissa_local_store::journal::ModelRequestState::OutcomeUnknown
-                )
+                (pending == Some(r.reservation.request_id.as_str())
+                    && r.state == melissa_local_store::journal::ModelRequestState::Reserved
+                    && r.dispatched_at_unix_ms.is_none())
+                    || !matches!(
+                        r.state,
+                        melissa_local_store::journal::ModelRequestState::Reserved
+                            | melissa_local_store::journal::ModelRequestState::Dispatched
+                            | melissa_local_store::journal::ModelRequestState::OutcomeUnknown
+                    )
             }),
             Kind::Uncertain,
             "own model request is unsettled",
+        )?;
+        require(
+            pending.is_none_or(|id| {
+                own.iter().any(|r| {
+                    r.reservation.request_id == id
+                        && r.state == melissa_local_store::journal::ModelRequestState::Reserved
+                        && r.dispatched_at_unix_ms.is_none()
+                        && r.reservation.profile_id == self.packet.node.profile
+                })
+            }),
+            Kind::Uncertain,
+            "pending checkpoint has no owned reservation",
         )?;
         let mut invocations = std::collections::BTreeMap::new();
         let tool_prefix = format!("model-tool:{}:", self.packet.lease.run);
@@ -97,7 +116,10 @@ impl WorkflowContinuation {
             budget.known_cost_micro_usd,
             budget.known_input_tokens,
             budget.known_output_tokens,
-            own.into_iter().map(|r| r.reservation.request_id).collect(),
+            own.into_iter()
+                .map(|r| r.reservation.request_id)
+                .filter(|id| pending != Some(id.as_str()))
+                .collect(),
         ))
     }
 }
@@ -115,7 +137,7 @@ impl ContinuationStore for WorkflowContinuation {
                 Kind::Authority,
                 "continuation task/run mismatch",
             )?;
-            let (cost, input, output, ids) = self.current(store)?;
+            let (cost, input, output, ids) = self.current(store, None)?;
             match store.artifact_metadata(task, &format!("model-run:{run}:result")) {
                 Ok(_) => return Err(error(Kind::Conflict, "terminal run cannot be replayed")),
                 Err(StoreError::NotFound(_)) => {}
@@ -189,7 +211,14 @@ impl ContinuationStore for WorkflowContinuation {
         state: &TurnCheckpointView<'_>,
     ) -> melissa_model_gateway::Result<()> {
         (|| -> Result<_> {
-            let (cost, input, output, ids) = self.current(store)?;
+            let pending = (state.phase == Phase::InferencePending).then(|| {
+                format!(
+                    "model:{}:{}",
+                    self.packet.lease.run,
+                    state.result.request_ids.len() + 1
+                )
+            });
+            let (cost, input, output, ids) = self.current(store, pending.as_deref())?;
             require(
                 state.result.task_id == self.packet.parent_task.task_id
                     && state.result.run_id == self.packet.lease.run
