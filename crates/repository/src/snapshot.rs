@@ -113,7 +113,7 @@ impl Repository {
         ];
         excluded.extend(excluded_prefixes);
         Ok(Self {
-            root: paths::pin(root, true, false)?,
+            root: paths::pin_root(root)?,
             limits,
             excluded,
             package_capture: false,
@@ -142,7 +142,7 @@ impl Repository {
     pub fn open_for_git(root: &Path, limits: Limits) -> Result<Self> {
         limits.validate()?;
         Ok(Self {
-            root: paths::pin(root, true, false)?,
+            root: paths::pin_root(root)?,
             limits,
             excluded: vec![".git".into()],
             package_capture: false,
@@ -154,7 +154,7 @@ impl Repository {
     pub fn open_for_package(root: &Path, limits: Limits) -> Result<Self> {
         limits.validate()?;
         Ok(Self {
-            root: paths::pin(root, true, false)?,
+            root: paths::pin_root(root)?,
             limits,
             excluded: vec![],
             package_capture: true,
@@ -172,6 +172,11 @@ impl Repository {
         if path.split('/').any(|s| s.eq_ignore_ascii_case(".git")) {
             return Err(Error::Denied("Git metadata is outside file capability"));
         }
+        if self.excluded.iter().any(|p| paths::beneath(path, p)) {
+            return Err(Error::Denied(
+                "path is outside repository source visibility",
+            ));
+        }
         Ok(())
     }
     pub(crate) fn lock(&self, path: &str, write: bool) -> Result<Pinned> {
@@ -187,6 +192,7 @@ impl Repository {
         pin: &mut Pinned,
         path: &str,
     ) -> Result<(FileVersion, Vec<u8>)> {
+        self.check_path(path)?;
         if pin.file.metadata()?.len() > self.limits.max_file_bytes {
             return Err(Error::Quota("file bytes"));
         }

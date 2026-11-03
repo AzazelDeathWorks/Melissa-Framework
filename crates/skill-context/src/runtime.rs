@@ -862,17 +862,17 @@ impl ContextRuntime {
                         self.source_inventory
                             .iter()
                             .find(|s| &s.id == id)
-                            .cloned()
                             .ok_or_else(|| Error("unknown memory source".into()))
                     })
                     .collect::<Result<Vec<_>>>()?;
+                crate::state::validate_memory_sources(selected.iter().copied())?;
                 let id = format!("memory:{}", ctx.invocation_id);
                 let d = self.state.memory.propose(
                     &id,
                     self.grant.namespace.clone(),
                     key,
                     claim,
-                    selected,
+                    selected.into_iter().cloned().collect(),
                 )?;
                 value!({"id":id,"proposal_digest":d,"status":"proposed","verified":false})
             }
@@ -942,7 +942,10 @@ impl ContextRuntime {
                     !key.trim().is_empty()
                         && !claim.trim().is_empty()
                         && claim.len() <= 65536
-                        && !source_ids.is_empty(),
+                        && key.len() <= 1024
+                        && !source_ids.is_empty()
+                        && source_ids.len() <= crate::state::MAX_MEMORY_SOURCES
+                        && source_ids.iter().collect::<BTreeSet<_>>().len() == source_ids.len(),
                     "invalid memory proposal fields",
                 )?;
             }
@@ -1318,7 +1321,7 @@ impl ToolDispatcher for ContextDispatcher {
                     "skill_load"=>("fs.read","skill_load",value!({"pin":{"type":"object"}})),
                     "context_search"=>("fs.search","search",value!({"query":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":256},"symbols":{"type":"array","items":{"type":"string"}}})),
                     "memory_search"=>("memory.search","memory_search",value!({"query":{"type":"string"}})),
-                    "memory_propose"=>("memory.propose","memory_propose",value!({"key":{"type":"string"},"claim":{"type":"string"},"source_ids":{"type":"array","minItems":1,"items":{"type":"string"}}})),
+                    "memory_propose"=>("memory.propose","memory_propose",value!({"key":{"type":"string","maxLength":1024},"claim":{"type":"string","maxLength":65536},"source_ids":{"type":"array","minItems":1,"maxItems":crate::state::MAX_MEMORY_SOURCES,"uniqueItems":true,"items":{"type":"string"}}})),
                     "context_template"=>("fs.read","template",value!({"pin":{"type":"object"},"path":{"type":"string"},"fields":{"type":"object"}})),
                     "context_factory"=>("fs.read","shared_template",value!({"category":{"type":"string","enum":scripts::TEMPLATE_CATEGORIES},"input":{"type":"object"}})),
                     "skill_helper"=>("fs.read","helper",value!({"pin":{"type":"object"},"path":{"type":"string"},"input":{"type":"object"}})),

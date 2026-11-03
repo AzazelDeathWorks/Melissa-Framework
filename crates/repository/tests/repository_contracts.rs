@@ -17,6 +17,75 @@ fn root() -> (tempfile::TempDir, Repository) {
     (t, Repository::open(&p, Limits::default(), vec![]).unwrap())
 }
 #[test]
+fn host_root_aliases_are_normalized_but_model_file_aliases_remain_denied() {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+    fn short(path: &std::path::Path) -> std::path::PathBuf {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut out = vec![0u16; 32768];
+        let len = unsafe { GetShortPathNameW(wide.as_ptr(), out.as_mut_ptr(), out.len() as u32) }
+            as usize;
+        assert!(len > 0 && len < out.len());
+        std::ffi::OsString::from_wide(&out[..len]).into()
+    }
+    let (_t, repo) = root();
+    let alias = short(repo.root_path());
+    let reopened = Repository::open(&alias, Limits::default(), vec![]).unwrap();
+    assert_eq!(repo.root_identity(), reopened.root_identity());
+    assert_eq!(repo.root_path(), reopened.root_path());
+    let forward = repo.root_path().to_string_lossy().replace('\\', "/");
+    assert_eq!(
+        repo.root_identity(),
+        Repository::open(std::path::Path::new(&forward), Limits::default(), vec![])
+            .unwrap()
+            .root_identity()
+    );
+    let file = repo.root_path().join("long-filename-for-alias-test.txt");
+    fs::write(&file, "private").unwrap();
+    let alias = short(&file);
+    let name = alias.file_name().unwrap().to_str().unwrap();
+    if name != "long-filename-for-alias-test.txt" {
+        assert!(matches!(repo.read(name), Err(Error::Denied(_))));
+    }
+    assert!(repo.read("long-filename-for-alias-test.txt").is_ok());
+}
+
+#[test]
+fn direct_reads_and_reopened_handles_cannot_bypass_source_exclusions() {
+    let (_t, repo) = root();
+    fs::create_dir(repo.root_path().join("target")).unwrap();
+    fs::write(repo.root_path().join("target/hidden.txt"), b"excluded").unwrap();
+    let scoped =
+        Repository::open(repo.root_path(), Limits::default(), vec!["crate-b".into()]).unwrap();
+    for r in [&scoped, &scoped.reopen().unwrap()] {
+        for path in [
+            "crate-b/lib.rs",
+            "CRATE-B/lib.rs",
+            "target/hidden.txt",
+            "TARGET/hidden.txt",
+        ] {
+            assert!(matches!(r.read(path), Err(Error::Denied(_))), "{path}");
+        }
+        assert!(r.read("crate-a/lib.rs").is_ok());
+        let snapshot = r.snapshot(&AtomicBool::new(false)).unwrap();
+        assert_eq!(snapshot.files.len(), 1);
+    }
+    // Explicit complete Git/package capture has a different host-selected policy.
+    assert!(
+        Repository::open_for_git(repo.root_path(), Limits::default())
+            .unwrap()
+            .read("target/hidden.txt")
+            .is_ok()
+    );
+    assert!(
+        Repository::open_for_package(repo.root_path(), Limits::default())
+            .unwrap()
+            .read("target/hidden.txt")
+            .is_ok()
+    );
+}
+
+#[test]
 fn reopened_repository_preserves_exclusions_limits_and_package_capture() {
     let (temp, r) = root();
     let scoped = Repository::open(

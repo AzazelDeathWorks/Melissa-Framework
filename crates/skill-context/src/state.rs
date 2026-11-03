@@ -126,6 +126,25 @@ pub struct Memory {
 pub struct MemoryBook {
     records: BTreeMap<String, Memory>,
 }
+/// Host allocation bounds, checked on borrowed sources before cloning content.
+pub const MAX_MEMORY_SOURCES: usize = 128;
+pub const MAX_MEMORY_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+pub fn validate_memory_sources<'a>(sources: impl IntoIterator<Item = &'a Source>) -> Result<()> {
+    let mut ids = BTreeSet::new();
+    let mut total = 0usize;
+    for source in sources {
+        require(ids.len() < MAX_MEMORY_SOURCES, "too many memory sources")?;
+        require(ids.insert(&source.id), "duplicate memory source")?;
+        total = total
+            .checked_add(source.content.len())
+            .ok_or_else(|| crate::Error("memory source size overflow".into()))?;
+        require(
+            total <= MAX_MEMORY_SOURCE_BYTES,
+            "memory source bytes exceed host envelope",
+        )?;
+    }
+    require(!ids.is_empty(), "memory sources required")
+}
 impl MemoryBook {
     pub fn records(&self) -> &BTreeMap<String, Memory> {
         &self.records
@@ -194,9 +213,12 @@ impl MemoryBook {
         sources: Vec<Source>,
     ) -> Result<String> {
         namespace.validate()?;
+        validate_memory_sources(&sources)?;
         require(
             !id.trim().is_empty()
+                && id.len() <= 512
                 && !key.trim().is_empty()
+                && key.len() <= 1024
                 && !claim.trim().is_empty()
                 && claim.len() <= 65536
                 && !self.records.contains_key(id)

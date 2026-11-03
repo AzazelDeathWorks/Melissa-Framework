@@ -42,6 +42,30 @@ fn request() -> PackRequest {
         skills: vec![],
     }
 }
+
+#[test]
+fn memory_proposals_reject_duplicate_and_oversized_sources_before_mutation() {
+    let s = source("src/a.rs", "evidence");
+    let mut book = MemoryBook::default();
+    assert!(validate_memory_sources([&s, &s]).is_err());
+    assert!(
+        book.propose("m", namespace(), "key", "claim", vec![s.clone(), s.clone()])
+            .is_err()
+    );
+    assert!(book.records().is_empty());
+    let big = source("src/b.rs", &"x".repeat(MAX_MEMORY_SOURCE_BYTES));
+    assert!(validate_memory_sources([&big]).is_ok());
+    assert!(validate_memory_sources([&big, &s]).is_err());
+    let many: Vec<_> = (0..=MAX_MEMORY_SOURCES)
+        .map(|i| source(&format!("src/{i}"), ""))
+        .collect();
+    assert!(validate_memory_sources(&many).is_err());
+    assert!(
+        book.propose("m", namespace(), "key", "claim", vec![s])
+            .is_ok()
+    );
+    assert_eq!(book.records().len(), 1);
+}
 fn checkpoint() -> (Checkpoint, ResumeState, Registry, SkillPolicy) {
     let (reg, policy, pins) = setup();
     let mut r = request();

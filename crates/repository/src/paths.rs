@@ -89,6 +89,7 @@ fn open_mode(
     write: bool,
     delete: bool,
     create: bool,
+    host_root: bool,
 ) -> Result<(File, String, PathBuf)> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::*;
@@ -116,11 +117,11 @@ fn open_mode(
         opts.access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE);
     }
     let file = opts.open(path)?;
-    inspect(file, path, dir)
+    inspect(file, path, dir, host_root)
 }
 
 #[cfg(windows)]
-fn inspect(file: File, path: &Path, dir: bool) -> Result<(File, String, PathBuf)> {
+fn inspect(file: File, path: &Path, dir: bool, host_root: bool) -> Result<(File, String, PathBuf)> {
     use std::os::windows::{ffi::OsStringExt, fs::MetadataExt, io::AsRawHandle};
     use windows_sys::Win32::Storage::FileSystem::*;
     let meta = file.metadata()?;
@@ -152,7 +153,7 @@ fn inspect(file: File, path: &Path, dir: bool) -> Result<(File, String, PathBuf)
         .ok_or(Error::Denied("non-local handle path"))?;
     let canonical = PathBuf::from(name);
     absolute(&canonical)?;
-    if key(&canonical.to_string_lossy()) != key(&path.to_string_lossy()) {
+    if !host_root && absolute_key(&canonical) != absolute_key(path) {
         return Err(Error::Denied("handle target alias"));
     }
     let identity = format!(
@@ -163,15 +164,29 @@ fn inspect(file: File, path: &Path, dir: bool) -> Result<(File, String, PathBuf)
 }
 
 pub(crate) fn pin(path: &Path, dir: bool, write: bool) -> Result<Pinned> {
-    pin_mode(path, dir, write, false)
+    pin_mode(path, dir, write, false, false)
+}
+
+/// Only the trusted host establishes a root. Normalize its spelling from held
+/// handles (e.g. a Windows runner's short TEMP path), with every ancestor pinned
+/// and reparse points still denied. All subsequent model paths use strict pin().
+pub(crate) fn pin_root(path: &Path) -> Result<Pinned> {
+    pin_mode(path, true, false, false, true)
+}
+
+#[cfg(windows)]
+fn absolute_key(path: &Path) -> Vec<String> {
+    path.components()
+        .map(|p| key(&p.as_os_str().to_string_lossy()))
+        .collect()
 }
 
 pub(crate) fn pin_delete(path: &Path) -> Result<Pinned> {
-    pin_mode(path, false, true, true)
+    pin_mode(path, false, true, true, false)
 }
 
 pub(crate) fn pin_delete_directory(path: &Path) -> Result<Pinned> {
-    pin_mode(path, true, false, true)
+    pin_mode(path, true, false, true, false)
 }
 
 /// Relative FILE_CREATE returns the new directory handle in the same system
@@ -238,7 +253,7 @@ pub(crate) fn create_directory(parent: &Pinned, name: &str) -> Result<Pinned> {
             .into());
         }
         let f = unsafe { File::from_raw_handle(handle) };
-        let (file, identity, canonical) = inspect(f, &parent.canonical.join(name), true)?;
+        let (file, identity, canonical) = inspect(f, &parent.canonical.join(name), true, false)?;
         Ok(Pinned {
             file,
             identity,
@@ -253,10 +268,10 @@ pub(crate) fn create_directory(parent: &Pinned, name: &str) -> Result<Pinned> {
     }
 }
 
-fn pin_mode(path: &Path, dir: bool, write: bool, delete: bool) -> Result<Pinned> {
+fn pin_mode(path: &Path, dir: bool, write: bool, delete: bool, host_root: bool) -> Result<Pinned> {
     #[cfg(not(windows))]
     {
-        let _ = (path, dir, write, delete);
+        let _ = (path, dir, write, delete, host_root);
         Err(Error::Unsupported(
             "Windows handle-pinned filesystem required",
         ))
@@ -271,14 +286,14 @@ fn pin_mode(path: &Path, dir: bool, write: bool, delete: bool) -> Result<Pinned>
         chain.reverse();
         let mut guards = Vec::new();
         for p in chain {
-            let (f, _, actual) = open_mode(p, true, false, false, false)?;
-            if key(&actual.to_string_lossy()) != key(&p.to_string_lossy()) {
+            let (f, _, actual) = open_mode(p, true, false, false, false, host_root)?;
+            if !host_root && absolute_key(&actual) != absolute_key(p) {
                 return Err(Error::Denied("ancestor alias is not canonical"));
             }
             guards.push(f);
         }
-        let (file, identity, canonical) = open_mode(path, dir, write, delete, false)?;
-        if key(&canonical.to_string_lossy()) != key(&path.to_string_lossy()) {
+        let (file, identity, canonical) = open_mode(path, dir, write, delete, false, host_root)?;
+        if !host_root && absolute_key(&canonical) != absolute_key(path) {
             return Err(Error::Denied("target alias is not canonical"));
         }
         Ok(Pinned {
@@ -295,7 +310,7 @@ fn pin_mode(path: &Path, dir: bool, write: bool, delete: bool) -> Result<Pinned>
 pub(crate) fn create_new(path: &Path) -> Result<Pinned> {
     #[cfg(windows)]
     {
-        let (file, identity, canonical) = open_mode(path, false, true, false, true)?;
+        let (file, identity, canonical) = open_mode(path, false, true, false, true, false)?;
         Ok(Pinned {
             file,
             identity,
