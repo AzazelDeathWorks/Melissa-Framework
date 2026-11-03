@@ -50,10 +50,10 @@ fn fixture_config(mode: &str, config: StoreConfig) -> Fixture {
     let project = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     // A real isolated PE fixture; copy removes Cargo's shared hard-link identity.
     fs::copy(
-        project.join("target/debug/melissa-executor-probe.exe"),
+        std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("melissa-executor-probe.exe"),
         &executable,
     )
-    .expect("build melissa-executor-probe first with scripts/verify-code03.ps1");
+    .expect("build melissa-executor-probe with cargo build -p melissa-windows-executor --bins using the same target/profile");
     let mut task: TaskContractV1 = serde_json::from_slice(include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../tests/fixtures/code01/wire/task-contract-v1.json"

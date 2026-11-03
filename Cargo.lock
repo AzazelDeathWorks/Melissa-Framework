@@ -997,6 +997,7 @@ dependencies = [
  "melissa-local-store",
  "melissa-model-gateway",
  "melissa-repository",
+ "melissa-windows-executor",
  "regex",
  "serde",
  "serde_json",

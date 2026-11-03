@@ -315,6 +315,9 @@ impl Repository {
         cancel: &AtomicBool,
     ) -> Result<WorkerInput> {
         self.validate_snapshot(source, cancel)?;
+        melissa_container_executor::Snapshot::preflight(
+            source.files.iter().map(|f| (f.path.as_str(), f.bytes)), self.limits.max_total_bytes,
+        ).map_err(|_| Error::Quota("worker transfer preflight: file count, bytes, reserved path or ustar path capacity"))?;
         let mut files = std::collections::BTreeMap::new();
         for f in &source.files {
             check_cancel(cancel)?;
@@ -358,9 +361,8 @@ impl Repository {
             }
             let (mut start, mut line, mut counted) = (0, 1, 0);
             // Restart one byte past each hit so overlapping matches are kept.
-            while let Some(found) = finder.find(&bytes[start..]) {
+            while let Some(pos) = find_chunked(&bytes, start, &finder, needle.len(), cancel)? {
                 check_cancel(cancel)?;
-                let pos = start + found;
                 if hits.len() == self.limits.max_search_hits {
                     truncated = true;
                     break;
@@ -384,5 +386,62 @@ impl Repository {
             truncated,
             snapshot_digest: snapshot.digest.clone(),
         })
+    }
+}
+
+fn find_chunked(
+    bytes: &[u8],
+    start: usize,
+    finder: &memchr::memmem::Finder<'_>,
+    needle_len: usize,
+    cancel: &AtomicBool,
+) -> Result<Option<usize>> {
+    let mut cursor = start;
+    while cursor < bytes.len() {
+        check_cancel(cancel)?;
+        let end = bytes
+            .len()
+            .min(cursor.saturating_add(256 * 1024 + needle_len - 1));
+        if let Some(found) = finder.find(&bytes[cursor..end]) {
+            return Ok(Some(cursor + found));
+        }
+        if end == bytes.len() {
+            break;
+        }
+        cursor += 256 * 1024;
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+    #[test]
+    fn chunk_boundaries_overlaps_and_cancellation_preserve_literal_search() {
+        let cancel = AtomicBool::new(false);
+        let finder = memchr::memmem::Finder::new(b"aaa");
+        assert_eq!(
+            find_chunked(b"aaaa", 0, &finder, 3, &cancel).unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            find_chunked(b"aaaa", 1, &finder, 3, &cancel).unwrap(),
+            Some(1)
+        );
+        let mut bytes = vec![b'x'; 600_000];
+        bytes[262_143..262_146].copy_from_slice(b"aaa");
+        assert_eq!(
+            find_chunked(&bytes, 0, &finder, 3, &cancel).unwrap(),
+            Some(262_143)
+        );
+        assert_eq!(
+            find_chunked(&bytes, 262_144, &finder, 3, &cancel).unwrap(),
+            None
+        );
+        cancel.store(true, std::sync::atomic::Ordering::Release);
+        assert!(matches!(
+            find_chunked(&bytes, 0, &finder, 3, &cancel),
+            Err(Error::Cancelled)
+        ));
     }
 }

@@ -10,6 +10,13 @@ fn main() {
     let args: Vec<_> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("ok");
     match mode {
+        "host-capture-echo" => {
+            let mut input = String::new();
+            std::io::stdin().read_to_string(&mut input).unwrap();
+            assert!(input.is_empty());
+            println!("{}", args.get(2).map(String::as_str).unwrap_or(""));
+            eprintln!("captured-error-stream");
+        }
         "ok" => {
             let mut stdin = String::new();
             std::io::stdin().read_to_string(&mut stdin).unwrap();

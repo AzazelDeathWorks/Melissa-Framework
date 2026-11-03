@@ -25,6 +25,151 @@ use windows_sys::Win32::{
 fn wide(s: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
     s.as_ref().encode_wide().chain(Some(0)).collect()
 }
+
+pub(crate) fn capture_host(
+    executable: &Path,
+    arguments: &[String],
+    cwd: &Path,
+    wall_time_ms: u64,
+    limit: usize,
+    cancel: &AtomicBool,
+) -> Result<HostCapture, ExecutorError> {
+    let job = Handle::new(
+        unsafe { CreateJobObjectW(null(), null()) },
+        "host capture job",
+    )?;
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    job_set(job.0, JobObjectExtendedLimitInformation, &limits)?;
+    let (input, input_write) = pipe()?;
+    drop(input_write); // deterministic EOF; no interactive host input
+    let (stdout, output_write) = pipe()?;
+    let (stderr, error_write) = pipe()?;
+    let inherited = [input.0, output_write.0, error_write.0];
+    let jobs = [job.0];
+    let mut attrs = Attributes::new()?;
+    attrs.set(
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+        inherited.as_ptr(),
+        inherited.len(),
+    )?;
+    attrs.set(PROC_THREAD_ATTRIBUTE_JOB_LIST, jobs.as_ptr(), jobs.len())?;
+    let mut startup: STARTUPINFOEXW = unsafe { zeroed() };
+    startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = input.0;
+    startup.StartupInfo.hStdOutput = output_write.0;
+    startup.StartupInfo.hStdError = error_write.0;
+    startup.lpAttributeList = attrs.ptr();
+    let executable_text = executable
+        .to_str()
+        .ok_or_else(|| ExecutorError::InvalidRequest("Unicode executable required".into()))?;
+    let line = std::iter::once(executable_text)
+        .chain(arguments.iter().map(String::as_str))
+        .map(quoted)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut line = wide(line);
+    if line.len() > 32767 {
+        return Err(ExecutorError::InvalidRequest(
+            "host command line too large".into(),
+        ));
+    }
+    let mut info: PROCESS_INFORMATION = unsafe { zeroed() };
+    // JOB_LIST associates the process before its first instruction. No
+    // spawn-then-assign gap, unrestricted fallback or shell interpretation.
+    bool_ok(
+        unsafe {
+            CreateProcessW(
+                wide(executable).as_ptr(),
+                line.as_mut_ptr(),
+                null(),
+                null(),
+                1,
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                null(),
+                wide(cwd).as_ptr(),
+                &startup.StartupInfo,
+                &mut info,
+            )
+        },
+        "owned host process",
+    )?;
+    let process = Handle::new(info.hProcess, "host process handle")?;
+    let primary_thread = Handle::new(info.hThread, "host thread handle")?;
+    drop(primary_thread);
+    drop(input);
+    drop(output_write);
+    drop(error_write);
+    let output = Arc::new(Mutex::new(Output::default()));
+    let exceeded = Arc::new(AtomicBool::new(false));
+    let readers = [
+        reader(stdout, false, output.clone(), limit, exceeded.clone()),
+        reader(stderr, true, output.clone(), limit, exceeded.clone()),
+    ];
+    let started = Instant::now();
+    let mut termination = loop {
+        if cancel.load(Ordering::Acquire) {
+            break TerminationReason::Cancelled;
+        }
+        if exceeded.load(Ordering::Acquire) {
+            break TerminationReason::OutputLimit;
+        }
+        if started.elapsed().as_millis() >= wall_time_ms as u128 {
+            break TerminationReason::Timeout;
+        }
+        match unsafe { WaitForSingleObject(process.0, 10) } {
+            WAIT_OBJECT_0 => break TerminationReason::Exited,
+            WAIT_TIMEOUT => (),
+            _ => return Err(last("host process wait")),
+        }
+    };
+    let mut exit_code = 0;
+    bool_ok(
+        unsafe { GetExitCodeProcess(process.0, &mut exit_code) },
+        "host process exit code",
+    )?;
+    // Even a naturally exited root must not leave descendants holding pipes.
+    bool_ok(
+        unsafe { TerminateJobObject(job.0, 1) },
+        "stop owned host process tree",
+    )?;
+    let drain = Instant::now();
+    while job_query::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>(
+        job.0,
+        JobObjectBasicAccountingInformation,
+    )?
+    .ActiveProcesses
+        != 0
+    {
+        if drain.elapsed() > Duration::from_secs(5) {
+            return Err(ExecutorError::Security(
+                "host process tree did not stop".into(),
+            ));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    for reader in readers {
+        reader
+            .join()
+            .map_err(|_| ExecutorError::Security("host output reader failed".into()))?;
+    }
+    let mut captured = output
+        .lock()
+        .map_err(|_| ExecutorError::Security("host output lock failed".into()))?;
+    if captured.failed {
+        return Err(ExecutorError::Security("host output capture failed".into()));
+    }
+    if captured.truncated {
+        termination = TerminationReason::OutputLimit;
+    }
+    Ok(HostCapture {
+        termination,
+        exit_code,
+        stdout: std::mem::take(&mut captured.stdout),
+        stderr: std::mem::take(&mut captured.stderr),
+    })
+}
 fn last(context: &str) -> ExecutorError {
     ExecutorError::Security(format!("{context}: {}", std::io::Error::last_os_error()))
 }

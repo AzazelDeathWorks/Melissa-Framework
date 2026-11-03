@@ -3,6 +3,7 @@
 //! A located finding is a candidate, not a proven defect. Developer check
 //! claims are untrusted. Neither can mint protected acceptance or publish.
 pub mod candidate;
+mod host_process;
 pub mod package;
 pub mod profiles;
 pub mod protected;

@@ -8,6 +8,8 @@ mod runtime;
 
 pub const EXECUTION_CONTRACT: &str = "linux.docker.readonly-tmpfs/v1";
 const MAX_CAPTURE: u64 = 64 * 1024 * 1024;
+pub const MAX_SNAPSHOT_BYTES: u64 = MAX_CAPTURE;
+pub const MAX_SNAPSHOT_FILES: usize = 1024;
 pub type ExecutorResult<T = ()> = Result<T, ExecutorError>;
 
 #[derive(Debug)]
@@ -182,25 +184,34 @@ pub struct Snapshot {
     pub files: BTreeMap<String, Vec<u8>>,
 }
 impl Snapshot {
-    pub fn validate(&self, max_bytes: u64) -> ExecutorResult {
-        if self.files.len() > 1024 {
-            return Err(ExecutorError::Invalid("snapshot file count".into()));
-        }
+    /// Validate transfer metadata before allocating or hex-encoding file bytes.
+    pub fn preflight<'a>(
+        files: impl IntoIterator<Item = (&'a str, u64)>,
+        max_bytes: u64,
+    ) -> ExecutorResult {
+        let mut paths = std::collections::BTreeSet::new();
         let mut total = 0u64;
-        for (name, data) in &self.files {
+        for (name, bytes) in files {
             archive::safe_name(name)?;
             if name == ".melissa-runtime" || name.starts_with(".melissa-runtime/") {
                 return Err(ExecutorError::Invalid("reserved snapshot path".into()));
             }
+            if paths.len() >= MAX_SNAPSHOT_FILES || !paths.insert(name) {
+                return Err(ExecutorError::Invalid(
+                    "snapshot file count or duplicate path".into(),
+                ));
+            }
             total = total
-                .checked_add(data.len() as u64)
+                .checked_add(bytes)
                 .ok_or_else(|| ExecutorError::Invalid("snapshot size overflow".into()))?;
-            if total > max_bytes.min(MAX_CAPTURE) {
+            if total > max_bytes.min(MAX_SNAPSHOT_BYTES) {
                 return Err(ExecutorError::Invalid("snapshot byte bound".into()));
             }
-            let mut parent = name.as_str();
+        }
+        for name in &paths {
+            let mut parent = *name;
             while let Some((head, _)) = parent.rsplit_once('/') {
-                if self.files.contains_key(head) {
+                if paths.contains(head) {
                     return Err(ExecutorError::Invalid(
                         "snapshot file-directory collision".into(),
                     ));
@@ -209,6 +220,12 @@ impl Snapshot {
             }
         }
         Ok(())
+    }
+    pub fn validate(&self, max_bytes: u64) -> ExecutorResult {
+        Self::preflight(
+            self.files.iter().map(|(p, b)| (p.as_str(), b.len() as u64)),
+            max_bytes,
+        )
     }
     pub fn digest(&self) -> ExecutorResult<String> {
         self.validate(MAX_CAPTURE)?;

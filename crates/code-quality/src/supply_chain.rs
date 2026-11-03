@@ -8,7 +8,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
-    process::Command,
     sync::atomic::AtomicBool,
 };
 pub struct CargoTool {
@@ -79,12 +78,13 @@ pub fn capture_cargo(
     }) {
         return Err(Error::Denied("Cargo config/toolchain overrides"));
     }
-    let output = Command::new(&tool.executable)
-        .args(["metadata", "--format-version=1", "--locked", "--offline"])
-        .current_dir(repo.root_path())
-        .output()
-        .map_err(|_| Error::Denied("Cargo metadata execution"))?;
-    if !output.status.success() || output.stdout.len() > 32 * 1024 * 1024 {
+    let output = crate::host_process::capture(
+        &tool.executable,
+        &["metadata", "--format-version=1", "--locked", "--offline"].map(str::to_owned),
+        repo.root_path(),
+        cancel,
+    )?;
+    if output.exit_code != 0 {
         return Err(Error::Invalid("Cargo metadata failed or oversized"));
     }
     let value = melissa_model_gateway::strict_json(

@@ -141,6 +141,56 @@ impl From<std::io::Error> for ExecutorError {
 pub struct Executor;
 pub const ENVIRONMENT_CONTRACT: &str = "windows.appcontainer.job.environment/v2";
 pub const DESCENDANT_DRAIN_GRACE_MS: u64 = 100;
+
+/// Trusted host inspection only. This does not replace the AppContainer worker
+/// or grant a model a shell. Windows starts the process in an owned Job Object.
+#[derive(Debug)]
+pub struct HostCapture {
+    pub termination: TerminationReason,
+    pub exit_code: u32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+pub fn capture_host(
+    executable: &std::path::Path,
+    arguments: &[String],
+    cwd: &std::path::Path,
+    wall_time_ms: u64,
+    max_output_bytes: usize,
+    cancel: &AtomicBool,
+) -> Result<HostCapture, ExecutorError> {
+    if !executable.is_absolute()
+        || !cwd.is_absolute()
+        || wall_time_ms == 0
+        || wall_time_ms > 1_800_000
+        || max_output_bytes == 0
+        || max_output_bytes > 64 * 1024 * 1024
+        || arguments.len() > 1024
+        || arguments.iter().any(|s| s.contains('\0'))
+    {
+        return Err(ExecutorError::InvalidRequest("host capture bounds".into()));
+    }
+    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(ExecutorError::CancelledBeforeLaunch);
+    }
+    #[cfg(windows)]
+    {
+        native::capture_host(
+            executable,
+            arguments,
+            cwd,
+            wall_time_ms,
+            max_output_bytes,
+            cancel,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        Err(ExecutorError::Unsupported(
+            "owned host inspection requires Windows Job Objects".into(),
+        ))
+    }
+}
 impl Executor {
     pub fn run(
         request: &ExecuteRequest,

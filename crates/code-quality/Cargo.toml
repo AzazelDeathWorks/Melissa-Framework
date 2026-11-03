@@ -11,6 +11,7 @@ melissa-repository = { path = "../repository" }
 melissa-local-store = { path = "../local-store" }
 melissa-model-gateway = { path = "../model-gateway" }
 melissa-execution-broker = { path = "../execution-broker" }
+melissa-windows-executor = { path = "../windows-executor" }
 serde.workspace = true
 serde_json.workspace = true
 blake3.workspace = true

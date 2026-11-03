@@ -10,6 +10,21 @@ use std::{
     time::{Duration, Instant},
 };
 const IMAGE: &str = "sha256:b8b264f0d1c889fe9510197a0b16a85d06685b2d112bb4115f7b33072ce46ec4";
+#[test]
+fn long_utf8_ustar_paths_reach_the_actual_worker_without_truncation() {
+    let name = format!("{}/{}", "ü".repeat(70), "x".repeat(99));
+    let snapshot = Snapshot {
+        files: BTreeMap::from([(name.clone(), b"exact long-path input".to_vec())]),
+    };
+    let mut request = make_request("");
+    request.executable = "/bin/cat".into();
+    request.argv = vec![name];
+    let report = Executor::run(&request, &snapshot, &AtomicBool::new(false)).unwrap();
+    assert_eq!(report.termination, TerminationReason::Exited);
+    assert_eq!(report.exit_code, Some(0));
+    assert_eq!(report.stdout, b"exact long-path input");
+    assert!(report.cleanup_confirmed && report.tree_confirmed_stopped);
+}
 fn make_request(script: &str) -> ContainerRequest {
     ContainerRequest {
         schema_version: "melissa.container-exec/v1".into(),

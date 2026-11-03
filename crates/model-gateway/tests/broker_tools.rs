@@ -951,7 +951,13 @@ fn native_dispatcher_runs_real_appcontainer_probe_and_rejects_changed_arguments(
     let project = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let executable = dir.path().join("owned-probe.exe");
     std::fs::copy(
-        project.join("target/debug/melissa-executor-probe.exe"),
+        std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("melissa-executor-probe.exe"),
         &executable,
     )
     .expect("build the real native executor probe before running native broker acceptance");
