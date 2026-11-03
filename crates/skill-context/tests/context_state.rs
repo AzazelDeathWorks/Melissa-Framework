@@ -339,6 +339,35 @@ fn model_memory_is_a_proposal_until_an_explicit_fresh_host_review() {
     assert_eq!(b.search(&sc, "answer").len(), 1);
 }
 #[test]
+fn renewed_observation_keeps_review_digest_but_changed_content_still_blocks_acceptance() {
+    let mut src = source("s", "fact");
+    let mut book = MemoryBook::default();
+    let expected = book
+        .propose("m", namespace(), "k", "claim", vec![src.clone()])
+        .unwrap();
+    src.observed_at_ms = 5;
+    src.valid_until_ms = 200;
+    book.revalidate(&namespace(), &[src.clone()]);
+    let mut changed = book.clone();
+    book.review(
+        "m",
+        &expected,
+        &scope(&[src.clone()]),
+        true,
+        "e",
+        &BTreeSet::new(),
+    )
+    .unwrap();
+    src.content = "different fact".into();
+    src.digest = digest(src.content.as_bytes());
+    changed.revalidate(&namespace(), &[src.clone()]);
+    assert!(
+        changed
+            .review("m", &expected, &scope(&[src]), true, "e", &BTreeSet::new())
+            .is_err()
+    );
+}
+#[test]
 fn stale_cross_project_and_engagement_memory_never_become_verified_facts() {
     let src = source("s", "fact");
     let sc = scope(std::slice::from_ref(&src));

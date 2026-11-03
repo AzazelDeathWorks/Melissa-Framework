@@ -1,7 +1,7 @@
 //! Quota/ownership-aware encrypted Journal continuation, shared by native Gateway.
 use crate::{Namespace, Result, digest, json, require};
 use melissa_core_contracts::{TaskState, design::SkillPin};
-use melissa_local_store::{ArtifactRequest, LocalStore, StoreError};
+use melissa_local_store::{ArtifactRequest, LocalStore, StoreError, journal::ModelRequestState};
 use melissa_model_gateway::{
     ErrorKind, GatewayError,
     continuation::{ContinuationStore, Phase, TurnCheckpoint, TurnCheckpointView},
@@ -57,7 +57,7 @@ impl JournalContinuation {
             messages: MessageLog::default(),
         }
     }
-    fn current(&self, store: &LocalStore) -> Result<(Freshness, u64, u64)> {
+    fn current(&self, store: &LocalStore, pending: Option<&str>) -> Result<(Freshness, u64, u64)> {
         require(
             !self.cancelled.load(Ordering::Acquire),
             "continuation cancelled or authority revoked",
@@ -82,9 +82,20 @@ impl JournalContinuation {
         )?;
         let b = store.journal().model_budget(&self.task)?;
         require(
-            b.active_requests == 0 && b.unknown_requests == 0 && !b.budget_exceeded,
+            b.active_requests == u64::from(pending.is_some())
+                && b.unknown_requests == 0
+                && !b.budget_exceeded,
             "unsettled model ledger blocks continuation",
         )?;
+        if let Some(id) = pending {
+            let request = store.journal().model_request(id)?;
+            require(
+                request.reservation.task_id == self.task
+                    && request.state == ModelRequestState::Reserved
+                    && request.dispatched_at_unix_ms.is_none(),
+                "pending checkpoint requires its exact never-dispatched reservation",
+            )?;
+        }
         let f = (self.refresh)()?;
         f.namespace.validate()?;
         require(
@@ -116,7 +127,7 @@ impl ContinuationStore for JournalContinuation {
                 task == self.task && run == self.run,
                 "continuation host identity mismatch",
             )?;
-            let (fresh, cost, requests) = self.current(store)?;
+            let (fresh, cost, requests) = self.current(store, None)?;
             match store.artifact_metadata(task, &format!("model-run:{run}:result")) {
                 Ok(_) => return Err(crate::Error("terminal run cannot be replayed".into())),
                 Err(StoreError::NotFound(_)) => {}
@@ -185,7 +196,8 @@ impl ContinuationStore for JournalContinuation {
         state: &TurnCheckpointView<'_>,
     ) -> melissa_model_gateway::Result<()> {
         (||->Result<()>{
-            let(fresh,cost,requests)=self.current(store)?;
+            let pending = (state.phase == Phase::InferencePending).then(|| format!("model:{}:{}", self.run, state.result.request_ids.len() + 1));
+            let(fresh,cost,requests)=self.current(store, pending.as_deref())?;
             require(state.result.task_id==self.task&&state.result.run_id==self.run,"checkpoint task mismatch")?;
             let transcript = self.messages.save(store, &self.task, &self.run, state.messages).map_err(|e|crate::Error(e.to_string()))?;
             let e=Envelope{state:state.metadata(),transcript:Some(transcript),freshness:fresh,charged_cost:cost,known_requests:requests};let bytes=serde_json::to_vec(&e)?;

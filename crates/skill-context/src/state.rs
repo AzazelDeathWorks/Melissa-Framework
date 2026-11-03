@@ -122,6 +122,17 @@ pub struct Memory {
     pub status: MemoryStatus,
     pub review_evidence_ref: Option<String>,
 }
+fn memory_review_digest(record: &Memory) -> Result<String> {
+    // Re-observation renews freshness without changing the proposed fact.
+    // Identity, version, content digest, status and claim remain hash-bound;
+    // review separately requires every source to be current and unexpired.
+    let mut stable = record.clone();
+    for source in &mut stable.sources {
+        source.observed_at_ms = 0;
+        source.valid_until_ms = 0;
+    }
+    Ok(digest(&serde_json::to_vec(&stable)?))
+}
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryBook {
@@ -274,7 +285,7 @@ impl MemoryBook {
             status: MemoryStatus::Proposed,
             review_evidence_ref: None,
         };
-        let hash = digest(&serde_json::to_vec(&record)?);
+        let hash = memory_review_digest(&record)?;
         self.records.insert(id.into(), record);
         if let Err(error) = crate::encode_state(self) {
             self.records.remove(id);
@@ -299,7 +310,8 @@ impl MemoryBook {
             .ok_or_else(|| crate::Error("memory not found".into()))?;
         require(
             record.status == MemoryStatus::Proposed
-                && digest(&serde_json::to_vec(record)?) == expected
+                && (memory_review_digest(record)? == expected
+                    || digest(&serde_json::to_vec(record)?) == expected)
                 && record.namespace == scope.namespace
                 && !evidence_ref.trim().is_empty()
                 && record.sources.iter().all(|s| scope.allows_ref(s)),

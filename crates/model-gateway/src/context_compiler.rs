@@ -78,6 +78,16 @@ pub fn read_history(
         .journal()
         .task(&context.task_id)
         .map_err(store_error)?;
+    let expected_prefix = history_prefix(&context.run_id);
+    let scoped_digest = page
+        .artifact_ref
+        .strip_prefix(&expected_prefix)
+        .filter(|hash| {
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        });
     if cancelled.load(std::sync::atomic::Ordering::Acquire)
         || !task
             .contract
@@ -94,9 +104,7 @@ pub fn read_history(
                 | melissa_core_contracts::TaskState::Repairing
                 | melissa_core_contracts::TaskState::Verifying
         )
-        || !page
-            .artifact_ref
-            .starts_with(&history_prefix(&context.run_id))
+        || scoped_digest.is_none()
     {
         return Err(GatewayError::new(
             ErrorKind::Authorization,
@@ -109,7 +117,9 @@ pub fn read_history(
     let meta = store
         .artifact_metadata(&context.task_id, &page.artifact_ref)
         .map_err(store_error)?;
-    if meta.logical_type != "context.archived-observation" {
+    if meta.logical_type != "context.archived-observation"
+        || meta.digest.strip_prefix("blake3:") != scoped_digest
+    {
         return Err(failure("not an archived observation"));
     }
     let raw = store

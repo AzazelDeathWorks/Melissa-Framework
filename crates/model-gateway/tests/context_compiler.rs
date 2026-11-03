@@ -180,6 +180,55 @@ fn long_native_histories_keep_pairs_opaque_bytes_and_recover_archived_ranges() {
     }
 }
 #[test]
+fn history_scope_rejects_prefix_related_runs_and_incomplete_utf8_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, task, profile) = setup(dir.path());
+    let body = "ö content";
+    let hash = blake3::hash(body.as_bytes()).to_hex().to_string();
+    let own = format!("{}{}", history_prefix("run"), hash);
+    let nested = format!("{}{}", history_prefix("run:child"), hash);
+    for id in [&own, &nested] {
+        store
+            .put_artifact(
+                &melissa_local_store::ArtifactRequest {
+                    artifact_id: id.clone(),
+                    task_id: task.clone(),
+                    content_type: "text/plain".into(),
+                    logical_type: "context.archived-observation".into(),
+                    schema_version: "v1".into(),
+                    retain_until_ms: 0,
+                    legal_hold: false,
+                },
+                body.as_bytes(),
+            )
+            .unwrap();
+    }
+    let mut context = ToolContext {
+        task_id: task,
+        profile_id: profile,
+        run_id: "run".into(),
+        request_id: "r".into(),
+        invocation_id: "i".into(),
+        attempt_id: "a".into(),
+        generation: 1,
+    };
+    let page = |context: &ToolContext, id: &str, start: usize, size: usize| {
+        read_history(
+            &store,
+            context,
+            &json!({"artifact_ref":id,"start_byte":start,"max_bytes":size}).to_string(),
+            &AtomicBool::new(false),
+        )
+    };
+    assert!(page(&context, &nested, 0, 20).is_err());
+    assert!(page(&context, &own, 0, 1).is_err());
+    assert!(page(&context, &own, 1, 2).is_err());
+    let result: Value = serde_json::from_str(&page(&context, &own, 0, 2).unwrap().content).unwrap();
+    assert_eq!(result["content"], "ö");
+    context.run_id = "run:child".into();
+    assert!(page(&context, &nested, 0, 20).is_ok());
+}
+#[test]
 fn output_reservation_exact_host_bound_and_required_overflow_never_dispatch() {
     let dir = tempfile::tempdir().unwrap();
     let (mut store, task, _) = setup(dir.path());

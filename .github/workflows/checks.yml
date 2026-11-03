@@ -30,6 +30,8 @@ jobs:
         run: cargo +1.98.0 test --locked -p melissa-cli
       - name: Repository and recovery regressions
         run: cargo +1.98.0 test --locked -p melissa-repository --lib --test repository_contracts --test read_error_observations --test incremental_parse -p melissa-recovery --test real_effects --test resume
+      - name: Continuation reservation boundary without Docker
+        run: cargo +1.98.0 test --locked -p melissa-skill-context --test native_runtime durable_gateway_resume_reopens_encrypted_journal_without_repeating_a_settled_tool_or_budget -- --exact
       - name: Native process fixture
         run: cargo +1.98.0 build --locked -p melissa-windows-executor --bins
       - name: Bounded host processes and admission
