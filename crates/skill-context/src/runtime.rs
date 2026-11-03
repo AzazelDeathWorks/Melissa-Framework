@@ -12,7 +12,7 @@ use melissa_core_contracts::{
     Module, TaskState, catalog::Catalog, design::SkillPin, validation::Validate,
 };
 use melissa_local_store::{
-    ArtifactRequest, LocalStore, StoreError,
+    ArtifactRequest, LocalStore,
     journal::{AdmissionRequest, AttemptState, InvocationRequest},
 };
 use melissa_model_gateway::{
@@ -168,6 +168,8 @@ pub struct ContextRuntime {
     state: RuntimeState,
     imported: Vec<MemoryBook>,
     source_inventory: Vec<Source>,
+    search_index: retrieval::SearchIndex,
+    parse_cache: melissa_repository::polyglot::ParseCache,
     native_scripts: BTreeMap<String, NativeScriptRoute>,
     native_dispatcher: Option<Box<dyn ToolDispatcher>>,
     release_gate: Option<ReleaseGate>,
@@ -248,33 +250,29 @@ impl ContextRuntime {
             state: RuntimeState::default(),
             imported: Vec::new(),
             source_inventory: Vec::new(),
+            search_index: retrieval::SearchIndex::new()?,
+            parse_cache: Default::default(),
             native_scripts: BTreeMap::new(),
             native_dispatcher: None,
             release_gate: None,
         };
         host.authority("fs.read")?;
-        loop {
-            let id = format!(
-                "context-state:{}:{}",
-                host.grant.task_id, host.state.sequence
-            );
-            match host.store.journal().checkpoint(&id, &host.grant.task_id) {
-                Ok(cp) => {
-                    let bytes = host
-                        .store
-                        .get_artifact(&host.grant.task_id, &cp.artifact_id)?;
-                    require(
-                        cp.data["namespace"] == value!(host.grant.namespace)
-                            && cp.data["digest"] == digest(&bytes),
-                        "context state binding mismatch",
-                    )?;
-                    let mut state: RuntimeState = json(&bytes)?;
-                    state.sequence = host.state.sequence + 1;
-                    host.state = state;
-                }
-                Err(StoreError::NotFound(_)) => break,
-                Err(e) => return Err(e.into()),
-            }
+        let (sequence, checkpoint) = host.store.journal().latest_checkpoint_in_series(
+            &host.grant.task_id,
+            &format!("context-state:{}:", host.grant.task_id),
+        )?;
+        if let Some(cp) = checkpoint {
+            let bytes = host
+                .store
+                .get_artifact(&host.grant.task_id, &cp.artifact_id)?;
+            require(
+                cp.data["namespace"] == value!(host.grant.namespace)
+                    && cp.data["digest"] == digest(&bytes),
+                "context state binding mismatch",
+            )?;
+            let mut state: RuntimeState = json(&bytes)?;
+            state.sequence = sequence;
+            host.state = state;
         }
         for anchor in anchors {
             let t = host.store.journal().task(&host.grant.task_id)?;
@@ -416,8 +414,15 @@ impl ContextRuntime {
             *self.state.telemetry.entry("parse.hit".into()).or_default() += 1;
             ast
         } else {
-            let ast =
-                value!(PolyglotIndex::build(&self.repo, &snapshot, &cancel).map_err(map_repo)?);
+            let ast = value!(
+                PolyglotIndex::build_incremental(
+                    &self.repo,
+                    &snapshot,
+                    &cancel,
+                    &mut self.parse_cache
+                )
+                .map_err(map_repo)?
+            );
             self.state.cache.put(
                 key,
                 serde_json::to_vec(&ast)?,
@@ -676,7 +681,16 @@ impl ContextRuntime {
             self.grant.task_id, self.state.sequence
         );
         let artifact = format!("{id}:artifact");
-        let bytes = crate::encode_state(&self.state)?;
+        let bytes = match crate::encode_state(&self.state) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                // Derived cache eviction cannot discard reviewed project facts.
+                self.state.cache = Cache::default();
+                self.parse_cache = Default::default();
+                self.search_index = retrieval::SearchIndex::new()?;
+                crate::encode_state(&self.state)?
+            }
+        };
         put(
             &mut self.store,
             &self.grant.task_id,
@@ -735,6 +749,8 @@ impl ContextRuntime {
         match id {
             "artifact_cleanup" => {
                 self.state.cache = Cache::default();
+                self.parse_cache = Default::default();
+                self.search_index = retrieval::SearchIndex::new()?;
                 self.state
                     .telemetry
                     .entry("cache.explicit_cleanup".into())
@@ -831,7 +847,7 @@ impl ContextRuntime {
                 query,
                 limit,
                 symbols,
-            } => value!(retrieval::search(
+            } => value!(self.search_index.search(
                 &self.source_inventory,
                 &scope,
                 query,
@@ -867,12 +883,12 @@ impl ContextRuntime {
                     .collect::<Result<Vec<_>>>()?;
                 crate::state::validate_memory_sources(selected.iter().copied())?;
                 let id = format!("memory:{}", ctx.invocation_id);
-                let d = self.state.memory.propose(
+                let d = self.state.memory.propose_borrowed(
                     &id,
                     self.grant.namespace.clone(),
                     key,
                     claim,
-                    selected.into_iter().cloned().collect(),
+                    &selected,
                 )?;
                 value!({"id":id,"proposal_digest":d,"status":"proposed","verified":false})
             }

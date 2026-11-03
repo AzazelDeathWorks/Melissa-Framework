@@ -187,10 +187,14 @@ struct TaskTools {
     tests: bool,
     build: bool,
     domain_authorized: bool,
+    history_read: bool,
 }
 impl ToolDispatcher for TaskTools {
     fn definitions(&self) -> Vec<BoundTool> {
         let mut d=vec![BoundTool{canonical_id:"evidence.attach".into(),definition:ToolDefinition{name:"submit_candidate".into(),description:"Submit the complete candidate summary and exact current source digest, obtained from fs_snapshot. This does not accept a task; protected host QA decides independently.".into(),parameters:self.execution.recipe.output_schema(),strict:false}}];
+        if self.history_read {
+            d.push(melissa_model_gateway::context_compiler::history_definition());
+        }
         if let Some(domain) = &self.execution.recipe.domain {
             if self.tests && self.domain_authorized {
                 d.extend(crate::domain::tool_definitions(domain));
@@ -229,6 +233,14 @@ impl ToolDispatcher for TaskTools {
                     ErrorKind::Authorization,
                     "CLI host identity mismatch",
                 ));
+            }
+            if call.name == "history_read" {
+                return melissa_model_gateway::context_compiler::read_history(
+                    &self.store,
+                    &ctx,
+                    &call.arguments,
+                    &cancel,
+                );
             }
             if call.name == "submit_candidate" {
                 let candidate = melissa_model_gateway::strict_json(&call.arguments)?;
@@ -351,22 +363,22 @@ impl ContinuationStore for Boundary {
         run: &str,
     ) -> melissa_model_gateway::Result<Option<TurnCheckpoint>> {
         let saved = self.inner.begin(store, binding, task, run)?;
-        let mut last = None;
-        loop {
-            let id = format!("cli-boundary:{}:{}", self.run, self.sequence);
-            match store.journal().checkpoint(&id, &self.task) {
-                Ok(p) => {
-                    last = Some(
-                        store
-                            .get_artifact(&self.task, &p.artifact_id)
-                            .map_err(|_| GatewayError::invalid("boundary unavailable"))?,
-                    );
-                    self.sequence += 1;
+        let (sequence, checkpoint) = store
+            .journal()
+            .latest_checkpoint_in_series(&self.task, &format!("cli-boundary:{}:", self.run))
+            .map_err(|_| GatewayError::invalid("boundary unavailable"))?;
+        self.sequence = sequence;
+        let last = checkpoint
+            .map(|p| {
+                let raw = store
+                    .get_artifact(&self.task, &p.artifact_id)
+                    .map_err(|_| GatewayError::invalid("boundary unavailable"))?;
+                if p.data["digest"] != digest(&raw) {
+                    return Err(GatewayError::invalid("boundary digest mismatch"));
                 }
-                Err(melissa_local_store::StoreError::NotFound(_)) => break,
-                Err(_) => return Err(GatewayError::invalid("boundary unavailable")),
-            }
-        }
+                Ok(raw)
+            })
+            .transpose()?;
         if saved.is_some() {
             let snapshot: melissa_repository::RepositorySnapshot =
                 decode(&last.ok_or_else(|| GatewayError::invalid("missing source boundary"))?)
@@ -387,7 +399,17 @@ impl ContinuationStore for Boundary {
         store: &mut LocalStore,
         state: &TurnCheckpoint,
     ) -> melissa_model_gateway::Result<()> {
-        self.inner.publish(store, state)?;
+        self.publish_view(
+            store,
+            &melissa_model_gateway::continuation::TurnCheckpointView::from(state),
+        )
+    }
+    fn publish_view(
+        &mut self,
+        store: &mut LocalStore,
+        state: &melissa_model_gateway::continuation::TurnCheckpointView<'_>,
+    ) -> melissa_model_gateway::Result<()> {
+        self.inner.publish_view(store, state)?;
         if state.phase == TurnPhase::Safe {
             let published = (|| -> Result<()> {
                 let snapshot = self.repo.snapshot(&AtomicBool::new(false))?;
@@ -564,6 +586,7 @@ fn gateway(
             melissa_model_gateway::agent_loop::HostRunLimit::new(e.recipe.wall_time_ms)
                 .map_err(gw)?,
         )
+        .with_context_compiler()
         // Use the existing host-selected full history policy. The generic
         // 2 MiB default would reject a valid large model context prematurely;
         // this preserves full history instead of shortening user/tool content.
@@ -1148,6 +1171,7 @@ impl App {
                 profile: node.profile.clone(),
                 tests: node.tools.contains("code.tests"),
                 build: e.recipe.domain.is_none() && node.tools.contains("code.build"),
+                history_read: node.tools.contains("fs.read"),
                 domain_authorized: e
                     .recipe
                     .domain

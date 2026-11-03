@@ -257,6 +257,53 @@ impl Cas {
         Ok(result)
     }
 
+    #[cfg(windows)]
+    pub(crate) fn inventory_paths(
+        &self,
+    ) -> StoreResult<std::collections::BTreeMap<String, PathBuf>> {
+        self.validate_directories()?;
+        let mut result = std::collections::BTreeMap::new();
+        for (index, entry) in fs::read_dir(self.root.join("blobs"))?.enumerate() {
+            if index >= MAX_SCAN_ENTRIES {
+                return Err(StoreError::Quota("CAS inventory scan limit".into()));
+            }
+            let entry = entry?;
+            regular_metadata(&entry.path())?;
+            let name = entry.file_name();
+            let hex = name
+                .to_str()
+                .and_then(|s| s.strip_suffix(".blob"))
+                .ok_or_else(|| StoreError::Integrity("unexpected CAS file".into()))?;
+            let digest = format!("blake3:{hex}");
+            validate_digest(&digest)?;
+            result.insert(digest, entry.path());
+        }
+        Ok(result)
+    }
+    #[cfg(windows)]
+    pub(crate) fn verify_file(&self, digest: &str, file: &File) -> StoreResult<BlobInfo> {
+        let metadata = file.metadata()?;
+        validate_regular(&metadata)?;
+        let maximum = stored_len_for_plain(self.max_blob_bytes)?;
+        if metadata.len() < ENVELOPE_OVERHEAD || metadata.len() > maximum {
+            return Err(StoreError::Integrity("pinned CAS size".into()));
+        }
+        let mut encrypted = Vec::new();
+        file.take(maximum + 1).read_to_end(&mut encrypted)?;
+        if encrypted.len() as u64 != metadata.len() {
+            return Err(StoreError::Integrity("pinned CAS length changed".into()));
+        }
+        let plain = Zeroizing::new(self.key.open(&encrypted, &blob_aad(digest))?);
+        if digest_for(&plain) != digest {
+            return Err(StoreError::Integrity("pinned CAS digest".into()));
+        }
+        Ok(BlobInfo {
+            digest: digest.into(),
+            plain_bytes: plain.len() as u64,
+            stored_bytes: encrypted.len() as u64,
+        })
+    }
+
     /// The owner must prove this blob is unreferenced and serialize GC against
     /// publication/reference commits before calling this primitive.
     pub fn remove(&self, digest: &str) -> StoreResult<()> {

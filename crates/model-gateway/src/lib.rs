@@ -2,6 +2,7 @@
 //! never creates tool authority or constitutes independent task acceptance.
 pub mod agent_loop;
 pub mod anthropic;
+pub mod context_compiler;
 pub mod continuation;
 pub mod openai;
 pub mod output_capabilities;
@@ -10,6 +11,7 @@ pub mod routing;
 pub mod schema;
 pub mod sse;
 pub mod tools;
+pub mod transcript;
 pub mod transport;
 mod types;
 pub mod vision;

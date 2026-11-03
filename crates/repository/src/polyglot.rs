@@ -2,10 +2,17 @@
 use crate::{Error, Repository, RepositorySnapshot, Result, check_cancel, discovery::language};
 use serde::Serialize;
 use std::{
+    collections::BTreeMap,
     ops::ControlFlow,
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
+#[derive(Default)]
+pub struct ParseCache {
+    entries: BTreeMap<String, (crate::FileVersion, Vec<SyntaxSymbol>, bool, bool, usize)>,
+    pub parsed_files: u64,
+    pub reused_files: u64,
+}
 #[derive(Debug, Clone, Serialize)]
 pub struct SyntaxSymbol {
     pub path: String,
@@ -33,7 +40,20 @@ impl PolyglotIndex {
         snapshot: &RepositorySnapshot,
         cancel: &AtomicBool,
     ) -> Result<Self> {
+        Self::build_incremental(repo, snapshot, cancel, &mut ParseCache::default())
+    }
+    pub fn build_incremental(
+        repo: &Repository,
+        snapshot: &RepositorySnapshot,
+        cancel: &AtomicBool,
+        cache: &mut ParseCache,
+    ) -> Result<Self> {
         repo.validate_snapshot(snapshot, cancel)?;
+        let current: std::collections::BTreeSet<_> =
+            snapshot.files.iter().map(|f| f.path.as_str()).collect();
+        cache
+            .entries
+            .retain(|path, _| current.contains(path.as_str()));
         let mut out = Self {
             snapshot_digest: snapshot.digest.clone(),
             symbols: vec![],
@@ -50,8 +70,31 @@ impl PolyglotIndex {
         let mut nodes = 0;
         for file in &snapshot.files {
             check_cancel(cancel)?;
+            if let Some((version, symbols, error, unsupported, count)) =
+                cache.entries.get(&file.path)
+                && version == file
+            {
+                nodes += count;
+                if nodes > 1_000_000 {
+                    return Err(Error::Quota("syntax nodes"));
+                }
+                out.symbols.extend(symbols.iter().cloned());
+                if *error {
+                    out.syntax_errors.push(file.path.clone());
+                }
+                if *unsupported {
+                    out.unsupported_files.push(file.path.clone());
+                }
+                cache.reused_files += 1;
+                continue;
+            }
+            let symbol_start = out.symbols.len();
+            let node_start = nodes;
             let Some(lang) = language(&file.path) else {
                 out.unsupported_files.push(file.path.clone());
+                cache
+                    .entries
+                    .insert(file.path.clone(), (file.clone(), vec![], false, true, 0));
                 continue;
             };
             let (version, bytes) = repo.read(&file.path)?;
@@ -142,6 +185,17 @@ impl PolyglotIndex {
                     }
                 }
             }
+            cache.entries.insert(
+                file.path.clone(),
+                (
+                    file.clone(),
+                    out.symbols[symbol_start..].to_vec(),
+                    tree.root_node().has_error(),
+                    false,
+                    nodes - node_start,
+                ),
+            );
+            cache.parsed_files += 1;
         }
         repo.validate_snapshot(snapshot, cancel)?;
         Ok(out)

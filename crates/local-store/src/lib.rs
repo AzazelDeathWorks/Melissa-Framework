@@ -5,6 +5,10 @@ use std::fmt;
 mod artifacts;
 mod backup;
 pub mod cas;
+#[cfg(windows)]
+mod pinned_inventory;
+#[cfg(windows)]
+pub use pinned_inventory::InventoryMetrics;
 pub mod crypto;
 pub mod journal;
 mod service;

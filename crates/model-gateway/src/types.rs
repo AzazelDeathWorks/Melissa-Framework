@@ -176,6 +176,14 @@ impl TurnRequest {
     }
     pub fn validate_with_limits(&self, limits: RequestLimits) -> Result<()> {
         limits.validate()?;
+        self.validate_structure()?;
+        serde_json::to_writer(&mut HistoryByteLimit(limits.max_history_bytes), self)
+            .map_err(|_| GatewayError::invalid("request total bytes"))?;
+        Ok(())
+    }
+    /// Validate identities and complete tool pairs before compiling a bounded
+    /// working view from a longer durable transcript.
+    pub fn validate_structure(&self) -> Result<()> {
         if self.model.trim().is_empty()
             || self.model.len() > 256
             || self.model.chars().any(char::is_control)
@@ -249,10 +257,6 @@ impl TurnRequest {
         if !pending.is_empty() {
             return Err(GatewayError::invalid("missing tool result"));
         }
-        // Count without allocating another complete, potentially oversized
-        // transcript. The writer rejects before accepting any bytes over quota.
-        serde_json::to_writer(&mut HistoryByteLimit(limits.max_history_bytes), self)
-            .map_err(|_| GatewayError::invalid("request total bytes"))?;
         Ok(())
     }
 }

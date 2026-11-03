@@ -11,7 +11,8 @@ use crate::{
 use melissa_local_store::{ArtifactRequest, LocalStore, StoreError};
 use melissa_model_gateway::{
     ErrorKind, GatewayError,
-    continuation::{ContinuationStore, Phase, TurnCheckpoint},
+    continuation::{ContinuationStore, Phase, TurnCheckpoint, TurnCheckpointView},
+    transcript::{Manifest, MessageLog},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -25,11 +26,14 @@ struct Envelope {
     known_cost: u64,
     known_input: u64,
     known_output: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transcript: Option<Manifest>,
 }
 pub struct WorkflowContinuation {
     owner: SharedScheduler,
     packet: WorkPacket,
     sequence: u64,
+    messages: MessageLog,
 }
 fn gateway(e: crate::Error) -> GatewayError {
     GatewayError::new(ErrorKind::Store, e.to_string())
@@ -40,6 +44,7 @@ impl WorkflowContinuation {
             owner,
             packet,
             sequence: 0,
+            messages: MessageLog::default(),
         }
     }
     fn cp(&self, n: u64) -> String {
@@ -116,24 +121,31 @@ impl ContinuationStore for WorkflowContinuation {
                 Err(StoreError::NotFound(_)) => {}
                 Err(e) => return Err(e.into()),
             }
+            let (next, checkpoint) = store
+                .journal()
+                .latest_checkpoint_in_series(task, &format!("workflow-turn:{run}:"))?;
+            self.sequence = next;
             let mut last = None;
-            loop {
-                match store.journal().checkpoint(&self.cp(self.sequence), task) {
-                    Ok(cp) => {
-                        let bytes = store.get_artifact(task, &cp.artifact_id)?;
-                        require(
-                            cp.data["digest"] == digest(&bytes),
-                            Kind::Store,
-                            "continuation index/content mismatch",
-                        )?;
-                        last = Some(serde_json::from_slice::<Envelope>(&bytes)?);
-                        self.sequence += 1;
-                    }
-                    Err(StoreError::NotFound(_)) => break,
-                    Err(e) => return Err(e.into()),
-                }
+            if let Some(cp) = checkpoint {
+                let bytes = store.get_artifact(task, &cp.artifact_id)?;
+                require(
+                    cp.data["digest"] == digest(&bytes),
+                    Kind::Store,
+                    "continuation index/content mismatch",
+                )?;
+                last = Some(serde_json::from_slice::<Envelope>(&bytes)?);
             }
-            if let Some(last) = last {
+            if let Some(mut last) = last {
+                if let Some(manifest) = &last.transcript {
+                    require(
+                        last.state.messages.is_empty(),
+                        Kind::Store,
+                        "ambiguous transcript checkpoint",
+                    )?;
+                    last.state.messages = MessageLog::restore(store, task, run, manifest)
+                        .map_err(|e| error(Kind::Store, &e.to_string()))?;
+                    self.messages.adopt(manifest);
+                }
                 let own_ids = last
                     .state
                     .result
@@ -169,6 +181,13 @@ impl ContinuationStore for WorkflowContinuation {
         store: &mut LocalStore,
         state: &TurnCheckpoint,
     ) -> melissa_model_gateway::Result<()> {
+        self.publish_view(store, &TurnCheckpointView::from(state))
+    }
+    fn publish_view(
+        &mut self,
+        store: &mut LocalStore,
+        state: &TurnCheckpointView<'_>,
+    ) -> melissa_model_gateway::Result<()> {
         (|| -> Result<_> {
             let (cost, input, output, ids) = self.current(store)?;
             require(
@@ -185,7 +204,17 @@ impl ContinuationStore for WorkflowContinuation {
                 "checkpoint does not cover own native request history",
             )?;
             let e = Envelope {
-                state: state.clone(),
+                state: state.metadata(),
+                transcript: Some(
+                    self.messages
+                        .save(
+                            store,
+                            &state.result.task_id,
+                            &state.result.run_id,
+                            state.messages,
+                        )
+                        .map_err(|e| error(Kind::Store, &e.to_string()))?,
+                ),
                 handoff_digest: digest(&serde_json::to_vec(&self.packet)?),
                 known_cost: cost,
                 known_input: input,

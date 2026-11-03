@@ -420,6 +420,33 @@ fn admission() -> CacheAdmission {
     }
 }
 #[test]
+fn cache_evicts_old_entries_and_oversized_results_do_not_poison_persistence() {
+    let mut cache = Cache::default();
+    let first = key(CacheKind::Retrieval);
+    cache
+        .put(first.clone(), vec![255; 256 * 1024], 1, 1000, &admission())
+        .unwrap();
+    for i in 2..10 {
+        let mut k = first.clone();
+        k.input_digest = digest(format!("{i}").as_bytes());
+        cache
+            .put(k, vec![255; 256 * 1024], i, 1000, &admission())
+            .unwrap();
+    }
+    assert!(cache.get(&first, 10, &admission()).unwrap().is_none());
+    assert!(encode_state(&cache).unwrap().len() < 4 * 1024 * 1024);
+    cache
+        .put(
+            first.clone(),
+            vec![255; 4 * 1024 * 1024],
+            10,
+            1000,
+            &admission(),
+        )
+        .unwrap();
+    assert!(cache.get(&first, 11, &admission()).unwrap().is_none());
+}
+#[test]
 fn all_seven_cache_types_bind_sources_and_every_execution_dependency() {
     for kind in [
         CacheKind::Prompt,

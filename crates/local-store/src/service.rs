@@ -54,6 +54,8 @@ pub(crate) struct Instance {
     // Publication, GC and backup use one order: process guard, then SQLite.
     pub files: Mutex<()>,
     pub inventory_readers: AtomicUsize,
+    #[cfg(windows)]
+    pub inventory: Mutex<Option<crate::pinned_inventory::PinnedInventory>>,
     _lease: File,
 }
 
@@ -89,9 +91,11 @@ impl LocalStore {
             config,
             files: Mutex::new(()),
             inventory_readers: AtomicUsize::new(1),
+            #[cfg(windows)]
+            inventory: Mutex::new(None),
             _lease: lease,
         });
-        let mut store = Self::connect_instance(instance)?;
+        let mut store = Self::connect_instance(instance, true)?;
         store.integrity_check()?;
         // No tool is executed or retried here. Possibly dispatched work becomes
         // explicitly unknown, under the exclusive session lease.
@@ -100,13 +104,17 @@ impl LocalStore {
         Ok(store)
     }
 
-    fn connect_instance(instance: Arc<Instance>) -> StoreResult<Self> {
+    fn connect_instance(instance: Arc<Instance>, initial: bool) -> StoreResult<Self> {
         let db_path = instance.root.join("store.sqlite3");
         reject_link_if_exists(&db_path)?;
         for suffix in ["-wal", "-shm", "-journal"] {
             reject_link_if_exists(&instance.root.join(format!("store.sqlite3{suffix}")))?;
         }
-        let journal = Journal::open(&db_path, instance.key.clone(), instance.config.journal)?;
+        let journal = if initial {
+            Journal::open(&db_path, instance.key.clone(), instance.config.journal)?
+        } else {
+            Journal::connect_session(&db_path, instance.key.clone(), instance.config.journal)?
+        };
         let cas = Cas::open(
             &instance.root.join("cas"),
             instance.key.clone(),
@@ -120,7 +128,62 @@ impl LocalStore {
     }
 
     pub fn connect(&self) -> StoreResult<Self> {
-        Self::connect_instance(Arc::clone(&self.instance))
+        Self::connect_instance(Arc::clone(&self.instance), false)
+    }
+    /// Authenticate once, then hold immutable Windows handles. Other processes
+    /// cannot rewrite/delete cached blobs; new/orphan objects are still checked.
+    /// Unsupported platforms retain full verification on every publication.
+    pub fn with_pinned_cas_inventory(self) -> StoreResult<Self> {
+        #[cfg(windows)]
+        {
+            let _guard = self.file_guard()?;
+            let mut pinned = crate::pinned_inventory::PinnedInventory::default();
+            pinned.list(&self.cas)?;
+            *self
+                .instance
+                .inventory
+                .lock()
+                .map_err(|_| StoreError::Integrity("inventory lock poisoned".into()))? =
+                Some(pinned);
+        }
+        Ok(self)
+    }
+    #[cfg(windows)]
+    pub fn inventory_metrics(&self) -> StoreResult<Option<crate::InventoryMetrics>> {
+        Ok(self
+            .instance
+            .inventory
+            .lock()
+            .map_err(|_| StoreError::Integrity("inventory lock poisoned".into()))?
+            .as_ref()
+            .map(|i| i.metrics))
+    }
+    pub(crate) fn publication_inventory(&self) -> StoreResult<Vec<crate::cas::BlobInfo>> {
+        #[cfg(windows)]
+        if let Some(pinned) = self
+            .instance
+            .inventory
+            .lock()
+            .map_err(|_| StoreError::Integrity("inventory lock poisoned".into()))?
+            .as_mut()
+        {
+            return pinned.list(&self.cas);
+        }
+        self.cas
+            .list_with_parallelism(self.instance.inventory_readers.load(Ordering::Acquire))
+    }
+    pub(crate) fn release_inventory_pins(&self) -> StoreResult<()> {
+        #[cfg(windows)]
+        if let Some(pinned) = self
+            .instance
+            .inventory
+            .lock()
+            .map_err(|_| StoreError::Integrity("inventory lock poisoned".into()))?
+            .as_mut()
+        {
+            pinned.clear();
+        }
+        Ok(())
     }
 
     /// Trusted host computation setting shared with this session's connections.

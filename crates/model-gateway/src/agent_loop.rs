@@ -129,6 +129,7 @@ pub struct Gateway {
     candidate_submission_tool: Option<String>,
     recovery: Option<Box<dyn crate::recovery::RecoveryHook>>,
     vision: Option<crate::vision::VisionPolicy>,
+    context_compiler: Option<crate::context_compiler::ContextCompiler>,
 }
 fn store_error(_: melissa_local_store::StoreError) -> GatewayError {
     GatewayError::new(
@@ -200,12 +201,24 @@ impl Gateway {
             candidate_submission_tool: None,
             recovery: None,
             vision: None,
+            context_compiler: None,
         })
     }
     /// Opt-in host configuration; the legacy constructor keeps its 30-minute bound.
     /// The continuation binding includes the actual selected duration.
     pub fn with_host_run_limit(mut self, limit: HostRunLimit) -> Self {
         self.policy.max_wall_time_ms = limit.0;
+        self
+    }
+    pub fn with_context_compiler(mut self) -> Self {
+        self.context_compiler = Some(crate::context_compiler::ContextCompiler::default());
+        self
+    }
+    pub fn with_native_context_compiler(
+        mut self,
+        compiler: crate::context_compiler::ContextCompiler,
+    ) -> Self {
+        self.context_compiler = Some(compiler);
         self
     }
     /// Explicit typed candidate channel for workflow hosts. A successful SOLO
@@ -255,9 +268,9 @@ impl Gateway {
         self.continuation = Some(hook);
         self
     }
-    fn publish_turn(&mut self, state: &crate::continuation::TurnCheckpoint) -> Result<()> {
+    fn publish_turn(&mut self, state: &crate::continuation::TurnCheckpointView<'_>) -> Result<()> {
         if let Some(hook) = self.continuation.as_mut() {
-            hook.publish(&mut self.store, state)?;
+            hook.publish_view(&mut self.store, state)?;
         }
         Ok(())
     }
@@ -565,6 +578,11 @@ impl Gateway {
                 &json!({"native_binding":binding,"vision":vision}),
             )?);
         }
+        if self.continuation.is_some() && self.context_compiler.is_some() {
+            binding = digest(&encoded(
+                &json!({"native_binding":binding,"context_policy":self.context_compiler.as_ref().map(|c|c.policy_id())}),
+            )?);
+        }
         if let Some(hook) = self.continuation.as_mut()
             && let Some(saved) =
                 hook.begin(&mut self.store, &binding, &spec.task_id, &spec.run_id)?
@@ -590,16 +608,16 @@ impl Gateway {
             next_turn = saved.next_turn;
         }
         if self.continuation.is_some() {
-            self.publish_turn(&crate::continuation::TurnCheckpoint {
-                schema_version: "melissa.gateway-turn-checkpoint/v1".into(),
-                binding_digest: binding.clone(),
+            self.publish_turn(&crate::continuation::TurnCheckpointView {
+                schema_version: "melissa.gateway-turn-checkpoint/v1",
+                binding_digest: &binding,
                 phase: crate::continuation::Phase::Safe,
                 next_turn,
-                messages: messages.clone(),
-                seen_calls: seen_calls.clone(),
-                successful: successful.clone(),
+                messages: &messages,
+                seen_calls: &seen_calls,
+                successful: &successful,
                 selected_model: selected,
-                result: result.clone(),
+                result: &result,
             })?;
         }
         for turn in next_turn..self.policy.max_turns {
@@ -658,17 +676,44 @@ impl Gateway {
                 };
                 tried.insert(index);
                 let model = self.models[index].clone();
-                let request = TurnRequest {
+                let (working_messages, archived) = self
+                    .context_compiler
+                    .as_ref()
+                    .map(|c| c.working_messages(&messages, &spec.task_id, &spec.run_id))
+                    .unwrap_or_else(|| (messages.clone(), vec![]));
+                let mut request = TurnRequest {
                     model: model.model_id.clone(),
                     system_prompt: system.clone(),
-                    messages: messages.clone(),
+                    messages: working_messages,
                     tools: definitions.iter().map(|v| v.definition.clone()).collect(),
                     max_output_tokens: spec.max_output_tokens.min(model.max_output_tokens),
                     output_schema: spec.output_schema.clone(),
                 };
-                let wire = self.transport.request_body(&model.endpoint, &request)?;
+                let (wire, context_report) = if let Some(compiler) = &mut self.context_compiler {
+                    let (wire, report) = compiler.compile(
+                        &mut request,
+                        &self.transport,
+                        &model.endpoint,
+                        model.context_tokens,
+                        &mut self.store,
+                        &spec.task_id,
+                        &spec.run_id,
+                        archived,
+                    )?;
+                    for archived in &report.archived {
+                        if !result.artifact_refs.contains(&archived.artifact_ref) {
+                            result.artifact_refs.push(archived.artifact_ref.clone());
+                        }
+                    }
+                    (wire, Some(report))
+                } else {
+                    (
+                        self.transport.request_body(&model.endpoint, &request)?,
+                        None,
+                    )
+                };
                 let request_bytes = encoded(
-                    &json!({"schema_version":"melissa.model-request-envelope/v1","provider_id":model.endpoint.provider_id,"endpoint":model.endpoint.url.as_str(),"protocol":model.endpoint.protocol,"task_id":spec.task_id,"profile_id":spec.profile_id,"pricing_snapshot":model.rate_card,"configured_context_tokens":model.context_tokens,"configured_max_output_tokens":model.max_output_tokens,"configured_max_history_bytes":self.transport.request_limits().max_history_bytes,"capabilities":model.capabilities,"configured_output_mode":if spec.output_schema.is_some(){Some(output_mode)}else{None},"output_capability_evidence":self.output_capabilities.record(&model.registration_id),"body":wire}),
+                    &json!({"schema_version":"melissa.model-request-envelope/v1","provider_id":model.endpoint.provider_id,"endpoint":model.endpoint.url.as_str(),"protocol":model.endpoint.protocol,"task_id":spec.task_id,"profile_id":spec.profile_id,"pricing_snapshot":model.rate_card,"configured_context_tokens":model.context_tokens,"configured_max_output_tokens":model.max_output_tokens,"configured_max_history_bytes":self.transport.request_limits().max_history_bytes,"capabilities":model.capabilities,"configured_output_mode":if spec.output_schema.is_some(){Some(output_mode)}else{None},"output_capability_evidence":self.output_capabilities.record(&model.registration_id),"context_report":context_report,"body":wire}),
                 )?;
                 let request_id = format!("model:{}:{}", spec.run_id, result.request_ids.len() + 1);
                 let task = self
@@ -676,7 +721,12 @@ impl Gateway {
                     .journal()
                     .task(&spec.task_id)
                     .map_err(store_error)?;
-                let reserved_input = model.context_tokens;
+                // Only an exact host-registered native tokenizer can reduce
+                // the reservation. UTF-8 units are not a provider billing proof.
+                let reserved_input = context_report
+                    .as_ref()
+                    .and_then(|r| r.exact_token_count)
+                    .unwrap_or(model.context_tokens);
                 let reserved_output = request.max_output_tokens;
                 let budget = self
                     .store
@@ -801,41 +851,42 @@ impl Gateway {
                 }
                 // Wire validation, local evidence preparation and admission have
                 // succeeded. Only the actual dispatch boundary makes resume unsafe.
-                if self.continuation.is_some() {
-                    if let Err(error) = self.publish_turn(&crate::continuation::TurnCheckpoint {
-                        schema_version: "melissa.gateway-turn-checkpoint/v1".into(),
-                        binding_digest: binding.clone(),
-                        phase: crate::continuation::Phase::InferencePending,
-                        next_turn: turn,
-                        messages: messages.clone(),
-                        seen_calls: seen_calls.clone(),
-                        successful: successful.clone(),
-                        selected_model: selected,
-                        result: result.clone(),
-                    }) {
-                        self.store
-                            .journal_mut()
-                            .finish_model_request(
-                                &request_id,
-                                record.version,
-                                &ModelSettlement {
-                                    state: ModelRequestState::NeverDispatched,
-                                    usage: ModelUsage {
-                                        input_tokens: Some(0),
-                                        output_tokens: Some(0),
-                                        cached_input_tokens: Some(0),
-                                        cost_micro_usd: Some(0),
-                                    },
-                                    receipt_digest: Some(digest(
-                                        b"checkpoint failed before transport dispatch",
-                                    )),
-                                    reason: Some("host never dispatched request".into()),
-                                    completed_at_unix_ms: now()?,
+                if self.continuation.is_some()
+                    && let Err(error) =
+                        self.publish_turn(&crate::continuation::TurnCheckpointView {
+                            schema_version: "melissa.gateway-turn-checkpoint/v1",
+                            binding_digest: &binding,
+                            phase: crate::continuation::Phase::InferencePending,
+                            next_turn: turn,
+                            messages: &messages,
+                            seen_calls: &seen_calls,
+                            successful: &successful,
+                            selected_model: selected,
+                            result: &result,
+                        })
+                {
+                    self.store
+                        .journal_mut()
+                        .finish_model_request(
+                            &request_id,
+                            record.version,
+                            &ModelSettlement {
+                                state: ModelRequestState::NeverDispatched,
+                                usage: ModelUsage {
+                                    input_tokens: Some(0),
+                                    output_tokens: Some(0),
+                                    cached_input_tokens: Some(0),
+                                    cost_micro_usd: Some(0),
                                 },
-                            )
-                            .map_err(store_error)?;
-                        return Err(error);
-                    }
+                                receipt_digest: Some(digest(
+                                    b"checkpoint failed before transport dispatch",
+                                )),
+                                reason: Some("host never dispatched request".into()),
+                                completed_at_unix_ms: now()?,
+                            },
+                        )
+                        .map_err(store_error)?;
+                    return Err(error);
                 }
                 let record = self
                     .store
@@ -1106,16 +1157,16 @@ impl Gateway {
                                 text: repair.feedback,
                             });
                             if self.continuation.is_some() {
-                                self.publish_turn(&crate::continuation::TurnCheckpoint {
-                                    schema_version: "melissa.gateway-turn-checkpoint/v1".into(),
-                                    binding_digest: binding.clone(),
+                                self.publish_turn(&crate::continuation::TurnCheckpointView {
+                                    schema_version: "melissa.gateway-turn-checkpoint/v1",
+                                    binding_digest: &binding,
                                     phase: crate::continuation::Phase::Safe,
                                     next_turn: turn + 1,
-                                    messages: messages.clone(),
-                                    seen_calls: seen_calls.clone(),
-                                    successful: successful.clone(),
+                                    messages: &messages,
+                                    seen_calls: &seen_calls,
+                                    successful: &successful,
                                     selected_model: selected,
-                                    result: result.clone(),
+                                    result: &result,
                                 })?;
                             }
                             continue;
@@ -1243,16 +1294,16 @@ impl Gateway {
                 return self.complete(result);
             }
             if self.continuation.is_some() {
-                self.publish_turn(&crate::continuation::TurnCheckpoint {
-                    schema_version: "melissa.gateway-turn-checkpoint/v1".into(),
-                    binding_digest: binding.clone(),
+                self.publish_turn(&crate::continuation::TurnCheckpointView {
+                    schema_version: "melissa.gateway-turn-checkpoint/v1",
+                    binding_digest: &binding,
                     phase: crate::continuation::Phase::ToolsPending,
                     next_turn: turn,
-                    messages: messages.clone(),
-                    seen_calls: seen_calls.clone(),
-                    successful: successful.clone(),
+                    messages: &messages,
+                    seen_calls: &seen_calls,
+                    successful: &successful,
                     selected_model: selected,
-                    result: result.clone(),
+                    result: &result,
                 })?;
             }
             for call in calls {
@@ -1469,16 +1520,16 @@ impl Gateway {
                 }
             }
             if self.continuation.is_some() {
-                self.publish_turn(&crate::continuation::TurnCheckpoint {
-                    schema_version: "melissa.gateway-turn-checkpoint/v1".into(),
-                    binding_digest: binding.clone(),
+                self.publish_turn(&crate::continuation::TurnCheckpointView {
+                    schema_version: "melissa.gateway-turn-checkpoint/v1",
+                    binding_digest: &binding,
                     phase: crate::continuation::Phase::Safe,
                     next_turn: turn + 1,
-                    messages: messages.clone(),
-                    seen_calls: seen_calls.clone(),
-                    successful: successful.clone(),
+                    messages: &messages,
+                    seen_calls: &seen_calls,
+                    successful: &successful,
                     selected_model: selected,
-                    result: result.clone(),
+                    result: &result,
                 })?;
             }
         }

@@ -18,6 +18,7 @@ pub struct ContextBridge {
     pub inner: ContextDispatcher,
     pub repo: Arc<Repository>,
     pub location: Location,
+    project: Option<ProjectMemory>,
 }
 impl ToolDispatcher for ContextBridge {
     fn definitions(&self) -> Vec<BoundTool> {
@@ -35,16 +36,26 @@ impl ToolDispatcher for ContextBridge {
     {
         Box::pin(async move {
             self.validate_call(&c)?;
-            let mut project =
-                ProjectMemory::open(&self.location.home, self.location.key.clone(), &self.repo)
-                    .map_err(map)?;
-            self.inner
-                .host()
-                .lock()
-                .map_err(|_| map(Error::Store))?
-                .replace_memory_book(project.book.clone())
-                .map_err(|_| map(Error::Store))?;
+            let memory = matches!(c.name.as_str(), "memory_search" | "memory_propose");
+            if memory && self.project.is_none() {
+                let project =
+                    ProjectMemory::open(&self.location.home, self.location.key.clone(), &self.repo)
+                        .map_err(map)?;
+                self.inner
+                    .host()
+                    .lock()
+                    .map_err(|_| map(Error::Store))?
+                    .replace_memory_book(project.book.clone())
+                    .map_err(|_| map(Error::Store))?;
+                // Keep the exclusive project lease through this agent session.
+                // Host review runs after it ends, preventing lost concurrent edits.
+                self.project = Some(project);
+            }
             let result = self.inner.execute(c, ctx, cancel).await;
+            if !memory {
+                return result;
+            }
+            let project = self.project.as_mut().ok_or_else(|| map(Error::Store))?;
             project.book = self
                 .inner
                 .host()
@@ -217,5 +228,6 @@ pub fn runtime(
             home: app.home.clone(),
             key: app.key.clone(),
         },
+        project: None,
     })
 }

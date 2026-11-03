@@ -400,6 +400,54 @@ fn checkpoint_is_owned_version_bound_and_durable() {
     );
 }
 #[test]
+fn checkpoint_series_orders_numeric_suffixes_and_rejects_gaps_and_aliases() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("j.db");
+    let mut j = open(&path);
+    running(&mut j, "a");
+    running(&mut j, "b");
+    fake_artifact(&path, "artifact", "a");
+    assert_eq!(
+        j.latest_checkpoint_in_series("a", "run:%_:").unwrap(),
+        (0, None)
+    );
+    for n in 0..12 {
+        let version = j.task("a").unwrap().record.version;
+        j.append_checkpoint(
+            &format!("run:%_:{n}"),
+            "a",
+            version,
+            "artifact",
+            json!({"n":n}),
+        )
+        .unwrap();
+    }
+    let (next, latest) = j.latest_checkpoint_in_series("a", "run:%_:").unwrap();
+    assert_eq!(next, 12);
+    assert_eq!(latest.unwrap().data["n"], 11);
+    assert_eq!(
+        j.latest_checkpoint_in_series("b", "run:%_:").unwrap(),
+        (0, None)
+    );
+    assert!(j.latest_checkpoint_in_series("missing", "run:%_:").is_err());
+    assert!(j.latest_checkpoint_in_series("a", "").is_err());
+    let version = j.task("a").unwrap().record.version;
+    j.append_checkpoint("gap:1", "a", version, "artifact", json!({}))
+        .unwrap();
+    assert!(j.latest_checkpoint_in_series("a", "gap:").is_err());
+    j.append_checkpoint("alias:00", "a", version, "artifact", json!({}))
+        .unwrap();
+    assert!(j.latest_checkpoint_in_series("a", "alias:").is_err());
+    drop(j);
+    assert_eq!(
+        open(&path)
+            .latest_checkpoint_in_series("a", "run:%_:")
+            .unwrap()
+            .0,
+        12
+    );
+}
+#[test]
 fn tampering_key_and_payload_and_schema_are_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("j.db");

@@ -266,14 +266,14 @@ impl App {
         if !dir.join("store/store.sqlite3").is_file() {
             return Err(Error::Store);
         }
-        LocalStore::open(&dir.join("store"), self.key.clone(), task_store_config()).map_err(|e| {
-            match e {
+        LocalStore::open(&dir.join("store"), self.key.clone(), task_store_config())
+            .and_then(LocalStore::with_pinned_cas_inventory)
+            .map_err(|e| match e {
                 melissa_local_store::StoreError::Busy => Error::Unavailable(
                     "Görev başka bir oturumda açık; canlı kontrol bağlantısı gereklidir.",
                 ),
                 _ => Error::Store,
-            }
-        })
+            })
     }
     pub(crate) fn workspace(&self, s: &LocalStore, id: &str) -> Result<Workspace> {
         let w: Workspace = decode(&s.get_artifact(id, WORKSPACE)?)?;
@@ -517,7 +517,8 @@ impl App {
         let dir = self.home.join("tasks").join(&id);
         fs::create_dir(&dir)?;
         let _task_pin = Repository::open(&dir, Limits::default(), vec![])?;
-        let mut s = LocalStore::open(&dir.join("store"), self.key.clone(), task_store_config())?;
+        let mut s = LocalStore::open(&dir.join("store"), self.key.clone(), task_store_config())?
+            .with_pinned_cas_inventory()?;
         s.journal_mut().create_task(&task)?;
         let mut files = BTreeMap::new();
         for f in &frozen.snapshot().files {
