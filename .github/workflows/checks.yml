@@ -20,6 +20,10 @@ jobs:
         run: rustup toolchain install 1.98.0 --profile minimal --component rustfmt
       - name: Formatting
         run: cargo +1.98.0 fmt --all -- --check
+      - name: Native process fixture
+        run: cargo +1.98.0 build --locked -p melissa-windows-executor --bins
+      - name: Bounded host processes and admission
+        run: cargo +1.98.0 test --locked --no-fail-fast -p melissa-windows-executor --test host_capture -p melissa-execution-broker --test broker_integration
       - name: Compile
         run: cargo +1.98.0 check --locked --workspace --all-targets
       - name: Contract and storage tests
@@ -34,10 +38,6 @@ jobs:
         run: cargo +1.98.0 test --locked -p melissa-skill-context --test native_runtime durable_gateway_resume_reopens_encrypted_journal_without_repeating_a_settled_tool_or_budget -- --exact
       - name: Shared workflow continuation and checkpoint ownership
         run: cargo +1.98.0 test --locked -p melissa-workflow --test workflow
-      - name: Native process fixture
-        run: cargo +1.98.0 build --locked -p melissa-windows-executor --bins
-      - name: Bounded host processes and admission
-        run: cargo +1.98.0 test --locked -p melissa-windows-executor --test host_capture -p melissa-execution-broker --test broker_integration
   portable-tests:
     # Test targets that need neither the Windows handle-pinned filesystem nor
     # Docker Desktop; without this job their crates are only compiled in CI.

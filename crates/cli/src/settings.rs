@@ -60,6 +60,7 @@ impl Settings {
             config
                 .validate()
                 .map_err(|_| Error::Usage("Yerel tokenizer yolu/özeti geçersiz."))?;
+            absolute(&config.path)?;
         }
         if self.schema_version != "melissa.cli-settings/v1"
             || self.provider_id.is_empty()

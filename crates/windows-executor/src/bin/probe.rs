@@ -257,9 +257,18 @@ fn detached_child(mode: &str) -> std::process::Child {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
         .arg(mode)
-        .stdin(Stdio::null())
+        // The executor already supplies an EOF pipe. Reuse it rather than
+        // opening another device from the restricted child token.
+        .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    // Ordinary std::process::Command: no special console/creation flags.
+    // A headless worker has no console to inherit. Do not ask a Server/service
+    // runner to create one under the inherited win32k restrictions. The child
+    // still inherits the exact AppContainer token and owning Job Object.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    }
     command.spawn().unwrap()
 }

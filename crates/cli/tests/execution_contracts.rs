@@ -76,6 +76,13 @@ fn tokenizer_import_authenticates_before_publication_without_resolving_keys() {
     fs::write(&path, b"{}").unwrap();
     assert!(f.app().configure(&f.config).is_err());
     assert_eq!(fs::read(f.home.join("settings.enc")).unwrap(), stored);
+    settings["local_tokenizer"]["path"] = json!(r"\\unreachable.invalid\share\tokenizer.json");
+    fs::write(&f.config, serde_json::to_vec(&settings).unwrap()).unwrap();
+    assert!(matches!(
+        f.app().configure(&f.config),
+        Err(melissa_cli::Error::Denied(_))
+    ));
+    assert_eq!(fs::read(f.home.join("settings.enc")).unwrap(), stored);
 }
 #[test]
 fn settings_import_and_display_never_resolve_or_disclose_the_credential_reference() {
