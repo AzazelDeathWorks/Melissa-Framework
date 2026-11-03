@@ -2,7 +2,7 @@ name: Checks
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, 'fix/**']
 permissions:
   contents: read
 jobs:
