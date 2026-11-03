@@ -1,0 +1,15 @@
+{
+  "schema_version": "melissa.upstream-license/v1",
+  "name": "vsimd",
+  "version": "0.8.0",
+  "crate_checksum": "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64",
+  "repository": "https://github.com/Nugine/simd",
+  "revision": "d74c030d9dc4f3cae02146d1f497ff62726ef09a",
+  "files": [
+    {
+      "path": "third_party/licenses/vsimd/0.8.0/LICENSE.upstream",
+      "url": "https://raw.githubusercontent.com/Nugine/simd/d74c030d9dc4f3cae02146d1f497ff62726ef09a/LICENSE",
+      "sha256": "71674605ec4c087fe9eb534e3e4f9e26eb2e4aabcd76a29fd156c6a844d44b3d"
+    }
+  ]
+}

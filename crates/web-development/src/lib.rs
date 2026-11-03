@@ -10,6 +10,7 @@ pub type Result<T = ()> = std::result::Result<T, Error>;
 #[derive(Debug)]
 pub enum Error {
     Invalid(&'static str),
+    Arguments(String),
     Store(melissa_local_store::StoreError),
     Repository(melissa_repository::Error),
     Json(serde_json::Error),
@@ -19,6 +20,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Invalid(s) => s,
+            Self::Arguments(s) => s,
             Self::Store(_) => "web development evidence persistence failed",
             Self::Repository(_) => "web development source verification failed",
             Self::Json(_) => "invalid web development protocol",

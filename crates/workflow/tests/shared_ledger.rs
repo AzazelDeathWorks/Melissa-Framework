@@ -122,7 +122,7 @@ fn unknown_usage_keeps_money_and_blocks_workflow_and_cancel_settlement() {
     let result = Scheduler::create(
         s,
         p,
-        &Catalog::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap(),
+        &Catalog::load_definitions(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap(),
         Arc::new(move || Ok(f.clone())),
         Arc::new(AtomicBool::new(false)),
     );

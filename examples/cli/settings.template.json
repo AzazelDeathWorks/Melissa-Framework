@@ -1,0 +1,21 @@
+{
+  "schema_version": "melissa.cli-settings/v1",
+  "provider_id": "operator-selected",
+  "endpoint": "https://provider.example.invalid/v1/responses",
+  "protocol": "open_ai_responses",
+  "model": "REPLACE_WITH_EXACT_MODEL_ID",
+  "credential": {"kind": "environment", "name": "MELISSA_API_KEY"},
+  "context_tokens": 0,
+  "max_output_tokens": 0,
+  "capabilities": {"tool_calling": true, "structured_output": false, "vision": false, "streaming": true},
+  "json_object": true,
+  "native_json_schema": false,
+  "single_attempt": false,
+  "rate_card": {
+    "source": {"kind": "verified_host_rate_card", "source_url": "https://provider.example.invalid/pricing", "checked_at_unix_ms": 0},
+    "input_micro_usd_per_million": 0,
+    "output_micro_usd_per_million": 0,
+    "cached_input_micro_usd_per_million": null,
+    "cache_creation_micro_usd_per_million": null
+  }
+}

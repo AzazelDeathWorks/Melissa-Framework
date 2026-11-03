@@ -1,0 +1,65 @@
+{
+  "schema_version": "melissa.cli-recipe/v2",
+  "agents": [
+    {
+      "profile": "melissa.code.implementer",
+      "goal": "main.py receives a JSON array as argv[1]. Return the array reversed as JSON. Preserve dirty work. Run public code_tests then submit_candidate with actual source digest.",
+      "write": true
+    }
+  ],
+  "writable_paths": [
+    "main.py"
+  ],
+  "protected_paths": [
+    "user-dirty.txt"
+  ],
+  "negative_workspace": "C:/Projects/separate-negative",
+  "max_cost_micro_usd": 5000000,
+  "wall_time_ms": 1800000,
+  "language": "python",
+  "entry": "main.py",
+  "development_checks": [
+    {
+      "id": "public-0",
+      "input": [
+        1,
+        2
+      ],
+      "expected": [
+        2,
+        1
+      ]
+    },
+    {
+      "id": "public-1",
+      "input": [],
+      "expected": []
+    }
+  ],
+  "checks": [
+    {
+      "id": "private-0",
+      "input": [
+        4,
+        1,
+        9
+      ],
+      "expected": [
+        9,
+        1,
+        4
+      ]
+    },
+    {
+      "id": "private-1",
+      "input": [
+        "a",
+        "b"
+      ],
+      "expected": [
+        "b",
+        "a"
+      ]
+    }
+  ]
+}

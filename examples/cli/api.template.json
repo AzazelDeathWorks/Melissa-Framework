@@ -1,0 +1,122 @@
+{
+  "schema_version": "melissa.cli-recipe/v2",
+  "agents": [
+    {
+      "profile": "melissa.code.backend",
+      "goal": "Implement local Python HTTP server server.py on127.0.0.1:37641 using stdlib. GET /health returns200 JSON {ok:true}, GET /version returns200 JSON {version:2}, unknown routes404 JSON. Each web_flow is a fresh closed session. Run public tests then submit actual source digest.",
+      "write": true
+    }
+  ],
+  "writable_paths": [
+    "server.py"
+  ],
+  "protected_paths": [
+    "user-dirty.txt"
+  ],
+  "negative_workspace": "C:/Projects/separate-negative",
+  "max_cost_micro_usd": 5000000,
+  "wall_time_ms": 1800000,
+  "domain": {
+    "kind": "backend",
+    "app": {
+      "language": "python",
+      "entry": "server.py"
+    },
+    "database": null,
+    "seed_path": null,
+    "migrations": {},
+    "statements": {},
+    "public_checks": [
+      {
+        "id": "public-health",
+        "steps": [
+          {
+            "operation": {
+              "command": "api",
+              "request": {
+                "session": "client",
+                "method": "get",
+                "path": "/health",
+                "headers": {
+                  "content-type": "application/json"
+                },
+                "body": null,
+                "timeout_ms": 5000
+              }
+            },
+            "expect": [
+              {
+                "operator": "equals",
+                "pointer": "/body/json/ok",
+                "value": true
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "private_checks": [
+      {
+        "id": "version",
+        "steps": [
+          {
+            "operation": {
+              "command": "api",
+              "request": {
+                "session": "client",
+                "method": "get",
+                "path": "/version",
+                "headers": {
+                  "content-type": "application/json"
+                },
+                "body": null,
+                "timeout_ms": 5000
+              }
+            },
+            "expect": [
+              {
+                "operator": "equals",
+                "pointer": "/body/status",
+                "value": 200
+              },
+              {
+                "operator": "equals",
+                "pointer": "/body/json/version",
+                "value": 2
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "missing",
+        "steps": [
+          {
+            "operation": {
+              "command": "api",
+              "request": {
+                "session": "client",
+                "method": "get",
+                "path": "/no-such-route",
+                "headers": {
+                  "content-type": "application/json"
+                },
+                "body": null,
+                "timeout_ms": 5000
+              }
+            },
+            "expect": [
+              {
+                "operator": "equals",
+                "pointer": "/body/status",
+                "value": 404
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "preview": null,
+    "private_seed_sql": null
+  }
+}

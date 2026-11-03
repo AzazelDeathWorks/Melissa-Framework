@@ -48,6 +48,7 @@
   },
   "tool_ids": [
     "fs.read",
+    "fs.snapshot",
     "fs.search",
     "git.diff",
     "code.symbols",

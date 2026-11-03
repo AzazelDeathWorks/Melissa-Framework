@@ -133,7 +133,7 @@ fn fixture_config(mode: &str, config: StoreConfig) -> Fixture {
     };
     let broker = Broker::new(
         store,
-        Catalog::load(&project).unwrap(),
+        Catalog::load_definitions(&project).unwrap(),
         workspace.clone(),
         RESOURCE.into(),
         policy,
@@ -363,8 +363,16 @@ fn mac_tamper_and_expiry_have_no_process_effect() {
             .execute(TASK, &altered, &identity("tamper"), &AtomicBool::new(false))
             .is_err()
     );
-    let expired = permit(&f, "expired", 20);
-    std::thread::sleep(Duration::from_millis(40));
+    // Minting hashes/pins files and can exceed 20 ms under a full native
+    // regression load. First prove a valid signed permit exists, then wait
+    // past its actual expiry; all execution/expiry assertions stay unchanged.
+    let expired = permit(&f, "expired", 5_000);
+    let wait = expired
+        .permit
+        .expires_at_unix_ms
+        .saturating_sub(unix_ms().unwrap())
+        + 40;
+    std::thread::sleep(Duration::from_millis(wait));
     assert!(
         f.broker
             .execute(
@@ -789,7 +797,8 @@ fn new_host_session_rejects_previously_signed_authority() {
     let signed = permit(&f, "session", 30_000);
     let policy = f.broker.policy_control().snapshot().unwrap();
     let store = f.broker.store().connect().unwrap();
-    let catalog = Catalog::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+    let catalog =
+        Catalog::load_definitions(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
     let mut other =
         Broker::new(store, catalog, f.workspace.clone(), RESOURCE.into(), policy).unwrap();
     assert!(

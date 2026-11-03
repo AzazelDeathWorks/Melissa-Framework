@@ -1,0 +1,7 @@
+# Verify this local tag resolves to the SDK_IMAGE pinned in protected.rs before
+# building. The produced image ID, not this mutable tag, is the runtime grant.
+FROM melissa-code06-complete:20261020
+ARG SEMGREP_VERSION
+RUN /opt/melissa-python/bin/python -m venv /opt/melissa-sast \
+ && /opt/melissa-sast/bin/pip install --no-cache-dir --report /opt/melissa-sast/install-report.json "semgrep==${SEMGREP_VERSION}" \
+ && /opt/melissa-sast/bin/pip freeze > /opt/melissa-sast/requirements-resolved.txt

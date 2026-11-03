@@ -1,0 +1,134 @@
+{
+  "schema_version": "melissa.cli-recipe/v2",
+  "agents": [
+    {
+      "profile": "melissa.code.database",
+      "goal": "Fix rollup.sql to create view totals(total) computing SUM(value) across readings. No extra writes.",
+      "write": true
+    }
+  ],
+  "writable_paths": [
+    "rollup.sql"
+  ],
+  "protected_paths": [
+    "user-dirty.txt"
+  ],
+  "negative_workspace": "C:/Projects/separate-negative",
+  "max_cost_micro_usd": 5000000,
+  "wall_time_ms": 1800000,
+  "domain": {
+    "kind": "database",
+    "app": null,
+    "database": "sqlite",
+    "seed_path": "seed.sql",
+    "migrations": {
+      "rollup": {
+        "source_path": "rollup.sql",
+        "baseline": {
+          "kind": "initial"
+        },
+        "transactional": true
+      }
+    },
+    "statements": {},
+    "public_checks": [
+      {
+        "id": "public-0",
+        "steps": [
+          {
+            "operation": {
+              "command": "migration",
+              "name": "rollup"
+            },
+            "expect": []
+          },
+          {
+            "operation": {
+              "command": "query",
+              "connection": "reader",
+              "sql": "SELECT total FROM totals",
+              "parameters": []
+            },
+            "expect": [
+              {
+                "operator": "equals",
+                "pointer": "/body/rows",
+                "value": [
+                  [
+                    7
+                  ]
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "private_checks": [
+      {
+        "id": "private-0",
+        "steps": [
+          {
+            "operation": {
+              "command": "migration",
+              "name": "rollup"
+            },
+            "expect": []
+          },
+          {
+            "operation": {
+              "command": "query",
+              "connection": "reader",
+              "sql": "SELECT total FROM totals",
+              "parameters": []
+            },
+            "expect": [
+              {
+                "operator": "equals",
+                "pointer": "/body/rows",
+                "value": [
+                  [
+                    43
+                  ]
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "private-1",
+        "steps": [
+          {
+            "operation": {
+              "command": "migration",
+              "name": "rollup"
+            },
+            "expect": []
+          },
+          {
+            "operation": {
+              "command": "query",
+              "connection": "reader",
+              "sql": "SELECT total*2 FROM totals",
+              "parameters": []
+            },
+            "expect": [
+              {
+                "operator": "equals",
+                "pointer": "/body/rows",
+                "value": [
+                  [
+                    86
+                  ]
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "preview": null,
+    "private_seed_sql": "CREATE TABLE readings(value INTEGER NOT NULL); INSERT INTO readings VALUES (19),(24);"
+  }
+}

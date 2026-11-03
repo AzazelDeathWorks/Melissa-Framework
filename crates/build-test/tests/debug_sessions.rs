@@ -59,7 +59,7 @@ fn exercise(language: Language, path: &str, body: &str) {
             .unwrap()
             .as_millis();
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
-            "../../reports/debug-faults/{stamp}-{}",
+            "../../reports/code06-complete-20261020/debug-faults/{stamp}-{}",
             language.wire()
         ));
         std::fs::create_dir_all(&dir).unwrap();

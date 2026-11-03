@@ -85,7 +85,11 @@ impl LocalStore {
             ));
         }
         let digest = digest_for(bytes);
-        let inventory = self.cas.list()?;
+        let inventory = self.cas.list_with_parallelism(
+            self.instance
+                .inventory_readers
+                .load(std::sync::atomic::Ordering::Acquire),
+        )?;
         let used = inventory.iter().try_fold(0_u64, |sum, blob| {
             sum.checked_add(blob.stored_bytes)
                 .ok_or_else(|| StoreError::Integrity("CAS inventory byte overflow".into()))
@@ -142,6 +146,22 @@ impl LocalStore {
         artifact_id: &str,
     ) -> StoreResult<ArtifactMetadata> {
         artifact_on(&self.journal.conn, &self.instance.key, task_id, artifact_id)
+    }
+    /// Authenticated metadata inventory for one owned task. This does not
+    /// decrypt payloads, execute work, or grant access to another task.
+    pub fn list_artifacts(&self, task_id: &str) -> StoreResult<Vec<ArtifactMetadata>> {
+        self.journal.task(task_id)?;
+        let mut statement = self
+            .journal
+            .conn
+            .prepare("SELECT artifact_id FROM artifacts WHERE task_id=?1 ORDER BY artifact_id")?;
+        let ids = statement
+            .query_map([task_id], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        ids.into_iter()
+            .map(|id| self.artifact_metadata(task_id, &id))
+            .collect()
     }
 
     pub fn get_artifact(&self, task_id: &str, artifact_id: &str) -> StoreResult<Vec<u8>> {

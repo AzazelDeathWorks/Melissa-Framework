@@ -35,6 +35,7 @@ struct Host {
     policy: RepositoryToolPolicy,
     read_error_observations: bool,
     recovery_observations: bool,
+    portable_patch_wire: bool,
 }
 #[derive(Clone)]
 pub struct RepositoryDispatcher {
@@ -224,6 +225,11 @@ struct UnifiedArg {
     #[serde(default)]
     line_endings: crate::unified::UnifiedLineEndings,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortablePatchArg {
+    proposal_json: String,
+}
 enum Parsed {
     ReadPage(ReadPageArg),
     ArtifactPage(ArtifactPageArg),
@@ -311,6 +317,24 @@ fn parse(call: &ToolCall) -> melissa_model_gateway::Result<Parsed> {
     Ok(p)
 }
 impl Host {
+    fn native_call(&self, call: &ToolCall) -> melissa_model_gateway::Result<ToolCall> {
+        if !self.portable_patch_wire || call.name != "fs_patch" {
+            return Ok(call.clone());
+        }
+        let outer = melissa_model_gateway::schema::validate_output(
+            &portable_patch_schema(),
+            &call.arguments,
+        )?;
+        let body: PortablePatchArg = decode(outer)?;
+        // Exact JSON transport, never field coercion, guessed bytes or a new
+        // permission. The unchanged complete native schema/broker still apply.
+        melissa_model_gateway::schema::validate_output(&schema("fs_patch"), &body.proposal_json)?;
+        Ok(ToolCall {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            arguments: body.proposal_json,
+        })
+    }
     fn authority(&self, wire: &str) -> crate::Result {
         let canonical = route(wire).ok_or(Error::Invalid("repository route"))?.0;
         if !self.policy.enabled_tools.contains(wire) {
@@ -381,7 +405,11 @@ impl Host {
             return Err(Error::Denied("tool context differs from host binding"));
         }
         check_cancel(cancel)?;
-        let parsed = parse(&call).map_err(|_| Error::Invalid("repository tool arguments"))?;
+        let native_call = self
+            .native_call(&call)
+            .map_err(|_| Error::Invalid("repository tool arguments"))?;
+        let parsed =
+            parse(&native_call).map_err(|_| Error::Invalid("repository tool arguments"))?;
         let binding_id = format!("{}:tool-binding", c.invocation_id);
         self.put(&binding_id,"repository_tool_binding",&serde_json::to_vec(&json!({"task":c.task_id,"profile":c.profile_id,"run":c.run_id,"request":c.request_id,"invocation":c.invocation_id,"attempt":c.attempt_id,"generation":c.generation,"wire_call_id":call.id,"wire_name":call.name,"canonical_tool":canonical,"arguments_digest":digest(call.arguments.as_bytes()),"root_identity":self.repo.root_identity()}))?)?;
         let mut artifacts = vec![binding_id];
@@ -630,6 +658,7 @@ impl RepositoryDispatcher {
                 policy,
                 read_error_observations: false,
                 recovery_observations: false,
+                portable_patch_wire: false,
             })),
         })
     }
@@ -641,6 +670,16 @@ impl RepositoryDispatcher {
             .lock()
             .map_err(|_| Error::Denied("repository host lock poisoned"))?
             .recovery_observations = true;
+        Ok(self)
+    }
+    /// Explicit host-selected transport for providers that reliably emit a
+    /// JSON string but not nested tool arrays. Legacy callers retain native
+    /// arguments. Both paths require the same exact native patch proposal.
+    pub fn with_portable_patch_wire(self) -> crate::Result<Self> {
+        self.host
+            .lock()
+            .map_err(|_| Error::Denied("repository host lock poisoned"))?
+            .portable_patch_wire = true;
         Ok(self)
     }
     /// Host-only opt-in: known write-free read/input failures become failed
@@ -685,8 +724,10 @@ impl ToolDispatcher for RepositoryDispatcher {
                 canonical_id: r.1.into(),
                 definition: ToolDefinition {
                     name: r.0.into(),
-                    description: r.2.into(),
-                    parameters: schema(r.0),
+                    description: if h.portable_patch_wire && r.0=="fs_patch" {
+                        format!("{} Transport: the ONLY outer field is proposal_json, a JSON STRING containing the complete native patch OBJECT serialized exactly once. Its files member must be an actual array INSIDE that object, never a string. Do not put native fields beside proposal_json. All source identity/preimage/permission checks remain unchanged. COMPLETE INNER SCHEMA: {}",r.2,schema("fs_patch"))
+                    } else {r.2.into()},
+                    parameters: if h.portable_patch_wire && r.0=="fs_patch" {portable_patch_schema()}else{schema(r.0)},
                     strict: false,
                 },
             })
@@ -696,12 +737,12 @@ impl ToolDispatcher for RepositoryDispatcher {
         let _id = route(&call.name)
             .ok_or_else(|| GatewayError::unsupported("unbound repository route"))?
             .0;
-        self.host
+        let host = self
+            .host
             .lock()
-            .map_err(|_| GatewayError::new(ErrorKind::Tool, "repository host unavailable"))?
-            .authority(&call.name)
-            .map_err(err)?;
-        parse(call).map(|_| ())
+            .map_err(|_| GatewayError::new(ErrorKind::Tool, "repository host unavailable"))?;
+        host.authority(&call.name).map_err(err)?;
+        parse(&host.native_call(call)?).map(|_| ())
     }
     fn execute<'a>(
         &'a mut self,
@@ -735,6 +776,12 @@ impl ToolDispatcher for RepositoryDispatcher {
 
 fn object(props: Value, required: &[&str]) -> Value {
     json!({"type":"object","properties":props,"required":required,"additionalProperties":false})
+}
+fn portable_patch_schema() -> Value {
+    object(
+        json!({"proposal_json":{"type":"string","minLength":2}}),
+        &["proposal_json"],
+    )
 }
 fn schema(id: &str) -> Value {
     let path = json!({"type":"string","minLength":1,"maxLength":2048});

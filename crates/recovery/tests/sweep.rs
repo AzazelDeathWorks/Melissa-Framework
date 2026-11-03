@@ -84,7 +84,7 @@ fn crash_case(semantic: bool) {
                     )
                     .unwrap(),
                     monitor.connect().unwrap(),
-                    melissa_core_contracts::catalog::Catalog::load(
+                    melissa_core_contracts::catalog::Catalog::load_definitions(
                         &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."),
                     )
                     .unwrap(),

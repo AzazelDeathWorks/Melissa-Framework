@@ -159,7 +159,7 @@ impl Repository {
         Ok(Discovery{schema_version:"melissa.repository-discovery/v1".into(),snapshot,files,manifests,ignore_inputs,configuration_scope:"pinned .gitignore/.ignore hierarchy and host globs; no ambient global/system Git configuration; excluded prefixes stay explicit".into()})
     }
 }
-pub(crate) fn language(path: &str) -> Option<&'static str> {
+pub fn language(path: &str) -> Option<&'static str> {
     match path.rsplit('.').next()? {
         "rs" => Some("rust"),
         "py" => Some("python"),

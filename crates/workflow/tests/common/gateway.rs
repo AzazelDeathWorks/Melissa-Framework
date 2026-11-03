@@ -205,7 +205,7 @@ fn store(root: &Path, input_budget: u64) -> LocalStore {
     )))
     .unwrap();
     task.task_id = TASK.into();
-    task.selected_profile_ids = Catalog::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap().profiles.keys().cloned().collect();
+    task.selected_profile_ids = Catalog::load_definitions(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap().profiles.keys().cloned().collect();
     task.allowed_effects = vec!["workspace.read".into(),"workspace.apply_patch_scoped".into(),"workspace.propose_patch".into(),"process.execute_scoped".into(),"task.delegate".into(),"task.read".into(),"evidence.append".into(),"artifact.read".into(),"artifact.write".into(),"git.read".into()];
     task.allowed_resource_ids.push(RESOURCE.into());
     task.authorization_refs.push(AUTH.into());
@@ -242,7 +242,7 @@ fn policy() -> GatewayPolicy {
 fn gateway(store: LocalStore, http: &HttpFixture, policy: GatewayPolicy) -> Gateway {
     Gateway::new(
         store,
-        Catalog::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap(),
+        Catalog::load_definitions(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap(),
         vec![ModelRegistration {
             registration_id: "fixture-route".into(),
             endpoint: ProviderEndpoint::new(

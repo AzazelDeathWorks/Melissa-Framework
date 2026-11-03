@@ -66,6 +66,7 @@ pub struct ProviderEndpoint {
     key: ApiKey,
     request_policy: ProviderRequestPolicy,
     reviewed_origin: Option<String>,
+    openai_image_detail: crate::openai::ImageDetail,
 }
 impl std::fmt::Debug for ProviderEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -74,6 +75,7 @@ impl std::fmt::Debug for ProviderEndpoint {
             .field("protocol", &self.protocol)
             .field("trust", &self.trust)
             .field("request_policy", &self.request_policy)
+            .field("openai_image_detail", &self.openai_image_detail)
             .field("credential", &"[redacted]")
             .finish()
     }
@@ -90,9 +92,26 @@ impl ProviderEndpoint {
             self.key.clone(),
         )?;
         self.validate_request_policy()?;
+        if self.protocol != Protocol::OpenAiResponses
+            && self.openai_image_detail != crate::openai::ImageDetail::Original
+        {
+            return Err(GatewayError::invalid(
+                "Responses image detail requires Responses protocol",
+            ));
+        }
         Ok(())
     }
-    /// Bound The reviewed gateway's internal waterfall to one generation dispatch.
+    /// Explicit provider wire compatibility, selected by trusted host code.
+    /// This never grants vision/tool authority or changes PNG bytes or size.
+    pub fn with_openai_image_detail(mut self, detail: crate::openai::ImageDetail) -> Result<Self> {
+        self.openai_image_detail = detail;
+        self.validate()?;
+        Ok(self)
+    }
+    pub fn openai_image_detail(&self) -> crate::openai::ImageDetail {
+        self.openai_image_detail
+    }
+    /// Bound the reviewed gateway's internal waterfall to one generation dispatch.
     /// This opt-in does not change the gateway host's separate retry policy.
     pub fn with_single_attempt_origin(mut self, reviewed_origin: &str) -> Result<Self> {
         let origin = Url::parse(reviewed_origin)
@@ -183,6 +202,7 @@ impl ProviderEndpoint {
             key,
             request_policy: ProviderRequestPolicy::Standard,
             reviewed_origin: None,
+            openai_image_detail: crate::openai::ImageDetail::Original,
         })
     }
 }
@@ -317,7 +337,11 @@ impl HttpTransport {
     ) -> Result<Value> {
         endpoint.validate()?;
         let mut body = match endpoint.protocol {
-            Protocol::OpenAiResponses => crate::openai::build_request_with_limits(request, limits),
+            Protocol::OpenAiResponses => crate::openai::build_request_with_image_detail(
+                request,
+                limits,
+                endpoint.openai_image_detail,
+            ),
             Protocol::AnthropicMessages => {
                 crate::anthropic::build_request_with_limits(request, limits)
             }
@@ -419,10 +443,10 @@ impl HttpTransport {
                 .and_then(|v| v.checked_mul(1000))
                 .map(|v| v.min(30_000));
             if !response.status().is_success() {
-                // The reviewed gateway's documented HTTP refusal envelope is distinct
-                // from a successful SSE refusal. Never infer this from prose,
-                // assume zero billing, or turn it into a replayable response.
-                if response.status().as_u16() == 400
+                // Bounded HTTP400 refusal and HTTP429 diagnostic JSON are not
+                // successful SSE replies. Retaining a throttle body confers no
+                // zero-usage proof, retry authority, or successful model result.
+                if matches!(response.status().as_u16(), 400 | 429)
                     && response
                         .headers()
                         .get("content-type")
@@ -485,7 +509,9 @@ impl HttpTransport {
                                 })
                     });
                     return Err(GatewayError::new(
-                        if refused {
+                        if status == Some(429) {
+                            ErrorKind::RateLimited
+                        } else if refused {
                             ErrorKind::Refused
                         } else {
                             ErrorKind::Protocol

@@ -61,6 +61,19 @@ impl Catalog {
         Self::load_with_limits(root, CatalogLimits::default())
     }
     pub fn load_with_limits(root: &Path, limits: CatalogLimits) -> ContractResult<Self> {
+        Self::load_mode(root, limits, true)
+    }
+    /// Runtime definition loading only. Historical status strings are claims,
+    /// not authenticated acceptance. This intentionally leaves `load` strict
+    /// and does not synthesize missing historical evidence files.
+    pub fn load_definitions(root: &Path) -> ContractResult<Self> {
+        Self::load_mode(root, CatalogLimits::default(), false)
+    }
+    fn load_mode(
+        root: &Path,
+        limits: CatalogLimits,
+        require_evidence: bool,
+    ) -> ContractResult<Self> {
         require(
             limits.max_file_bytes > 0
                 && limits.max_total_bytes > 0
@@ -190,14 +203,14 @@ impl Catalog {
         // Evidence references are local definition evidence only. Existence does
         // not authenticate a verifier, prove content, or promote product state.
         for item in &catalog.backlog.items {
-            if item.status == BacklogStatus::Accepted {
+            if require_evidence && item.status == BacklogStatus::Accepted {
                 for reference in &item.evidence_refs {
                     reader.evidence(reference)?;
                 }
             }
         }
         for module in &catalog.modules.modules {
-            if module.gate.status == GateStatus::Passed {
+            if require_evidence && module.gate.status == GateStatus::Passed {
                 for reference in &module.gate.evidence_refs {
                     reader.evidence(reference)?;
                 }

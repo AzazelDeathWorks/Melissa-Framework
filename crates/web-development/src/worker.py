@@ -1,5 +1,6 @@
 """Isolated development adapter; all process/fixture registration comes from Rust."""
 import concurrent.futures
+import base64
 import hashlib
 import http.cookiejar
 import json
@@ -191,6 +192,8 @@ def start():
     if R['database']=='postgres':
         pg_bin=next(Path('/usr/lib/postgresql').glob('*/bin'))
         data=STATE/'pg'; socket=STATE/'socket';socket.mkdir()
+        if P.get('postgres_data_policy')=='ephemeral_runtime_logical_evidence':
+            data=ROOT/'.melissa-runtime'/'web-postgres'
         run([str(pg_bin/'initdb'),'-D',str(data),'-U','melissa_fixture','--auth-local=trust','--auth-host=reject','--no-locale','--encoding=UTF8'])
         pg=subprocess.Popen([str(pg_bin/'postgres'),'-D',str(data),'-k',str(socket),'-p','37642','-c','listen_addresses=','-c','shared_buffers=16MB','-c','max_connections=16'],stdout=open(STATE/'pg.log','wb'),stderr=subprocess.STDOUT)
         processes.append(pg)
@@ -211,7 +214,10 @@ def start():
     app=R['app']
     if app:
         language=app['language']
-        if language=='python':argv=['/opt/melissa-python/bin/python','-I',app['entry']]
+        if language=='python':
+            argv=['/opt/melissa-python/bin/python','-I',app['entry']]
+            if P.get('python_project_imports'):
+                argv=['/opt/melissa-python/bin/python','-I','-B','-c',"import runpy,sys;from pathlib import Path;entry=sys.argv[1];sys.argv=sys.argv[1:];sys.path.insert(0,str(Path(entry).resolve().parent));sys.path.insert(0,'/work');runpy.run_path(entry,run_name='__main__')",app['entry']]
         elif language=='java_script':argv=['/opt/node/bin/node',app['entry']]
         elif language=='type_script':
             run(['/opt/node/bin/node','/opt/melissa-tools/node_modules/typescript/bin/tsc',app['entry'],'--target','es2022','--module','commonjs','--outDir',str(PRIVATE/'build'),'--skipLibCheck'])
@@ -294,9 +300,16 @@ def send_binary(seq,meta):
     if len(raw)!=meta['bytes'] or 'sha256:'+hashlib.sha256(raw).hexdigest()!=meta['sha256']:raise ValueError('binary artifact changed before transfer')
     for offset in range(0,len(raw),24576):
         part=raw[offset:offset+24576]
-        print(json.dumps({'schema_version':'melissa.web-binary/v1','seq':seq,'artifact_id':meta['id'],'offset':offset,'total_bytes':len(raw),'data_hex':part.hex()}),flush=True)
+        frame={'schema_version':'melissa.web-binary/v1','seq':seq,'artifact_id':meta['id'],'offset':offset,'total_bytes':len(raw),'data_hex':part.hex()}
+        if P.get('binary_encoding')=='base64-v2':
+            frame.pop('data_hex');frame['schema_version']='melissa.web-binary/v2';frame['data_base64']=base64.b64encode(part).decode('ascii')
+        print(json.dumps(frame),flush=True)
         ack=json.loads(sys.stdin.readline(2048))
         if ack!={'artifact_ack':seq,'offset':offset}:raise ValueError('binary artifact acknowledgement mismatch')
+    if P.get('binary_encoding')=='base64-v2' and meta['kind']=='trace':
+        original=(PRIVATE/'trace.zip').read_bytes()
+        if original!=raw:raise ValueError('retained original trace differs from acknowledged artifact')
+        path.unlink()  # Only this acknowledged temporary duplicate; trace.zip stays exact.
 def cleanup():
     for c in connections.values():
         try:c.close()

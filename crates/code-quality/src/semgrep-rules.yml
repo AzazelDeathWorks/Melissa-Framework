@@ -1,0 +1,25 @@
+rules:
+  - id: melissa.python-eval
+    languages: [python]
+    severity: ERROR
+    message: Dynamic evaluation requires independent security review.
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: exec(...)
+  - id: melissa.python-shell
+    languages: [python]
+    severity: ERROR
+    message: A shell-enabled subprocess requires independent security review.
+    pattern: subprocess.$FUNC(..., shell=True, ...)
+  - id: melissa.javascript-eval
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: Dynamic evaluation requires independent security review.
+    pattern: eval(...)
+  - id: melissa.rust-shell
+    languages: [rust]
+    severity: ERROR
+    message: Shell interpretation of a variable requires independent security review.
+    pattern-either:
+      - pattern: std::process::Command::new("sh").arg("-c").arg($INPUT)
+      - pattern: std::process::Command::new("cmd.exe").arg("/c").arg($INPUT)

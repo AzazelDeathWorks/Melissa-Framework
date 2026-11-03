@@ -212,7 +212,7 @@ fn fixture(script: &str, store_config: StoreConfig, rust: bool) -> Fixture {
     };
     let broker = ContainerBroker::new(
         store,
-        Catalog::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap(),
+        Catalog::load_definitions(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap(),
         RESOURCE.into(),
         policy,
     )
@@ -850,7 +850,8 @@ fn local_gateway_provider_protocol_drives_real_rust_broker_and_returns_only_a_ca
         measurements: Measurements::default(),
     };
     let store = f.broker.lock().unwrap().store().connect().unwrap();
-    let catalog = Catalog::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+    let catalog =
+        Catalog::load_definitions(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
     let mut gateway = Gateway::new(
         store,
         catalog,
@@ -1035,7 +1036,7 @@ fn native_dispatcher_runs_real_appcontainer_probe_and_rejects_changed_arguments(
     };
     let broker = Broker::new(
         store,
-        Catalog::load(&project).unwrap(),
+        Catalog::load_definitions(&project).unwrap(),
         workspace.clone(),
         resource.into(),
         policy,

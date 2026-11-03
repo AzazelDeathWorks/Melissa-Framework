@@ -238,7 +238,7 @@ fn policy() -> GatewayPolicy {
 fn gateway(store: LocalStore, http: &HttpFixture, policy: GatewayPolicy) -> Gateway {
     Gateway::new(
         store,
-        Catalog::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap(),
+        Catalog::load_definitions(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap(),
         vec![ModelRegistration {
             registration_id: "fixture-route".into(),
             endpoint: ProviderEndpoint::new(

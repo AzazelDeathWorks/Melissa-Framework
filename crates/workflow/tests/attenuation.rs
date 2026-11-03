@@ -43,7 +43,8 @@ fn setup(
         workspace_digest: p.workspace_digest.clone(),
         policy_digest: p.policy_digest.clone(),
     };
-    let c = Catalog::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+    let c =
+        Catalog::load_definitions(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
     let mut s = Scheduler::create(
         store,
         p,
@@ -186,6 +187,67 @@ fn patch_targets_require_write_ownership_for_every_file() {
         .unwrap()
         .push(json!({"before":{"path":"src/b.py"}}));
     assert!(d.validate_call(&call("fs_patch", args)).is_err());
+}
+struct PortablePatch;
+impl ToolDispatcher for PortablePatch {
+    fn definitions(&self) -> Vec<BoundTool> {
+        vec![BoundTool {
+            canonical_id: "fs.patch".into(),
+            definition: ToolDefinition {
+                name: "fs_patch".into(),
+                description: "Exact declared JSON-string transport".into(),
+                parameters: json!({"type":"object","properties":{"proposal_json":{"type":"string"}},"required":["proposal_json"],"additionalProperties":false}),
+                strict: false,
+            },
+        }]
+    }
+    fn validate_call(&self, _: &ToolCall) -> Result<()> {
+        Ok(())
+    }
+    fn execute<'a>(
+        &'a mut self,
+        _: ToolCall,
+        _: ToolContext,
+        _: Arc<AtomicBool>,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolExecution>> + Send + 'a>> {
+        Box::pin(async { panic!("scope-only test must not execute") })
+    }
+}
+#[test]
+fn declared_portable_patch_checks_every_native_target_without_outer_smuggling() {
+    let (_temp, s, p) = setup(
+        &["fs.patch"],
+        &["workspace.apply_patch_scoped"],
+        vec![claim("src/a.py", Access::Write)],
+    );
+    let d = NodeDispatcher::new(s, p, Box::new(PortablePatch)).unwrap();
+    let proposal = json!({"files":[{"before":{"path":"src/a.py"}}]});
+    assert!(
+        d.validate_call(&call(
+            "fs_patch",
+            json!({"proposal_json":proposal.to_string()})
+        ))
+        .is_ok()
+    );
+    for invalid in [
+        json!({"proposal_json":json!({"files":[{"before":{"path":"src/b.py"}}]}).to_string()}),
+        json!({"proposal_json":proposal.to_string(),"files":proposal["files"]}),
+        json!({"proposal_json":json!({"files":"[]"}).to_string()}),
+        json!({"proposal_json":"{\"files\":[]}"}),
+        proposal,
+    ] {
+        assert!(d.validate_call(&call("fs_patch", invalid)).is_err());
+    }
+}
+#[test]
+fn fixed_code_tests_can_run_with_read_ownership_without_source_write_authority() {
+    let (_temp, s, p) = setup(
+        &["code.tests"],
+        &["process.execute_scoped"],
+        vec![claim("/", Access::Read)],
+    );
+    let d = NodeDispatcher::new(s, p, tool("code.tests", "code_tests")).unwrap();
+    assert!(d.validate_call(&call("code_tests", json!({}))).is_ok());
 }
 #[test]
 fn move_requires_both_source_and_destination() {

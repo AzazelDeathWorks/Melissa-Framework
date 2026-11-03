@@ -118,6 +118,11 @@ impl Cas {
         let file = File::open(&path)?;
         validate_regular(&file.metadata()?)?;
         let mut bytes = Vec::new();
+        let capacity = usize::try_from(metadata.len())
+            .map_err(|_| StoreError::Invalid("CAS envelope exceeds address space".into()))?;
+        bytes
+            .try_reserve_exact(capacity)
+            .map_err(|_| StoreError::Invalid("CAS envelope allocation exceeds capacity".into()))?;
         file.take(max_stored + 1).read_to_end(&mut bytes)?;
         if bytes.len() as u64 != metadata.len() || bytes.len() as u64 > max_stored {
             return Err(StoreError::Integrity(
@@ -131,6 +136,98 @@ impl Cas {
             ));
         }
         Ok(std::mem::take(&mut *plaintext))
+    }
+
+    /// Trusted-host opt-in: authenticate every blob using at most four readers.
+    /// No inventory is cached. Every worker is joined and any error fails the
+    /// whole inventory. The legacy serial API is unchanged.
+    pub fn list_with_parallelism(&self, maximum_readers: usize) -> StoreResult<Vec<BlobInfo>> {
+        if !(1..=4).contains(&maximum_readers) {
+            return Err(StoreError::Invalid(
+                "CAS verification readers must be1..4".into(),
+            ));
+        }
+        let readers =
+            maximum_readers.min(std::thread::available_parallelism().map_or(1, usize::from));
+        if readers == 1 {
+            return self.list();
+        }
+        self.validate_directories()?;
+        let mut digests = Vec::new();
+        for (index, entry) in fs::read_dir(self.root.join("blobs"))?.enumerate() {
+            if index >= MAX_SCAN_ENTRIES {
+                return Err(StoreError::Quota("CAS inventory scan limit".into()));
+            }
+            let entry = entry?;
+            let metadata = regular_metadata(&entry.path())?;
+            let name = entry.file_name();
+            let name = name
+                .to_str()
+                .ok_or_else(|| StoreError::Integrity("non-UTF8 CAS filename".into()))?;
+            let hex = name
+                .strip_suffix(".blob")
+                .ok_or_else(|| StoreError::Integrity("unexpected CAS file".into()))?;
+            let digest = format!("blake3:{hex}");
+            validate_digest(&digest)
+                .map_err(|_| StoreError::Integrity("unexpected CAS filename".into()))?;
+            digests.push((digest, metadata.len()));
+        }
+        if digests.is_empty() {
+            return Ok(vec![]);
+        }
+        // Length is only a scheduling estimate. Each selected file still goes
+        // through verified_info/get, and quota accounting uses those verified
+        // results. Large historical blobs must not strand the other readers.
+        digests.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let mut partitions = vec![Vec::new(); readers];
+        let mut loads = vec![0_u64; readers];
+        for (digest, stored_bytes) in digests {
+            let index = (0..readers)
+                .min_by_key(|&index| (loads[index], index))
+                .ok_or_else(|| StoreError::Integrity("empty CAS reader plan".into()))?;
+            loads[index] = loads[index]
+                .checked_add(stored_bytes)
+                .ok_or_else(|| StoreError::Integrity("CAS scheduling size overflow".into()))?;
+            partitions[index].push(digest);
+        }
+        let mut result = std::thread::scope(|scope| -> StoreResult<Vec<BlobInfo>> {
+            let jobs = partitions
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .map(|part| {
+                    scope.spawn(move || {
+                        part.iter()
+                            .map(|digest| self.verified_info(digest))
+                            .collect::<StoreResult<Vec<_>>>()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut result = Vec::new();
+            let mut failure = None;
+            for job in jobs {
+                match job.join() {
+                    Ok(Ok(infos)) => result.extend(infos),
+                    Ok(Err(error)) => {
+                        if failure.is_none() {
+                            failure = Some(error);
+                        }
+                    }
+                    Err(_) => {
+                        if failure.is_none() {
+                            failure = Some(StoreError::Integrity(
+                                "CAS verification reader panicked".into(),
+                            ));
+                        }
+                    }
+                }
+            }
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            Ok(result)
+        })?;
+        result.sort_unstable_by(|a, b| a.digest.cmp(&b.digest));
+        Ok(result)
     }
 
     /// Full verification is intentional: a directory name alone is not a valid

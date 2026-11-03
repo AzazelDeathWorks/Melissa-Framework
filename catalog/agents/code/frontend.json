@@ -48,8 +48,10 @@
   },
   "tool_ids": [
     "fs.read",
+    "fs.snapshot",
     "fs.search",
     "fs.hash",
+    "code.patch_propose",
     "fs.patch",
     "git.diff",
     "code.build",
@@ -68,6 +70,7 @@
   "authority": {
     "capability_ceiling": [
       "workspace.read",
+      "workspace.propose_patch",
       "workspace.apply_patch_scoped",
       "process.execute_scoped",
       "browser.interact_scoped",

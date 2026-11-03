@@ -1,5 +1,7 @@
 /target/
 /reports/
+/.private/
+/evidence/
 /work/
 /.secrets/
 /local-reference/

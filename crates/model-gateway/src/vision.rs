@@ -28,7 +28,7 @@ mod tests {
         )
         .unwrap();
         store.journal_mut().create_task(&task).unwrap();
-        let bytes = include_bytes!("../tests/fixtures/browser-fixture.png");
+        let bytes = include_bytes!("../tests/fixtures/code10-real-browser.png");
         let descriptor = json!({"id":"a1","kind":"png","bytes":bytes.len(),"sha256":"verified-by-native-receiver"});
         let reply = json!({"seq":3,"ok":true,"source_digest":"source-current","body":{"binary_artifact":descriptor,"content_type":"image/png"}});
         let receipt = json!({"artifact_id":"binary","web_reply_artifact_id":"reply","descriptor":descriptor,"source_digest":"source-current","seq":3,"blake3":format!("blake3:{}",blake3::hash(bytes))});
@@ -103,7 +103,7 @@ mod tests {
         )
         .unwrap();
         store.journal_mut().create_task(&task).unwrap();
-        let bytes = include_bytes!("../tests/fixtures/browser-fixture.png");
+        let bytes = include_bytes!("../tests/fixtures/code10-real-browser.png");
         let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
         let reply = json!({"ok":true,"body":{"content_type":"image/png","png_hex":hex},"seq":1,"source_digest":"owned-source"});
         store

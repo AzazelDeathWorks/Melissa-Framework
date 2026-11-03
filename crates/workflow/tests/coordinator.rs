@@ -48,7 +48,8 @@ fn setup() -> (tempfile::TempDir, Arc<Mutex<Scheduler>>) {
         workspace_digest: p.workspace_digest.clone(),
         policy_digest: p.policy_digest.clone(),
     };
-    let catalog = Catalog::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+    let catalog =
+        Catalog::load_definitions(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
     let scheduler = Scheduler::create(
         store,
         p,
@@ -115,7 +116,8 @@ async fn coordinator_native_task_spawn_routes_three_real_profile_runs_and_handof
         )),
     ])
     .await;
-    let catalog = Catalog::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+    let catalog =
+        Catalog::load_definitions(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
     let mut tools =
         CoordinatorDispatcher::new(rt, "melissa.core.coordinator".into(), &catalog).unwrap();
     let store = owner.lock().unwrap().store().connect().unwrap();
@@ -164,7 +166,8 @@ async fn coordinator_native_task_spawn_routes_three_real_profile_runs_and_handof
 async fn invalid_spawn_cannot_create_an_unapproved_expert() {
     let (_d, owner) = setup();
     let (rt, http) = driver(owner, vec![]).await;
-    let c = Catalog::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+    let c =
+        Catalog::load_definitions(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
     let tools = CoordinatorDispatcher::new(rt, "melissa.core.coordinator".into(), &c).unwrap();
     let call = ToolCall {
         id: "bad".into(),

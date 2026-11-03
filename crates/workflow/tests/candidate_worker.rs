@@ -14,7 +14,7 @@ fn service(store: LocalStore, run: &str, fixed: bool) -> CandidateTests {
     let task = store.journal().task(TASK).unwrap().contract;
     CandidateTests::new(
         store,
-        Catalog::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap(),
+        Catalog::load_definitions(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap(),
         CandidateTestConfig {
             task,
             profile: "melissa.code.implementer".into(),

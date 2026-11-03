@@ -81,7 +81,7 @@ fn try_setup(
     let d = CodeDispatcher::new(
         f.repo,
         store,
-        Catalog::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap(),
+        Catalog::load_definitions(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap(),
         policy,
     )?;
     Ok((f._dir, d, monitor))

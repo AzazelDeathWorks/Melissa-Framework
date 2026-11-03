@@ -22,24 +22,31 @@ use std::{
     time::{Duration, Instant},
 };
 pub(crate) enum Plan<'a> {
+    Git(
+        &'a melissa_repository::git::GitPlan,
+        &'a melissa_repository::RepositorySnapshot,
+    ),
     Semantic(&'a SemanticPlan),
     Procedure(&'a ProcedurePlan),
 }
 impl Plan<'_> {
     fn request(&self) -> &melissa_container_executor::ContainerRequest {
         match self {
+            Self::Git(p, _) => &p.request,
             Self::Semantic(p) => p.request(),
             Self::Procedure(p) => p.request(),
         }
     }
     fn snapshot(&self) -> &melissa_container_executor::Snapshot {
         match self {
+            Self::Git(p, _) => &p.snapshot,
             Self::Semantic(p) => p.snapshot(),
             Self::Procedure(p) => p.snapshot(),
         }
     }
     fn source(&self) -> &melissa_repository::RepositorySnapshot {
         match self {
+            Self::Git(_, s) => s,
             Self::Semantic(p) => p.source(),
             Self::Procedure(p) => p.source(),
         }
@@ -232,6 +239,30 @@ pub(crate) fn execute(
             return Err(denied());
         }
         let (success, content, mut refs) = match plan {
+            Plan::Git(p, source) => {
+                host.repo
+                    .validate_snapshot(source, &AtomicBool::new(false))?;
+                let current = if let CodeOperation::Git { operation } = op {
+                    melissa_repository::git::GitPlan::prepare(
+                        &host.repo,
+                        source,
+                        operation,
+                        &p.request.image_id,
+                        p.request.limits.clone(),
+                        &AtomicBool::new(false),
+                    )?
+                } else {
+                    return Err(denied());
+                };
+                let unchanged = current.metadata_digest == p.metadata_digest;
+                let success = unchanged
+                    && report.exit_code == Some(0)
+                    && report.termination == TerminationReason::Exited;
+                (success, json!({"operation":op,"source_digest":source.digest,"metadata_digest":p.metadata_digest,
+                    "source_current":unchanged,"success":success,"stdout":String::from_utf8_lossy(&report.stdout),
+                    "stderr":String::from_utf8_lossy(&report.stderr),"raw_report_artifact":raw_id,
+                    "private_worker_output":true,"host_worktree_changed":false,"task_completed":false}).to_string(), vec![])
+            }
             Plan::Semantic(p) => {
                 let r = p.analyze(
                     &host.repo,

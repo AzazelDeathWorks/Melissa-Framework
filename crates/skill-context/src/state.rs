@@ -127,6 +127,64 @@ pub struct MemoryBook {
     records: BTreeMap<String, Memory>,
 }
 impl MemoryBook {
+    pub fn records(&self) -> &BTreeMap<String, Memory> {
+        &self.records
+    }
+    /// Re-observe authenticated current source bytes at a later task/session.
+    /// Expired observation time alone does not erase a fact; changed source does.
+    /// This never promotes proposals, rejected records or tombstones.
+    pub fn revalidate(&mut self, namespace: &Namespace, current: &[Source]) {
+        self.revalidate_scoped(namespace, current, &[]);
+    }
+    /// Missing sources outside this task's read scope are withheld, not
+    /// globally declared stale. Retrieval still checks the current scope.
+    pub fn revalidate_scoped(
+        &mut self,
+        namespace: &Namespace,
+        current: &[Source],
+        excluded: &[String],
+    ) {
+        for record in self
+            .records
+            .values_mut()
+            .filter(|r| &r.namespace == namespace)
+        {
+            if !matches!(
+                record.status,
+                MemoryStatus::Accepted | MemoryStatus::Proposed
+            ) {
+                continue;
+            }
+            if record.sources.iter().any(|s| {
+                excluded.iter().any(|p| {
+                    s.id.eq_ignore_ascii_case(p)
+                        || s.id.to_lowercase().starts_with(&(p.to_lowercase() + "/"))
+                })
+            }) {
+                continue;
+            }
+            let refreshed: Option<Vec<_>> = record
+                .sources
+                .iter()
+                .map(|old| {
+                    current
+                        .iter()
+                        .find(|s| {
+                            &s.namespace == namespace
+                                && s.id == old.id
+                                && s.version == old.version
+                                && s.digest == old.digest
+                        })
+                        .cloned()
+                })
+                .collect();
+            if let Some(sources) = refreshed {
+                record.sources = sources;
+            } else {
+                record.status = MemoryStatus::Stale;
+            }
+        }
+    }
     pub fn propose(
         &mut self,
         id: &str,

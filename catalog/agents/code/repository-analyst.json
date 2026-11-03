@@ -49,6 +49,7 @@
     "workspace.inspect",
     "fs.list",
     "fs.read",
+    "fs.snapshot",
     "fs.search",
     "git.status",
     "git.log",

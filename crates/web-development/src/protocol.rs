@@ -70,6 +70,10 @@ pub enum Command {
     Inspect {
         page: String,
     },
+    Elements {
+        page: String,
+        selector: String,
+    },
     Fill {
         page: String,
         selector: String,
@@ -218,7 +222,7 @@ impl Command {
         Some(match self {
             Self::Start {} | Self::Close {} => return None,
             Self::Navigate { .. } => "browser.navigate",
-            Self::Inspect { .. } => "browser.inspect",
+            Self::Inspect { .. } | Self::Elements { .. } => "browser.inspect",
             Self::Screenshot { .. } => "browser.screenshot",
             Self::Api { .. } | Self::ApiConcurrent { .. } | Self::ReconcileApi { .. } => {
                 "code.tests"
@@ -333,6 +337,7 @@ impl Command {
                 return Err(Error::Invalid("invalid page handle"));
             }
             Self::Fill { page, selector, .. }
+            | Self::Elements { page, selector }
             | Self::Click { page, selector }
             | Self::Press { page, selector, .. }
             | Self::Wait { page, selector, .. }

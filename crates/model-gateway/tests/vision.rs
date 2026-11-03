@@ -1,7 +1,7 @@
 use melissa_model_gateway::{vision::*, *};
 use serde_json::json;
 fn png() -> InlinePng {
-    InlinePng::new(include_bytes!("fixtures/browser-fixture.png").to_vec()).unwrap()
+    InlinePng::new(include_bytes!("fixtures/code10-real-browser.png").to_vec()).unwrap()
 }
 fn request(messages: Vec<Message>) -> TurnRequest {
     TurnRequest {
@@ -77,7 +77,7 @@ fn external_targets_fake_dimensions_empty_images_and_resource_overflow_are_rejec
         serde_json::from_value::<InlinePng>(json!({"url":"https://outside.invalid/secret"}))
             .is_err()
     );
-    let mut bytes = include_bytes!("fixtures/browser-fixture.png").to_vec();
+    let mut bytes = include_bytes!("fixtures/code10-real-browser.png").to_vec();
     bytes[16..20].copy_from_slice(&u32::MAX.to_be_bytes());
     assert!(InlinePng::new(bytes).is_err());
     assert!(

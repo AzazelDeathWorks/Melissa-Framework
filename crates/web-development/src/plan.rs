@@ -59,6 +59,7 @@ pub struct WebPlan {
     pub(crate) snapshot: Snapshot,
     pub(crate) source: RepositorySnapshot,
     pub(crate) registration: Registration,
+    pub(crate) binary_base64: bool,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct ApiReconciliationRule {
@@ -75,6 +76,85 @@ fn source_path(s: &str) -> bool {
             .all(|p| !p.is_empty() && p != "." && p != ".." && !p.starts_with(".melissa-"))
 }
 impl WebPlan {
+    /// Trusted CLI opt-in: local Python modules and logical SQL transcripts,
+    /// inputs and logs, without a physical disposable PostgreSQL backup. The
+    /// fixed policy is bound to native admission by the snapshot digest.
+    /// Existing web sessions retain their full-cluster export behavior.
+    pub fn with_local_project_adapter(mut self) -> Result<Self> {
+        let bytes = self
+            .snapshot
+            .files
+            .get_mut(&format!("{PRIVATE}/program.json"))
+            .ok_or(Error::Invalid("web program absent"))?;
+        let mut program: serde_json::Value = serde_json::from_slice(bytes)?;
+        program["python_project_imports"] = serde_json::json!(true);
+        program["postgres_data_policy"] = serde_json::json!("ephemeral_runtime_logical_evidence");
+        *bytes = serde_json::to_vec(&program)?;
+        Ok(self)
+    }
+    /// Host-only private acceptance input. The source snapshot is unchanged;
+    /// the exact fixture bytes are included in the admitted worker input.
+    /// No model tool accepts this operation or selects this private path.
+    pub fn with_host_fixture_seed(mut self, sql: &[u8]) -> Result<Self> {
+        if self.registration.database.is_none()
+            || sql.is_empty()
+            || sql.len() > 1024 * 1024
+            || std::str::from_utf8(sql).is_err()
+        {
+            return Err(Error::Invalid("private database fixture envelope"));
+        }
+        let path = format!("{PRIVATE}/acceptance-seed.sql");
+        let bytes = self
+            .snapshot
+            .files
+            .get_mut(&format!("{PRIVATE}/program.json"))
+            .ok_or(Error::Invalid("web program absent"))?;
+        let mut program: serde_json::Value = serde_json::from_slice(bytes)?;
+        program["registration"]["seed_path"] = serde_json::json!(path);
+        program["private_fixture_digest"] = serde_json::json!(digest(sql));
+        *bytes = serde_json::to_vec(&program)?;
+        self.snapshot.files.insert(path, sql.to_vec());
+        self.snapshot
+            .validate(self.request.limits.disk_bytes)
+            .map_err(|_| Error::Invalid("private fixture snapshot bound"))?;
+        Ok(self)
+    }
+    /// Trusted host opt-in. The complete program snapshot binds this wire
+    /// choice to the native admission; model arguments cannot select it.
+    pub fn with_base64_binary_transport(mut self) -> Result<Self> {
+        self.binary_base64 = true;
+        let limit = self.binary_artifact_limit();
+        let bytes = self
+            .snapshot
+            .files
+            .get_mut(&format!("{PRIVATE}/program.json"))
+            .ok_or(Error::Invalid("web program absent"))?;
+        let mut program: serde_json::Value = serde_json::from_slice(bytes)?;
+        program["binary_encoding"] = serde_json::json!("base64-v2");
+        program["artifact_limit"] = serde_json::json!(limit);
+        *bytes = serde_json::to_vec(&program)?;
+        self.snapshot
+            .validate(self.request.limits.disk_bytes)
+            .map_err(|_| Error::Invalid("web snapshot bound"))?;
+        Ok(self)
+    }
+
+    pub(crate) fn binary_artifact_limit(&self) -> u64 {
+        let limits = &self.request.limits;
+        if self.binary_base64 {
+            limits
+                .export_bytes
+                .saturating_sub(4 * 1024 * 1024)
+                .min(limits.output_bytes.saturating_sub(8 * 1024 * 1024) / 4 * 3)
+                .min(64 * 1024 * 1024)
+        } else {
+            limits
+                .export_bytes
+                .min(limits.output_bytes / 3)
+                .min(64 * 1024 * 1024)
+        }
+    }
+
     pub fn with_api_reconciliation(mut self, rules: Vec<ApiReconciliationRule>) -> Result<Self> {
         if rules.len() > 16
             || rules.iter().any(|r| {
@@ -237,6 +317,7 @@ impl WebPlan {
             snapshot,
             source: source.clone(),
             registration,
+            binary_base64: false,
         })
     }
     pub fn request(&self) -> &ContainerRequest {

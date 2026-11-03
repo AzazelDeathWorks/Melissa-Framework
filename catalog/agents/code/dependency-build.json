@@ -49,8 +49,10 @@
   "tool_ids": [
     "environment.inspect",
     "fs.read",
+    "fs.snapshot",
     "fs.search",
     "fs.hash",
+    "code.patch_propose",
     "fs.patch",
     "code.dependencies",
     "code.build",
@@ -68,6 +70,7 @@
   "authority": {
     "capability_ceiling": [
       "workspace.read",
+      "workspace.propose_patch",
       "workspace.apply_patch_scoped",
       "process.execute_scoped",
       "network.package_sources_scoped",

@@ -120,7 +120,7 @@ fn fixture_with_controls(script: &str, controls: bool) -> Fixture {
     };
     let broker = ContainerBroker::new(
         store,
-        Catalog::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap(),
+        Catalog::load_definitions(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap(),
         RESOURCE.into(),
         policy,
     )

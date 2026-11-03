@@ -17,6 +17,45 @@ fn root() -> (tempfile::TempDir, Repository) {
     (t, Repository::open(&p, Limits::default(), vec![]).unwrap())
 }
 #[test]
+fn reopened_repository_preserves_exclusions_limits_and_package_capture() {
+    let (temp, r) = root();
+    let scoped = Repository::open(
+        r.root_path(),
+        Limits {
+            max_search_hits: 2,
+            ..Limits::default()
+        },
+        vec!["crate-b".into()],
+    )
+    .unwrap();
+    let again = scoped.reopen().unwrap();
+    let cancel = AtomicBool::new(false);
+    assert_eq!(
+        scoped.snapshot(&cancel).unwrap(),
+        again.snapshot(&cancel).unwrap()
+    );
+    assert_eq!(again.limits().max_search_hits, 2);
+    let p = temp.path().join("package");
+    fs::create_dir(&p).unwrap();
+    fs::create_dir(p.join("target")).unwrap();
+    fs::write(p.join("target").join("result.txt"), b"distribution").unwrap();
+    let package = Repository::open_for_package(&p, Limits::default()).unwrap();
+    assert_eq!(
+        package.snapshot(&cancel).unwrap(),
+        package.reopen().unwrap().snapshot(&cancel).unwrap()
+    );
+    assert_eq!(
+        package
+            .reopen()
+            .unwrap()
+            .snapshot(&cancel)
+            .unwrap()
+            .files
+            .len(),
+        1
+    );
+}
+#[test]
 fn monorepo_snapshot_search_hashes_and_stale_additions_are_explicit() {
     let (_t, r) = root();
     let c = AtomicBool::new(false);

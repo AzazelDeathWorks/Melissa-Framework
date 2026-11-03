@@ -190,6 +190,22 @@ pub struct MemoryAnchor {
     pub resource_id: String,
 }
 impl ContextRuntime {
+    /// Trusted host bridge to a project-scoped encrypted store. Model tools
+    /// cannot import a book, accept a proposal, or choose its namespace.
+    pub fn replace_memory_book(&mut self, book: MemoryBook) -> Result<()> {
+        require(
+            book.records()
+                .values()
+                .all(|r| r.namespace == self.grant.namespace),
+            "foreign project memory book",
+        )?;
+        self.state.memory = book;
+        self.imported.clear();
+        Ok(())
+    }
+    pub fn memory_book(&self) -> MemoryBook {
+        self.state.memory.clone()
+    }
     pub fn open(
         repo: Arc<Repository>,
         store: LocalStore,
@@ -450,6 +466,14 @@ impl ContextRuntime {
         self.repo
             .validate_snapshot(&snapshot, &cancel)
             .map_err(map_repo)?;
+        self.state.memory.revalidate_scoped(
+            &self.grant.namespace,
+            &result,
+            &snapshot.excluded_prefixes,
+        );
+        for book in &mut self.imported {
+            book.revalidate_scoped(&self.grant.namespace, &result, &snapshot.excluded_prefixes);
+        }
         Ok((snapshot.digest, result))
     }
     fn cache_key(

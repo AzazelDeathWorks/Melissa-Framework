@@ -4,6 +4,27 @@ Rust tabanlı, geliştirme aşamasındaki ajan ve araç orkestrasyonu çatısı.
 
 Genel ajan/worker tanımları, skill paketleri, tipli sözleşmeler, kalıcılık, izin denetimi, araç bağlantıları, iş akışı ve hata toparlama kodları bulunur. Katalogdaki tanımlar, bütün ajanların aynı anda çalıştığı anlamına gelmez.
 
+## CLI — 0.3.0
+
+Aktif ürün kapsamı 6 Core ve 12 Code profilidir. Diğer alanların genel tanımları
+korunur; derlenen CLI'ya dahil edilmez. Masaüstü arayüzü bu kapsamda yoktur.
+
+- Proje bazlı şifreli bellek, kaynak yeniliği denetimi ve kullanıcı onaylı kayıtlar.
+- Skill paketleri, bağlam araçları ve izole yardımcı script çalıştırma.
+- Gerçek dil sunucusu sorguları ve dosya değişikliğinden sonra erken kontroller.
+- Kaynak envanterine dayalı, incelenebilir doğal dil görev taslakları.
+- Build/test/lint, sahip olunan hata ayıklama oturumu ve izole Git işlemleri.
+- Kalıcı oturum geçmişi, devam etme ve kalan adımları yeniden planlama.
+
+Desteklenen diller, çalışma sınırları ve komutlar:
+[CLI kullanım rehberi](docs/CLI_CAPABILITIES_TR.md).
+Görev taslağı yerel kurallarla hazırlanır ve kabul tarifi kullanıcı incelemesi
+gerektirir. Yeni bağlantılar için yerel testler çalıştırılmıştır; canlı model
+başarısı veya tamamlanmış üretim sürümü iddiası yoktur.
+
+Kendi bağlantı ayarlarınızı [örnek yapılandırmadan](examples/cli/settings.template.json)
+hazırlayın; anahtarınızı ortam değişkeninde veya proje dışındaki özel dosyada tutun.
+
 ## Geliştirme
 
 Rust ve Cargo gerekir. İşletim sistemi ve izole çalışma ortamına bağlı testlerin ek gereksinimleri vardır. Başlangıç kontrolleri:
@@ -13,6 +34,7 @@ cargo fmt --all -- --check
 cargo check --locked --workspace --all-targets
 cargo test --locked -p melissa-core-contracts -p melissa-local-store
 cargo test --locked -p melissa-model-gateway --test reviewed_origin_policy
+cargo test --locked -p melissa-cli
 ```
 
 Katalogdaki backlog verileri şema ve sözleşme testleri için sentetik örneklerdir; proje görev listesi veya ilerleme raporu değildir.

@@ -1,0 +1,18 @@
+{
+  "schema_version": "melissa.cli-recipe/v1",
+  "agents": [
+    {"profile": "melissa.code.implementer", "goal": "Implement the operator-requested triangular-number program using scoped tools, preserve user files, run available tests, submit the actual source digest and final JSON.", "write": true},
+    {"profile": "melissa.code.reviewer", "goal": "Independently inspect the candidate and actual source with read-only tools, submit the actual digest and final JSON. Do not claim task acceptance.", "write": false}
+  ],
+  "writable_paths": ["main.py"],
+  "protected_paths": ["user-notes.txt"],
+  "language": "python",
+  "entry": "main.py",
+  "negative_workspace": "C:/REPLACE_WITH_PRIVATE_NEGATIVE_PROJECT",
+  "checks": [
+    {"id": "zero", "input": 0, "expected": 0},
+    {"id": "seven", "input": 7, "expected": 28}
+  ],
+  "max_cost_micro_usd": 5000000,
+  "wall_time_ms": 1800000
+}

@@ -288,7 +288,13 @@
       "owner_module": "code",
       "family": "code",
       "referenced_by": [
-        "melissa.code.implementer"
+        "melissa.code.backend",
+        "melissa.code.database",
+        "melissa.code.debugger",
+        "melissa.code.dependency-build",
+        "melissa.code.frontend",
+        "melissa.code.implementer",
+        "melissa.code.test-engineer"
       ],
       "worker_candidates": [
         "generic"
@@ -1672,7 +1678,18 @@
       "owner_module": "core",
       "family": "fs",
       "referenced_by": [
-        "melissa.code.implementer"
+        "melissa.code.architect",
+        "melissa.code.backend",
+        "melissa.code.database",
+        "melissa.code.debugger",
+        "melissa.code.dependency-build",
+        "melissa.code.frontend",
+        "melissa.code.implementer",
+        "melissa.code.release-engineer",
+        "melissa.code.repository-analyst",
+        "melissa.code.reviewer",
+        "melissa.code.security-reviewer",
+        "melissa.code.test-engineer"
       ],
       "worker_candidates": [
         "generic"

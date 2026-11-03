@@ -1,0 +1,15 @@
+{
+  "schema_version": "melissa.upstream-license/v1",
+  "name": "jsonschema-value",
+  "version": "0.58.3",
+  "crate_checksum": "43519639b8e32075ef90a9b6b19136e516a3236b7943c3fe6b1622dafdced8ea",
+  "repository": "https://github.com/Stranger6667/jsonschema",
+  "revision": "a171a01f52f20142bc4f1cfb07c6e56e195e8da6",
+  "files": [
+    {
+      "path": "third_party/licenses/jsonschema-value/0.58.3/LICENSE.upstream",
+      "url": "https://raw.githubusercontent.com/Stranger6667/jsonschema/a171a01f52f20142bc4f1cfb07c6e56e195e8da6/LICENSE",
+      "sha256": "117829c3ca21efb132d81a44b55363d395ab8eea18526873bc828da4c0e5f038"
+    }
+  ]
+}

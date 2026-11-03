@@ -10,7 +10,7 @@ use melissa_skill_context::{
 
 fn context(store: LocalStore, repo: Arc<Repository>, profile: &str) -> ContextDispatcher {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let catalog = Catalog::load(&root).unwrap();
+    let catalog = Catalog::load_definitions(&root).unwrap();
     let p = &catalog.profiles[profile];
     let workspace = store.journal().task(TASK).unwrap().contract.workspace_ref;
     let policy = SkillPolicy {

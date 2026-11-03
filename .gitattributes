@@ -6,6 +6,11 @@
 *.md text eol=lf
 *.yml text eol=lf
 *.ps1 text eol=lf
+*.cjs text eol=lf
+*.sql text eol=lf
+*.html text eol=lf
+Dockerfile* text eol=lf
 *.png binary
 Cargo.lock text eol=lf
 skills/** -text
+*.upstream -text

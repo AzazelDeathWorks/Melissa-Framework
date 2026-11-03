@@ -96,6 +96,7 @@ pub struct Repository {
     pub(crate) root: Pinned,
     pub(crate) limits: Limits,
     excluded: Vec<String>,
+    package_capture: bool,
 }
 impl Repository {
     /// Host-selected workspace. Does not run Git, build scripts, hooks or tools.
@@ -115,10 +116,25 @@ impl Repository {
             root: paths::pin(root, true, false)?,
             limits,
             excluded,
+            package_capture: false,
         })
     }
     pub fn root_path(&self) -> &Path {
         &self.root.canonical
+    }
+    /// Independent handle with the exact same source visibility and envelope.
+    /// A domain worker must not accidentally re-include operator exclusions.
+    pub fn reopen(&self) -> Result<Self> {
+        let root = paths::pin(&self.root.canonical, true, false)?;
+        if root.identity != self.root.identity {
+            return Err(Error::Stale("repository root identity changed"));
+        }
+        Ok(Self {
+            root,
+            limits: self.limits.clone(),
+            excluded: self.excluded.clone(),
+            package_capture: self.package_capture,
+        })
     }
     /// Exact bounded worktree capture for Git: no generated/ignored exclusions.
     /// A repository that exceeds the selected envelope fails instead of
@@ -129,6 +145,19 @@ impl Repository {
             root: paths::pin(root, true, false)?,
             limits,
             excluded: vec![".git".into()],
+            package_capture: false,
+        })
+    }
+    /// Complete package file capture: generated/runtime directories are part
+    /// of the artifact. Git metadata is rejected instead of silently omitted.
+    /// Existing source/Git capture policies retain their original behavior.
+    pub fn open_for_package(root: &Path, limits: Limits) -> Result<Self> {
+        limits.validate()?;
+        Ok(Self {
+            root: paths::pin(root, true, false)?,
+            limits,
+            excluded: vec![],
+            package_capture: true,
         })
     }
     pub fn root_identity(&self) -> &str {
@@ -237,9 +266,13 @@ impl Repository {
                 format!("{relative}/{name}")
             };
             paths::relative(&child)?;
-            if self.excluded.iter().any(|p| paths::beneath(&child, p))
-                || child.split('/').any(|s| s.eq_ignore_ascii_case(".git"))
-            {
+            if child.split('/').any(|s| s.eq_ignore_ascii_case(".git")) {
+                if self.package_capture {
+                    return Err(Error::Denied("package contains Git metadata"));
+                }
+                continue;
+            }
+            if self.excluded.iter().any(|p| paths::beneath(&child, p)) {
                 continue;
             }
             if !seen.insert(paths::key(&child)) {

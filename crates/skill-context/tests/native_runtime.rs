@@ -250,7 +250,7 @@ fn gateway(store: LocalStore, http: &HttpFixture, policy: GatewayPolicy) -> Gate
     Gateway::new(
         store,
         extend_catalog(
-            &Catalog::load(&root()).unwrap(),
+            &Catalog::load_definitions(&root()).unwrap(),
             &BTreeSet::from([PROFILE.into()]),
         )
         .unwrap(),
@@ -399,7 +399,7 @@ fn setup_runtime(
     pin: melissa_core_contracts::design::SkillPin,
 ) -> ContextRuntime {
     let registry = load_packages(&root(), std::slice::from_ref(&pin)).unwrap();
-    let base = Catalog::load(&root()).unwrap();
+    let base = Catalog::load_definitions(&root()).unwrap();
     let catalog = extend_catalog(&base, &BTreeSet::from([PROFILE.into()])).unwrap();
     let profile = &catalog.profiles[PROFILE];
     let policy = SkillPolicy {
@@ -582,7 +582,7 @@ fn all_ten_current_versions_load_under_actual_owner_tools_and_caps_without_expan
     let pins = current();
     assert_eq!(pins.len(), 10);
     let registry = load_packages(&root(), &pins).unwrap();
-    let catalog = Catalog::load(&root()).unwrap();
+    let catalog = Catalog::load_definitions(&root()).unwrap();
     for profile in catalog
         .profiles
         .values()
@@ -1076,7 +1076,7 @@ async fn full_skill_assembly_reaches_native_request_without_eval_answers_and_bin
     let mut s = store(&dir.path().join("store"), 10000000);
     let pin = skill("debug-root-cause");
     let registry = load_packages(&root(), std::slice::from_ref(&pin)).unwrap();
-    let catalog = Catalog::load(&root()).unwrap();
+    let catalog = Catalog::load_definitions(&root()).unwrap();
     let p = &catalog.profiles[PROFILE];
     let policy = SkillPolicy {
         epoch: "assembly".into(),
@@ -1458,7 +1458,7 @@ fn helper_interpreter_and_descriptor_caps_are_checked_before_any_worker_or_model
         let mut reg = melissa_skill_context::package::Registry::default();
         reg.insert(p).unwrap();
         let catalog = extend_catalog(
-            &Catalog::load(&root()).unwrap(),
+            &Catalog::load_definitions(&root()).unwrap(),
             &BTreeSet::from([PROFILE.into()]),
         )
         .unwrap();

@@ -20,6 +20,33 @@ fn no_external_target_or_forged_protocol() {
     }
 }
 #[test]
+fn bounded_element_reads_are_native_browser_inspection_without_arbitrary_javascript() {
+    let op = Command::Elements {
+        page: "owned".into(),
+        selector: "#results article:visible".into(),
+    };
+    op.validate().unwrap();
+    assert_eq!(op.canonical(), Some("browser.inspect"));
+    assert_eq!(op.service(), Some(Service::Browser));
+    assert!(
+        Command::Elements {
+            page: "owned".into(),
+            selector: "x".repeat(4097)
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        Command::Elements {
+            page: "owned".into(),
+            selector: "\0".into()
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(serde_json::from_value::<Command>(json!({"command":"elements","page":"owned","selector":"h1","javascript":"document.cookie"})).is_err());
+}
+#[test]
 fn bounded_http_and_sql_fields() {
     let mut r = ApiRequest {
         session: "a".into(),

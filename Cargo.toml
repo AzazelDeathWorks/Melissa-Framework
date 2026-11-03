@@ -1,10 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/core-contracts", "crates/local-store", "crates/windows-executor", "crates/execution-broker", "crates/container-executor", "crates/model-gateway", "crates/repository", "crates/build-test", "crates/skill-context", "crates/workflow", "crates/recovery", "crates/web-development"]
+members = ["crates/core-contracts", "crates/local-store", "crates/windows-executor", "crates/execution-broker", "crates/container-executor", "crates/model-gateway", "crates/repository", "crates/build-test", "crates/skill-context", "crates/workflow", "crates/recovery", "crates/web-development", "crates/code-quality", "crates/cli"]
 
 [workspace.package]
 edition = "2024"
 publish = false
+license = "MIT"
 
 [workspace.dependencies]
 serde = { version = "=1.0.229", features = ["derive"] }
@@ -17,7 +18,7 @@ zeroize = "=1.9.0"
 tempfile = "=3.27.0"
 windows-sys = "=0.61.2"
 reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls", "stream", "json"] }
-tokio = { version = "=1.53.2", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
+tokio = { version = "=1.53.3", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
 futures-util = "=0.3.34"
 url = "=2.5.8"
 jsonschema = { version = "=0.58.3", default-features = false }

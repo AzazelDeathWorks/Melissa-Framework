@@ -89,6 +89,121 @@ fn mutation(d: &RepositoryDispatcher, m: FileMutation) -> Value {
         mutation: m
     })
 }
+
+#[tokio::test]
+async fn explicit_json_patch_transport_keeps_exact_preimages_crlf_scope_and_native_mode() {
+    let (temp, d, peer) = fixture();
+    let mut d = d.with_portable_patch_wire().unwrap();
+    let native = {
+        let h = d.host.lock().unwrap();
+        json!(PatchProposal {
+            schema_version: "melissa.repository-patch/v1".into(),
+            root_identity: h.repo.root_identity().into(),
+            files: vec![FilePatch {
+                before: h.repo.read("lib.rs").unwrap().0,
+                edits: vec![ByteEdit {
+                    start: 7,
+                    end: 15,
+                    expected: b"original".to_vec(),
+                    replacement: b"updated".to_vec()
+                }]
+            }]
+        })
+    };
+    let outer = json!({"proposal_json":native.to_string()});
+    assert!(d.validate_call(&call("fs_patch", native.clone())).is_err());
+    let mut wrong = native.clone();
+    wrong["files"] = json!(wrong["files"].to_string());
+    assert!(
+        d.validate_call(&call(
+            "fs_patch",
+            json!({"proposal_json":wrong.to_string()})
+        ))
+        .is_err()
+    );
+    assert!(
+        d.validate_call(&call(
+            "fs_patch",
+            json!({"proposal_json":native.to_string(),"extra":true})
+        ))
+        .is_err()
+    );
+    assert!(
+        d.validate_call(&call(
+            "fs_patch",
+            json!({"proposal_json":"{\"files\":[],\"files\":[]}"})
+        ))
+        .is_err()
+    );
+    let protected = {
+        let h = d.host.lock().unwrap();
+        json!(PatchProposal {
+            schema_version: "melissa.repository-patch/v1".into(),
+            root_identity: h.repo.root_identity().into(),
+            files: vec![FilePatch {
+                before: h.repo.read("dirty.txt").unwrap().0,
+                edits: vec![ByteEdit {
+                    start: 0,
+                    end: 1,
+                    expected: vec![b'p'],
+                    replacement: vec![b'x']
+                }]
+            }]
+        })
+    };
+    let denied = d
+        .execute(
+            call("fs_patch", json!({"proposal_json":protected.to_string()})),
+            context("protected-portable"),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(denied.kind, ErrorKind::Authorization);
+    assert!(
+        invoke(&mut d, "fs_patch", outer.clone(), "portable-exact")
+            .await
+            .success
+    );
+    assert_eq!(
+        fs::read(temp.path().join("repo/lib.rs")).unwrap(),
+        b"pub fn updated() {}\r\n"
+    );
+    assert_eq!(
+        fs::read(temp.path().join("repo/dirty.txt")).unwrap(),
+        b"preserve dirty\0\xff"
+    );
+    let stored = peer
+        .get_artifact("task:repository-tools", "inv:portable-exact:tool-binding")
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&stored).unwrap()["arguments_digest"],
+        digest(outer.to_string().as_bytes())
+    );
+    assert!(
+        d.execute(
+            call("fs_patch", outer),
+            context("portable-stale"),
+            Arc::new(AtomicBool::new(false))
+        )
+        .await
+        .is_err()
+    );
+    let (_temp, native_dispatcher, _peer) = fixture();
+    assert!(
+        native_dispatcher
+            .validate_call(&call(
+                "fs_patch",
+                json!({"proposal_json":native.to_string()})
+            ))
+            .is_err()
+    );
+    assert!(
+        native_dispatcher
+            .validate_call(&call("fs_patch", native))
+            .is_ok()
+    );
+}
 async fn invoke(d: &mut dyn ToolDispatcher, name: &str, args: Value, tag: &str) -> ToolExecution {
     let c = call(name, args);
     d.validate_call(&c).unwrap();
@@ -216,7 +331,7 @@ async fn repository_read_search_and_rust_ast_bindings_return_source_evidence() {
 #[test]
 fn every_repository_function_schema_is_valid_and_maps_to_existing_catalog_capability() {
     let (_t, d, _p) = fixture();
-    let catalog = melissa_core_contracts::catalog::Catalog::load(
+    let catalog = melissa_core_contracts::catalog::Catalog::load_definitions(
         &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."),
     )
     .unwrap();

@@ -1,0 +1,29 @@
+[package]
+name = "melissa-code-quality"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "MIT"
+
+[dependencies]
+melissa-core-contracts = { path = "../core-contracts" }
+melissa-repository = { path = "../repository" }
+melissa-local-store = { path = "../local-store" }
+melissa-model-gateway = { path = "../model-gateway" }
+melissa-execution-broker = { path = "../execution-broker" }
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
+melissa-container-executor = { path = "../container-executor" }
+getrandom.workspace = true
+regex = "=1.13.1"
+sha2 = "=0.10.9"
+toml = "=1.1.8"
+spdx = "=0.13.6"
+time = { version = "=0.3.55", features = ["parsing"] }
+windows-sys = { workspace = true, features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
+
+[dev-dependencies]
+tempfile.workspace = true

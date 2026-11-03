@@ -2,7 +2,7 @@
 use crate::{
     Error, Result, identifier,
     plan::{Registration, WebPlan},
-    protocol::{Command, Service},
+    protocol::{ApiRequest, Command, Service},
     session::{Policy, WebSession},
 };
 use melissa_container_executor::ContainerLimits;
@@ -57,10 +57,10 @@ impl Revocation {
 }
 fn err(e: Error) -> GatewayError {
     GatewayError::new(
-        if matches!(e, Error::AfterDispatch(_)) {
-            ErrorKind::Tool
-        } else {
-            ErrorKind::Authorization
+        match &e {
+            Error::Arguments(_) => ErrorKind::Invalid,
+            Error::AfterDispatch(_) => ErrorKind::Tool,
+            _ => ErrorKind::Authorization,
         },
         e.to_string(),
     )
@@ -73,6 +73,29 @@ fn canonical(reg: &Registration) -> &'static str {
     } else {
         "data.profile"
     }
+}
+fn canonicalize_portable_headers(request: &mut ApiRequest) -> Result {
+    let mut headers = std::collections::BTreeMap::new();
+    for (name, value) in std::mem::take(&mut request.headers) {
+        let lower = name.to_ascii_lowercase();
+        let name = if [
+            "content-type",
+            "authorization",
+            "idempotency-key",
+            "x-test-tenant",
+        ]
+        .contains(&lower.as_str())
+        {
+            lower
+        } else {
+            name
+        };
+        if headers.insert(name, value).is_some() {
+            return Err(Error::Invalid("duplicate local API header name"));
+        }
+    }
+    request.headers = headers;
+    Ok(())
 }
 impl Host {
     fn uncertain(&mut self, message: &str) -> ToolExecution {
@@ -98,25 +121,44 @@ impl Host {
             return Err(Error::Invalid("unregistered web tool or revoked host"));
         }
         let mut value = melissa_model_gateway::strict_json(&call.arguments)
-            .map_err(|_| Error::Invalid("strict web arguments JSON"))?;
+            .map_err(|e| Error::Arguments(format!("strict web arguments JSON: {e}")))?;
         if self.portable_wire {
-            let fields = value
-                .as_object_mut()
-                .ok_or(Error::Invalid("portable web object"))?;
+            let fields = value.as_object_mut().ok_or_else(|| {
+                Error::Arguments("portable web arguments must be an object".into())
+            })?;
             let raw = fields
                 .remove("operation_json")
                 .and_then(|v| v.as_str().map(String::from))
-                .ok_or(Error::Invalid("portable operation JSON absent"))?;
+                .ok_or_else(|| {
+                    Error::Arguments(
+                        "operation_json must be a JSON string containing only the command object"
+                            .into(),
+                    )
+                })?;
             if fields.len() != 1 || !fields.contains_key("session_id") {
-                return Err(Error::Invalid("portable web fields"));
+                return Err(Error::Arguments(
+                    "portable outer fields must be exactly session_id and operation_json".into(),
+                ));
             }
             fields.insert(
                 "operation".into(),
                 melissa_model_gateway::strict_json(&raw)
-                    .map_err(|_| Error::Invalid("strict typed operation JSON"))?,
+                    .map_err(|e| Error::Arguments(format!("invalid operation_json: {e}; encode the command object once, e.g. {{\"command\":\"start\"}}")))?,
             );
         }
-        let parsed: Call = serde_json::from_value(value)?;
+        let mut parsed: Call = serde_json::from_value(value)
+            .map_err(|e| Error::Arguments(format!("invalid typed web arguments: {e}; operation_json contains only the command object; session_id belongs in the outer arguments")))?;
+        if self.portable_wire {
+            match &mut parsed.operation {
+                Command::Api { request } => canonicalize_portable_headers(request)?,
+                Command::ApiConcurrent { requests } => {
+                    for request in requests {
+                        canonicalize_portable_headers(request)?;
+                    }
+                }
+                _ => {}
+            }
+        }
         parsed.operation.validate()?;
         match &self.session {
             None if parsed.session_id.is_none()
@@ -245,6 +287,15 @@ impl Host {
     }
 }
 impl WebDispatcher {
+    /// Settle this host's owned session when a model run stops. This never
+    /// replays an application command and preserves genuine unknown effects.
+    pub fn finish_owned(&self) -> Result<Option<crate::session::Outcome>> {
+        let mut host = self
+            .host
+            .lock()
+            .map_err(|_| Error::Invalid("web host lock"))?;
+        host.session.take().map(WebSession::finish).transpose()
+    }
     pub fn with_portable_model_wire(self) -> Result<Self> {
         self.host
             .lock()
@@ -348,6 +399,7 @@ pub fn tool_schema() -> Value {
         variant("close", json!({})),
         variant("navigate", json!({"page":string,"path":string})),
         variant("inspect", json!({"page":string})),
+        variant("elements", json!({"page":string,"selector":string})),
         variant("screenshot", json!({"page":string})),
         variant(
             "fill",
@@ -406,7 +458,13 @@ impl ToolDispatcher for WebDispatcher {
                     h.registration.migrations.keys().collect::<Vec<_>>(),
                     if h.portable_wire {
                         format!(
-                            "operation_json must be one JSON object matching the operation field of this COMPLETE schema: {}",
+                            "operation_json contains ONLY the operation command object, serialized once as a JSON string. Start example: {}. Keep session_id in the outer arguments; do not nest operation/session_id inside operation_json or manually double-escape it. {}COMPLETE schema: {}",
+                            json!({"command":"start"}),
+                            if h.registration.services.contains(&Service::Api) {
+                                "API request.session is a COOKIE-JAR LABEL, e.g. alice or client1, NOT the outer opaque web session_id. It must start with an ASCII letter, use only letters/digits/_/-, and be at most48 bytes. Reuse that label for cookies; use different labels for isolated clients. API header names content-type, authorization, idempotency-key and x-test-tenant are ASCII case-insensitive; values are preserved exactly. Duplicate names after case folding, forbidden headers and control characters are denied before send. "
+                            } else {
+                                ""
+                            },
                             tool_schema()
                         )
                     } else {

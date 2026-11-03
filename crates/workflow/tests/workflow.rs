@@ -20,7 +20,7 @@ impl ToolDispatcher for NoTools {
 }
 
 fn catalog() -> Catalog {
-    Catalog::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap()
+    Catalog::load_definitions(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap()
 }
 fn node(id: &str) -> Node {
     Node {

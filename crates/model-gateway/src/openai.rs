@@ -9,10 +9,34 @@ use crate::{
     StopReason, ToolCall, TurnRequest, Usage,
 };
 
+/// Host-selected Responses image encoding. Image bytes remain unchanged.
+/// Providers that accept only auto/low/high require an explicit High selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ImageDetail {
+    #[default]
+    Original,
+    High,
+}
+impl ImageDetail {
+    pub(crate) fn wire_value(self) -> &'static str {
+        match self {
+            Self::Original => "original",
+            Self::High => "high",
+        }
+    }
+}
+
 pub fn build_request(request: &TurnRequest) -> Result<Value> {
     build_request_with_limits(request, RequestLimits::default())
 }
 pub fn build_request_with_limits(request: &TurnRequest, limits: RequestLimits) -> Result<Value> {
+    build_request_with_image_detail(request, limits, ImageDetail::Original)
+}
+pub(crate) fn build_request_with_image_detail(
+    request: &TurnRequest,
+    limits: RequestLimits,
+    image_detail: ImageDetail,
+) -> Result<Value> {
     request.validate_with_limits(limits)?;
     if request.model.trim().is_empty() || request.max_output_tokens == 0 {
         return Err(GatewayError::invalid(
@@ -47,7 +71,7 @@ pub fn build_request_with_limits(request: &TurnRequest, limits: RequestLimits) -
                 }
                 let mut parts = vec![json!({"type":"input_text","text":text})];
                 parts.extend(images.iter().map(
-                    |i| json!({"type":"input_image","image_url":i.data_url(),"detail":"original"}),
+                    |i| json!({"type":"input_image","image_url":i.data_url(),"detail":image_detail.wire_value()}),
                 ));
                 input.push(json!({"role":"user","content":parts}));
             }
@@ -64,7 +88,7 @@ pub fn build_request_with_limits(request: &TurnRequest, limits: RequestLimits) -
                     json!({"type":"input_text","text":if *is_error {json!({"is_error":true,"content":content}).to_string()} else {content.clone()}}),
                 ];
                 parts.extend(images.iter().map(
-                    |i| json!({"type":"input_image","image_url":i.data_url(),"detail":"original"}),
+                    |i| json!({"type":"input_image","image_url":i.data_url(),"detail":image_detail.wire_value()}),
                 ));
                 input.push(json!({"type":"function_call_output","call_id":call_id,"output":parts}));
             }

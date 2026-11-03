@@ -26,6 +26,8 @@ jobs:
         run: cargo +1.98.0 test --locked -p melissa-core-contracts -p melissa-local-store
       - name: Origin policy tests
         run: cargo +1.98.0 test --locked -p melissa-model-gateway --test reviewed_origin_policy
+      - name: Local CLI contracts
+        run: cargo +1.98.0 test --locked -p melissa-cli
   secrets:
     runs-on: ubuntu-latest
     steps:

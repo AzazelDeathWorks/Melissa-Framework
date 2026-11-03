@@ -1,0 +1,6 @@
+{
+  "schema_version": "melissa.product-scope/v1",
+  "active_modules": ["core", "code"],
+  "deferred_modules": ["cyber", "game", "science", "fit", "repack", "grid"],
+  "decision": "Code-first CLI. Preserve deferred definitions for a future explicit scope change; exclude them from the compiled product."
+}

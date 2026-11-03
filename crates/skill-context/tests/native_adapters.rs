@@ -255,7 +255,7 @@ fn gateway(store: LocalStore, http: &HttpFixture, policy: GatewayPolicy) -> Gate
     Gateway::new(
         store,
         extend_catalog(
-            &Catalog::load(&root()).unwrap(),
+            &Catalog::load_definitions(&root()).unwrap(),
             &BTreeSet::from([PROFILE.into()]),
         )
         .unwrap(),
@@ -404,7 +404,7 @@ fn setup_runtime(
     pin: melissa_core_contracts::design::SkillPin,
 ) -> ContextRuntime {
     let registry = load_packages(&root(), std::slice::from_ref(&pin)).unwrap();
-    let base = Catalog::load(&root()).unwrap();
+    let base = Catalog::load_definitions(&root()).unwrap();
     let catalog = extend_catalog(&base, &BTreeSet::from([PROFILE.into()])).unwrap();
     let profile = &catalog.profiles[PROFILE];
     let policy = SkillPolicy {
@@ -587,7 +587,7 @@ async fn native_scripts_use_real_sdk_symbols_references_tests_and_cache_revalida
     std::fs::write(dir.path().join("repo/tests/__init__.py"), b"").unwrap();
     let s = store(&dir.path().join("store"), 10000000);
     let catalog = extend_catalog(
-        &Catalog::load(&root()).unwrap(),
+        &Catalog::load_definitions(&root()).unwrap(),
         &BTreeSet::from([PROFILE.into()]),
     )
     .unwrap();

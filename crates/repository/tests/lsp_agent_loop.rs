@@ -244,7 +244,7 @@ fn policy() -> GatewayPolicy {
 fn gateway(store: LocalStore, http: &HttpFixture, policy: GatewayPolicy) -> Gateway {
     Gateway::new(
         store,
-        Catalog::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap(),
+        Catalog::load_definitions(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap(),
         vec![ModelRegistration {
             registration_id: "fixture-route".into(),
             endpoint: ProviderEndpoint::new(
@@ -349,7 +349,7 @@ async fn real_lsp_gateway_sse_worker_result_reaches_the_next_model_request() {
     let mut tools = RepositoryReadDispatcher::new(
         repo,
         g.store().connect().unwrap(),
-        Catalog::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap(),
+        Catalog::load_definitions(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap(),
         RepositoryReadPolicy {
             task_id: TASK.into(),
             profile_id: PROFILE.into(),

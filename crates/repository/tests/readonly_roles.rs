@@ -24,7 +24,7 @@ use std::{
     },
 };
 fn catalog() -> Catalog {
-    Catalog::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap()
+    Catalog::load_definitions(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap()
 }
 fn fixture(operation: RepositoryRead) -> (tempfile::TempDir, RepositoryReadDispatcher, LocalStore) {
     let d = tempfile::tempdir().unwrap();

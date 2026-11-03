@@ -162,7 +162,7 @@ fn run(plan: &GitPlan) -> ContainerReport {
     let project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut broker = ContainerBroker::new(
         store,
-        Catalog::load(&project).unwrap(),
+        Catalog::load_definitions(&project).unwrap(),
         task.workspace_ref.clone(),
         policy,
     )

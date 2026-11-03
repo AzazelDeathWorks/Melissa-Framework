@@ -129,7 +129,7 @@ pub fn container(
     };
     let b = ContainerBroker::new(
         store,
-        Catalog::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap(),
+        Catalog::load_definitions(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap(),
         t.workspace_ref.clone(),
         policy,
     )

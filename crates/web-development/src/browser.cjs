@@ -66,6 +66,18 @@ async function main(op) {
     }
     case 'inspect':
       result={url:p.url(),title:await p.title(),aria:await p.locator('body').ariaSnapshot(),dom:await p.locator('body').innerHTML(),layout:await p.evaluate(()=>({width:innerWidth,height:innerHeight,scrollWidth:document.documentElement.scrollWidth,focus:document.activeElement?.getAttribute('id')}))};break;
+    case 'elements': {
+      const locator=p.locator(op.selector),count=await locator.count();
+      if(count>128)throw Error('element observation count envelope exceeded');
+      const elements=[];
+      for(let i=0;i<count;i++) {
+        const node=locator.nth(i);
+        const observed=await node.evaluate(e=>({tag:e.tagName.toLowerCase(),text:e.textContent??'',value:typeof e.value==='string'?e.value:null}));
+        if(observed.text.length>8192||(observed.value?.length??0)>8192)throw Error('element observation text envelope exceeded');
+        elements.push({...observed,normalized_text:observed.text.trim(),visible:await node.isVisible()});
+      }
+      result={count,elements};break;
+    }
     case 'fill':await p.locator(op.selector).fill(op.value);break;
     case 'click':await p.locator(op.selector).click();break;
     case 'press':await p.locator(op.selector).press(op.key);break;

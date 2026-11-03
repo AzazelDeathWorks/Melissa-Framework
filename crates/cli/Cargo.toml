@@ -1,0 +1,36 @@
+[package]
+name = "melissa-cli"
+version = "0.3.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "melissa"
+path = "src/main.rs"
+
+[dependencies]
+melissa-core-contracts = { path = "../core-contracts" }
+melissa-local-store = { path = "../local-store" }
+melissa-repository = { path = "../repository" }
+melissa-code-quality = { path = "../code-quality" }
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+getrandom.workspace = true
+melissa-model-gateway = { path = "../model-gateway" }
+melissa-workflow = { path = "../workflow" }
+melissa-recovery = { path = "../recovery" }
+melissa-skill-context = { path = "../skill-context" }
+melissa-build-test = { path = "../build-test" }
+melissa-container-executor = { path = "../container-executor" }
+melissa-web-development = { path = "../web-development" }
+melissa-execution-broker = { path = "../execution-broker" }
+tokio.workspace = true
+zeroize.workspace = true
+url.workspace = true
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading"] }
+tempfile.workspace = true
+
+[build-dependencies]
+serde_json.workspace = true

@@ -12,7 +12,10 @@ fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 fn catalog() -> Catalog {
-    Catalog::load(&root()).expect("the checked-in definition catalog must load")
+    // Source distributions omit private historical reports. Definition checks
+    // use the existing definition loader; strict file/evidence checks below
+    // still use Catalog::load with owned existence-only fixtures.
+    Catalog::load_definitions(&root()).expect("the checked-in definition catalog must load")
 }
 fn profile_json() -> Value {
     serde_json::to_value(catalog().profiles["melissa.code.implementer"].clone()).unwrap()
@@ -537,5 +540,14 @@ fn windows_loader_rejects_directory_junction() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(Catalog::load(&f.path).is_err());
+}
+
+#[test]
+fn runtime_definitions_never_authenticate_absent_historical_evidence() {
+    let f = Fixture::new();
+    fs::remove_file(f.path.join("reports/catalog-validation.json")).unwrap();
+    let definitions = Catalog::load_definitions(&f.path).unwrap();
+    assert!(!definitions.readiness().executable);
     assert!(Catalog::load(&f.path).is_err());
 }

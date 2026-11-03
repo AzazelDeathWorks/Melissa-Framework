@@ -36,6 +36,9 @@ use std::{
 #[derive(Clone, Serialize)]
 #[serde(tag = "service", rename_all = "snake_case")]
 pub enum CodeOperation {
+    Git {
+        operation: melissa_repository::git::GitOperation,
+    },
     Procedure {
         language: Language,
         operation: Operation,
@@ -56,6 +59,12 @@ pub enum CodeOperation {
 impl CodeOperation {
     pub fn canonical(&self) -> &'static str {
         match self {
+            Self::Git { operation } => match operation {
+                melissa_repository::git::GitOperation::Status => "git.status",
+                melissa_repository::git::GitOperation::Diff { .. } => "git.diff",
+                melissa_repository::git::GitOperation::Log { .. } => "git.log",
+                _ => "git.worktree",
+            },
             Self::Procedure { operation, .. } => match operation {
                 Operation::Build {} => "code.build",
                 Operation::Check {} => "code.diagnostics",
@@ -73,10 +82,11 @@ impl CodeOperation {
     fn process(&self) -> bool {
         !matches!(
             self,
-            Self::Semantic {
-                build_scripts: false,
-                ..
-            }
+            Self::Git { .. }
+                | Self::Semantic {
+                    build_scripts: false,
+                    ..
+                }
         )
     }
 }
@@ -173,6 +183,15 @@ impl Host {
             return Err(denied());
         }
         if op.process() && (!allows("process.execute_scoped") || p.process_policy.is_none()) {
+            return Err(denied());
+        }
+        if let CodeOperation::Git { operation } = op
+            && (!allows("git.read")
+                || (matches!(
+                    operation,
+                    melissa_repository::git::GitOperation::WorktreeCreate { .. }
+                ) && !allows("workspace.create_worktree_scoped")))
+        {
             return Err(denied());
         }
         if op.process() {
@@ -278,8 +297,65 @@ impl Host {
         Ok(None)
     }
     fn page_authority(&self, page: &PageCall) -> Result {
-        let op = self.results.get(&page.artifact_id).ok_or_else(denied)?;
-        self.authority(op)?;
+        if let Some(op) = self.results.get(&page.artifact_id) {
+            self.authority(op)?;
+        } else {
+            // Resume may construct a new dispatcher. Recover only a native
+            // service result with an authenticated matching proposal in this
+            // task; never accept an arbitrary user/model artifact as a receipt.
+            let invocation = page
+                .artifact_id
+                .strip_suffix(":semantic-service-result")
+                .ok_or_else(denied)?;
+            let meta = self
+                .store
+                .artifact_metadata(&self.policy.task_id, &page.artifact_id)?;
+            let proposal_id = format!("{invocation}:semantic-proposal");
+            if meta.logical_type != "semantic.service-result"
+                || self
+                    .store
+                    .artifact_metadata(&self.policy.task_id, &proposal_id)?
+                    .logical_type
+                    != "semantic.proposal"
+            {
+                return Err(denied());
+            }
+            let proposal: Value = serde_json::from_slice(
+                &self
+                    .store
+                    .get_artifact(&self.policy.task_id, &proposal_id)?,
+            )?;
+            if proposal["schema_version"] != "melissa.semantic-dispatch/v1"
+                || proposal["task_id"] != self.policy.task_id
+                || proposal["profile_id"] != self.policy.profile_id
+                || proposal["resource_id"] != self.policy.resource_id
+                || proposal["authorization_ref"] != self.policy.authorization_ref
+                || proposal["root_identity"] != self.repo.root_identity()
+            {
+                return Err(denied());
+            }
+            let value = &proposal["operation"];
+            let op = match value["service"].as_str() {
+                Some("semantic") => CodeOperation::Semantic {
+                    language: serde_json::from_value(value["language"].clone())?,
+                    query: serde_json::from_value(value["query"].clone())?,
+                    build_scripts: serde_json::from_value(value["build_scripts"].clone())?,
+                },
+                Some("procedure") if value["harness"].is_null() => CodeOperation::Procedure {
+                    language: serde_json::from_value(value["language"].clone())?,
+                    operation: serde_json::from_value(value["operation"].clone())?,
+                    harness: None,
+                },
+                Some("git") => CodeOperation::Git {
+                    operation: serde_json::from_value(value["operation"].clone())?,
+                },
+                _ => return Err(denied()),
+            };
+            if serde_json::to_value(&op)? != *value {
+                return Err(denied());
+            }
+            self.authority(&op)?;
+        }
         if page.max_bytes == 0
             || page.max_bytes > 65536
             || !self
@@ -468,6 +544,29 @@ impl Host {
             idempotency_key: None,
         };
         match &op {
+            CodeOperation::Git { operation } => {
+                let plan = melissa_repository::git::GitPlan::prepare(
+                    &self.repo,
+                    &source,
+                    operation,
+                    crate::toolchain::COMPLETE_IMAGE,
+                    self.policy.limits.clone(),
+                    &cancel,
+                )?;
+                let result = crate::semantic_service::execute(
+                    self,
+                    &op,
+                    crate::semantic_service::Plan::Git(&plan, &source),
+                    &call,
+                    &ctx,
+                    cancel,
+                )?;
+                self.results.insert(
+                    format!("{}:semantic-service-result", ctx.invocation_id),
+                    op.clone(),
+                );
+                Ok(result)
+            }
             CodeOperation::Procedure {
                 language,
                 operation,
@@ -589,8 +688,40 @@ pub(crate) fn token() -> Result<String> {
     Ok(blake3::hash(&b).to_hex().to_string())
 }
 impl CodeDispatcher {
+    /// Trusted-host finite query registration. Existing result paging remains
+    /// available; callers cannot register a raw command or change authority.
+    pub fn bind_query(&mut self, name: &str, operation: CodeOperation) -> Result {
+        if !matches!(
+            (&operation, name),
+            (
+                CodeOperation::Semantic {
+                    build_scripts: false,
+                    ..
+                },
+                "cli_semantic_native"
+            ) | (CodeOperation::Git { .. }, "cli_git_native")
+                | (CodeOperation::Debug { .. }, "cli_debug_native")
+        ) {
+            return Err(denied());
+        }
+        let mut host = self.host.lock().map_err(|_| denied())?;
+        host.authority(&operation)?;
+        if host.session.is_some() {
+            return Err(denied());
+        }
+        host.policy.operations.insert(name.into(), operation);
+        Ok(())
+    }
     pub fn new(
         repo: Repository,
+        store: LocalStore,
+        catalog: Catalog,
+        policy: CodeToolPolicy,
+    ) -> Result<Self> {
+        Self::new_shared(Arc::new(repo), store, catalog, policy)
+    }
+    pub fn new_shared(
+        repo: Arc<Repository>,
         store: LocalStore,
         catalog: Catalog,
         policy: CodeToolPolicy,
@@ -635,7 +766,7 @@ impl CodeDispatcher {
         let revoked = Arc::new(AtomicBool::new(false));
         let active_cancel = Arc::new(Mutex::new(None));
         let h = Host {
-            repo: Arc::new(repo),
+            repo,
             store,
             catalog,
             policy,

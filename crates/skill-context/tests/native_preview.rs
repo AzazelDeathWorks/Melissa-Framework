@@ -250,7 +250,7 @@ fn gateway(store: LocalStore, http: &HttpFixture, policy: GatewayPolicy) -> Gate
     Gateway::new(
         store,
         extend_catalog(
-            &Catalog::load(&root()).unwrap(),
+            &Catalog::load_definitions(&root()).unwrap(),
             &BTreeSet::from([PROFILE.into()]),
         )
         .unwrap(),
@@ -399,7 +399,7 @@ fn setup_runtime(
     pin: melissa_core_contracts::design::SkillPin,
 ) -> ContextRuntime {
     let registry = load_packages(&root(), std::slice::from_ref(&pin)).unwrap();
-    let base = Catalog::load(&root()).unwrap();
+    let base = Catalog::load_definitions(&root()).unwrap();
     let catalog = extend_catalog(&base, &BTreeSet::from([PROFILE.into()])).unwrap();
     let profile = &catalog.profiles[PROFILE];
     let policy = SkillPolicy {

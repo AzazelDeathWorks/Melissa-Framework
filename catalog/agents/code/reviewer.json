@@ -47,6 +47,7 @@
   },
   "tool_ids": [
     "fs.read",
+    "fs.snapshot",
     "fs.search",
     "fs.hash",
     "git.diff",

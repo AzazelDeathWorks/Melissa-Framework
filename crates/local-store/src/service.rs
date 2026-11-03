@@ -1,7 +1,10 @@
 use std::{
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -50,6 +53,7 @@ pub(crate) struct Instance {
     pub config: StoreConfig,
     // Publication, GC and backup use one order: process guard, then SQLite.
     pub files: Mutex<()>,
+    pub inventory_readers: AtomicUsize,
     _lease: File,
 }
 
@@ -84,6 +88,7 @@ impl LocalStore {
             key,
             config,
             files: Mutex::new(()),
+            inventory_readers: AtomicUsize::new(1),
             _lease: lease,
         });
         let mut store = Self::connect_instance(instance)?;
@@ -116,6 +121,22 @@ impl LocalStore {
 
     pub fn connect(&self) -> StoreResult<Self> {
         Self::connect_instance(Arc::clone(&self.instance))
+    }
+
+    /// Trusted host computation setting shared with this session's connections.
+    /// Defaults to one reader. This never skips authentication, changes quotas,
+    /// or grants a model/tool any authority. Opening, GC and backup retain their
+    /// existing full checks. Callers budget transient blob memory for readers.
+    pub fn with_parallel_cas_verification(self, readers: usize) -> StoreResult<Self> {
+        if !(1..=4).contains(&readers) {
+            return Err(StoreError::Invalid(
+                "CAS verification readers must be1..4".into(),
+            ));
+        }
+        self.instance
+            .inventory_readers
+            .store(readers, Ordering::Release);
+        Ok(self)
     }
 
     pub fn root(&self) -> &Path {

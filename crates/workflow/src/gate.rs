@@ -35,7 +35,12 @@ fn effects(canonical: &str) -> Option<&'static [&'static str]> {
             "workspace.create_worktree_scoped",
             "workspace.apply_patch_scoped",
         ],
-        "process.exec" | "code.build" | "code.tests" | "code.lint" | "code.diagnostics" => {
+        "code.tests" => &["process.execute_scoped"],
+        "browser.navigate" | "browser.inspect" | "browser.interact" | "browser.screenshot" => {
+            &["process.execute_scoped", "browser.interact_scoped"]
+        }
+        "data.query" | "data.profile" => &["process.execute_scoped", "database.local_fixture"],
+        "process.exec" | "code.build" | "code.lint" | "code.diagnostics" => {
             &["process.execute_scoped", "workspace.apply_patch_scoped"]
         }
         "artifact.read" => &["artifact.read"],
@@ -124,10 +129,30 @@ impl NodeDispatcher {
                 })
         };
         if def.canonical_id == "fs.patch" {
+            // Decode only the transport explicitly declared by the trusted
+            // backend. Ownership is checked on the unchanged native proposal;
+            // no wrapper can omit or replace the inner path checks.
+            let portable = if call.name == "fs_patch"
+                && def.definition.parameters["properties"]["proposal_json"]["type"] == "string"
+            {
+                require(
+                    args.as_object().is_some_and(|o| o.len() == 1),
+                    Kind::Invalid,
+                    "portable patch requires one exact outer field",
+                )?;
+                Some(melissa_model_gateway::strict_json(
+                    args["proposal_json"].as_str().ok_or_else(|| {
+                        error(Kind::Invalid, "portable proposal must be a JSON string")
+                    })?,
+                )?)
+            } else {
+                None
+            };
+            let patch = portable.as_ref().unwrap_or(&args);
             let mut paths = vec![];
             match call.name.as_str() {
                 "fs_patch" => {
-                    for f in args["files"]
+                    for f in patch["files"]
                         .as_array()
                         .ok_or_else(|| error(Kind::Invalid, "missing patch files"))?
                     {

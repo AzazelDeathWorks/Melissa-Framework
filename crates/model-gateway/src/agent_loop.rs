@@ -37,6 +37,18 @@ pub struct GatewayPolicy {
     pub max_backoff_ms: u64,
     pub decoder_limits: DecoderLimits,
 }
+/// An explicit trusted-host grant for a long run. It is never a model tool.
+/// Task limits, absolute expiry, cancellation and request/usage guards still apply.
+#[derive(Debug, Clone, Copy)]
+pub struct HostRunLimit(u64);
+impl HostRunLimit {
+    pub fn new(wall_time_ms: u64) -> Result<Self> {
+        if wall_time_ms == 0 || wall_time_ms > 86_400_000 {
+            return Err(GatewayError::invalid("host run duration outside one day"));
+        }
+        Ok(Self(wall_time_ms))
+    }
+}
 #[derive(Clone)]
 pub struct RunSpec {
     pub run_id: String,
@@ -187,6 +199,12 @@ impl Gateway {
             recovery: None,
             vision: None,
         })
+    }
+    /// Opt-in host configuration; the legacy constructor keeps its 30-minute bound.
+    /// The continuation binding includes the actual selected duration.
+    pub fn with_host_run_limit(mut self, limit: HostRunLimit) -> Self {
+        self.policy.max_wall_time_ms = limit.0;
+        self
     }
     /// Explicit typed candidate channel for workflow hosts. A successful SOLO
     /// call supplies the ORIGINAL model arguments as a schema-validated candidate.
@@ -516,6 +534,21 @@ impl Gateway {
         } else {
             String::new()
         };
+        if self.continuation.is_some() {
+            let image_details = self
+                .models
+                .iter()
+                .filter(|m| m.endpoint.openai_image_detail() != crate::openai::ImageDetail::Original)
+                .map(|m| {
+                    json!({"registration":m.registration_id,"detail":m.endpoint.openai_image_detail().wire_value()})
+                })
+                .collect::<Vec<_>>();
+            if !image_details.is_empty() {
+                binding = digest(&encoded(
+                    &json!({"native_binding":binding,"openai_image_details":image_details}),
+                )?);
+            }
+        }
         if self.continuation.is_some()
             && let Some(hook) = self.recovery.as_ref()
         {

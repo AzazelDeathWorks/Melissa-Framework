@@ -1,0 +1,141 @@
+{
+  "schema_version": "melissa.cli-recipe/v2",
+  "agents": [
+    {
+      "profile": "melissa.code.frontend",
+      "goal": "Build a responsive counter in site/index.html: #inc button increments #count starting0; keyboard works. Review final-source PNGs at390 and1280 in separate web_flow calls ending screenshot. Run public tests and submit actual digest.",
+      "write": true
+    }
+  ],
+  "writable_paths": [
+    "site/index.html"
+  ],
+  "protected_paths": [
+    "user-dirty.txt"
+  ],
+  "negative_workspace": "C:/Projects/separate-negative",
+  "max_cost_micro_usd": 5000000,
+  "wall_time_ms": 1800000,
+  "domain": {
+    "kind": "frontend",
+    "app": {
+      "language": "static",
+      "directory": "site"
+    },
+    "database": null,
+    "seed_path": null,
+    "migrations": {},
+    "statements": {},
+    "public_checks": [
+      {
+        "id": "public-page",
+        "steps": [
+          {
+            "operation": {
+              "command": "navigate",
+              "page": "p",
+              "path": "/"
+            },
+            "expect": []
+          },
+          {
+            "operation": {
+              "command": "elements",
+              "page": "p",
+              "selector": "#count"
+            },
+            "expect": [
+              {
+                "operator": "equals",
+                "pointer": "/body/count",
+                "value": 1
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "private_checks": [
+      {
+        "id": "click",
+        "steps": [
+          {
+            "operation": {
+              "command": "navigate",
+              "page": "p",
+              "path": "/"
+            },
+            "expect": []
+          },
+          {
+            "operation": {
+              "command": "click",
+              "page": "p",
+              "selector": "#inc"
+            },
+            "expect": []
+          },
+          {
+            "operation": {
+              "command": "elements",
+              "page": "p",
+              "selector": "#count"
+            },
+            "expect": [
+              {
+                "operator": "equals",
+                "pointer": "/body/count",
+                "value": 1
+              },
+              {
+                "operator": "equals",
+                "pointer": "/body/elements/0/normalized_text",
+                "value": "1"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "initial",
+        "steps": [
+          {
+            "operation": {
+              "command": "navigate",
+              "page": "p",
+              "path": "/"
+            },
+            "expect": []
+          },
+          {
+            "operation": {
+              "command": "elements",
+              "page": "p",
+              "selector": "#count"
+            },
+            "expect": [
+              {
+                "operator": "equals",
+                "pointer": "/body/count",
+                "value": 1
+              },
+              {
+                "operator": "equals",
+                "pointer": "/body/elements/0/normalized_text",
+                "value": "0"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "preview": {
+      "path": "/",
+      "widths": [
+        390,
+        1280
+      ]
+    },
+    "private_seed_sql": null
+  }
+}

@@ -140,7 +140,9 @@ impl Fixture {
             statements: BTreeMap::new(),
             services: BTreeSet::from([service]),
         };
-        let catalog = Catalog::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+        let catalog =
+            Catalog::load_definitions(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+                .unwrap();
         Self {
             dir,
             repo,

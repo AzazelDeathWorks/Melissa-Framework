@@ -1,0 +1,77 @@
+[
+  {
+    "schema_version": "melissa.upstream-license/v1",
+    "name": "jsonschema-regex",
+    "version": "0.58.3",
+    "crate_checksum": "023cf6b6c38655c1e9cedf72b9c534fd361bd35d20ac06e074f2c93b7dd0836c",
+    "repository": "https://github.com/Stranger6667/jsonschema",
+    "revision": "a171a01f52f20142bc4f1cfb07c6e56e195e8da6",
+    "files": [
+      {
+        "path": "third_party/licenses/jsonschema-regex/0.58.3/LICENSE.upstream",
+        "url": "https://raw.githubusercontent.com/Stranger6667/jsonschema/a171a01f52f20142bc4f1cfb07c6e56e195e8da6/LICENSE",
+        "sha256": "117829c3ca21efb132d81a44b55363d395ab8eea18526873bc828da4c0e5f038"
+      }
+    ]
+  },
+  {
+    "schema_version": "melissa.upstream-license/v1",
+    "name": "jsonschema-value",
+    "version": "0.58.3",
+    "crate_checksum": "43519639b8e32075ef90a9b6b19136e516a3236b7943c3fe6b1622dafdced8ea",
+    "repository": "https://github.com/Stranger6667/jsonschema",
+    "revision": "a171a01f52f20142bc4f1cfb07c6e56e195e8da6",
+    "files": [
+      {
+        "path": "third_party/licenses/jsonschema-value/0.58.3/LICENSE.upstream",
+        "url": "https://raw.githubusercontent.com/Stranger6667/jsonschema/a171a01f52f20142bc4f1cfb07c6e56e195e8da6/LICENSE",
+        "sha256": "117829c3ca21efb132d81a44b55363d395ab8eea18526873bc828da4c0e5f038"
+      }
+    ]
+  },
+  {
+    "schema_version": "melissa.upstream-license/v1",
+    "name": "tree-sitter-typescript",
+    "version": "0.23.2",
+    "crate_checksum": "6c5f76ed8d947a75cc446d5fccd8b602ebf0cde64ccf2ffa434d873d7a575eff",
+    "repository": "https://github.com/tree-sitter/tree-sitter-typescript",
+    "revision": "f975a621f4e7f532fe322e13c4f79495e0a7b2e7",
+    "files": [
+      {
+        "path": "third_party/licenses/tree-sitter-typescript/0.23.2/LICENSE.upstream",
+        "url": "https://raw.githubusercontent.com/tree-sitter/tree-sitter-typescript/f975a621f4e7f532fe322e13c4f79495e0a7b2e7/LICENSE",
+        "sha256": "49bf33cf78ef5897e4e161ce1517df7de1ae5042a65b6bcfd44401e0fc606559"
+      }
+    ]
+  },
+  {
+    "schema_version": "melissa.upstream-license/v1",
+    "name": "uuid-simd",
+    "version": "0.8.0",
+    "crate_checksum": "23b082222b4f6619906941c17eb2297fff4c2fb96cb60164170522942a200bd8",
+    "repository": "https://github.com/Nugine/simd",
+    "revision": "d74c030d9dc4f3cae02146d1f497ff62726ef09a",
+    "files": [
+      {
+        "path": "third_party/licenses/uuid-simd/0.8.0/LICENSE.upstream",
+        "url": "https://raw.githubusercontent.com/Nugine/simd/d74c030d9dc4f3cae02146d1f497ff62726ef09a/LICENSE",
+        "sha256": "71674605ec4c087fe9eb534e3e4f9e26eb2e4aabcd76a29fd156c6a844d44b3d"
+      }
+    ]
+  },
+  {
+    "schema_version": "melissa.upstream-license/v1",
+    "name": "vsimd",
+    "version": "0.8.0",
+    "crate_checksum": "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64",
+    "repository": "https://github.com/Nugine/simd",
+    "revision": "d74c030d9dc4f3cae02146d1f497ff62726ef09a",
+    "files": [
+      {
+        "path": "third_party/licenses/vsimd/0.8.0/LICENSE.upstream",
+        "url": "https://raw.githubusercontent.com/Nugine/simd/d74c030d9dc4f3cae02146d1f497ff62726ef09a/LICENSE",
+        "sha256": "71674605ec4c087fe9eb534e3e4f9e26eb2e4aabcd76a29fd156c6a844d44b3d"
+      }
+    ]
+  }
+]
