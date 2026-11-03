@@ -43,8 +43,10 @@ pub struct GatewayPolicy {
 pub struct HostRunLimit(u64);
 impl HostRunLimit {
     pub fn new(wall_time_ms: u64) -> Result<Self> {
-        if wall_time_ms == 0 || wall_time_ms > 86_400_000 {
-            return Err(GatewayError::invalid("host run duration outside one day"));
+        if wall_time_ms == 0 || wall_time_ms > i64::MAX as u64 {
+            return Err(GatewayError::invalid(
+                "host run duration outside durable clock range",
+            ));
         }
         Ok(Self(wall_time_ms))
     }
@@ -601,19 +603,6 @@ impl Gateway {
             })?;
         }
         for turn in next_turn..self.policy.max_turns {
-            if self.continuation.is_some() {
-                self.publish_turn(&crate::continuation::TurnCheckpoint {
-                    schema_version: "melissa.gateway-turn-checkpoint/v1".into(),
-                    binding_digest: binding.clone(),
-                    phase: crate::continuation::Phase::InferencePending,
-                    next_turn: turn,
-                    messages: messages.clone(),
-                    seen_calls: seen_calls.clone(),
-                    successful: successful.clone(),
-                    selected_model: selected,
-                    result: result.clone(),
-                })?;
-            }
             let mut accepted: Option<(ModelResponse, String)> = None;
             let mut tried = BTreeSet::new();
             for attempt in 0..self.policy.max_requests {
@@ -801,6 +790,44 @@ impl Gateway {
                         RunStatus::Cancelled
                     };
                     return self.complete(result);
+                }
+                // Wire validation, local evidence preparation and admission have
+                // succeeded. Only the actual dispatch boundary makes resume unsafe.
+                if self.continuation.is_some() {
+                    if let Err(error) = self.publish_turn(&crate::continuation::TurnCheckpoint {
+                        schema_version: "melissa.gateway-turn-checkpoint/v1".into(),
+                        binding_digest: binding.clone(),
+                        phase: crate::continuation::Phase::InferencePending,
+                        next_turn: turn,
+                        messages: messages.clone(),
+                        seen_calls: seen_calls.clone(),
+                        successful: successful.clone(),
+                        selected_model: selected,
+                        result: result.clone(),
+                    }) {
+                        self.store
+                            .journal_mut()
+                            .finish_model_request(
+                                &request_id,
+                                record.version,
+                                &ModelSettlement {
+                                    state: ModelRequestState::NeverDispatched,
+                                    usage: ModelUsage {
+                                        input_tokens: Some(0),
+                                        output_tokens: Some(0),
+                                        cached_input_tokens: Some(0),
+                                        cost_micro_usd: Some(0),
+                                    },
+                                    receipt_digest: Some(digest(
+                                        b"checkpoint failed before transport dispatch",
+                                    )),
+                                    reason: Some("host never dispatched request".into()),
+                                    completed_at_unix_ms: now()?,
+                                },
+                            )
+                            .map_err(store_error)?;
+                        return Err(error);
+                    }
                 }
                 let record = self
                     .store

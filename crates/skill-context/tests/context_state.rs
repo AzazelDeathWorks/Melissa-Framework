@@ -44,6 +44,27 @@ fn request() -> PackRequest {
 }
 
 #[test]
+fn oversized_checkpoint_cannot_publish_a_record_that_restore_rejects() {
+    let dir = tempfile::tempdir().unwrap();
+    let cas = Cas::open(
+        dir.path(),
+        StoreKey::from_bytes([206; 32]),
+        64 * 1024 * 1024,
+    )
+    .unwrap();
+    let good = save(&cas, &"previous checkpoint").unwrap();
+    let before = cas.list().unwrap().len();
+    // Escaping expands JSON; checking raw string length alone is insufficient.
+    let oversized = "\n".repeat(MAX_STATE_BYTES / 2);
+    assert!(save(&cas, &oversized).is_err());
+    assert_eq!(cas.list().unwrap().len(), before);
+    assert_eq!(
+        restore::<String>(&cas, &good).unwrap(),
+        "previous checkpoint"
+    );
+}
+
+#[test]
 fn memory_proposals_reject_duplicate_and_oversized_sources_before_mutation() {
     let s = source("src/a.rs", "evidence");
     let mut book = MemoryBook::default();

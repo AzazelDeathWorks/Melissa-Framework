@@ -144,7 +144,7 @@ impl ProjectMemory {
         })
     }
     pub fn save(&mut self, ns: &Namespace) -> Result {
-        let raw = bytes(&self.book)?;
+        let raw = melissa_skill_context::encode_state(&self.book).map_err(|_| Error::Store)?;
         let hash = digest(&raw);
         let review_hash = review_digest(&self.book)?;
         if review_hash == self.before {

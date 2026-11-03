@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub fn save<T: Serialize>(cas: &Cas, record: &T) -> Result<String> {
-    let bytes = serde_json::to_vec(record)?;
+    let bytes = crate::encode_state(record)?;
     let blob = cas.put(&bytes)?;
     Ok(format!("blake3:{}", blob.digest))
 }
@@ -240,6 +240,10 @@ impl MemoryBook {
         };
         let hash = digest(&serde_json::to_vec(&record)?);
         self.records.insert(id.into(), record);
+        if let Err(error) = crate::encode_state(self) {
+            self.records.remove(id);
+            return Err(error);
+        }
         Ok(hash)
     }
     /// Host review decision only; semantic truth is the reviewer's responsibility.

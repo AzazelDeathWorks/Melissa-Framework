@@ -676,7 +676,7 @@ impl ContextRuntime {
             self.grant.task_id, self.state.sequence
         );
         let artifact = format!("{id}:artifact");
-        let bytes = serde_json::to_vec(&self.state)?;
+        let bytes = crate::encode_state(&self.state)?;
         put(
             &mut self.store,
             &self.grant.task_id,

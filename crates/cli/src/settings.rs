@@ -35,11 +35,22 @@ pub struct Settings {
     pub credential: Credential,
     pub context_tokens: u64,
     pub max_output_tokens: u64,
+    #[serde(
+        default = "default_request_timeout",
+        skip_serializing_if = "is_default_request_timeout"
+    )]
+    pub request_timeout_ms: u64,
     pub capabilities: Capabilities,
     pub json_object: bool,
     pub native_json_schema: bool,
     pub single_attempt: bool,
     pub rate_card: RateCard,
+}
+fn default_request_timeout() -> u64 {
+    1_800_000
+}
+fn is_default_request_timeout(value: &u64) -> bool {
+    *value == default_request_timeout()
 }
 impl Settings {
     pub fn validate(&self) -> Result {
@@ -55,6 +66,8 @@ impl Settings {
             || self.context_tokens == 0
             || self.max_output_tokens == 0
             || self.max_output_tokens >= self.context_tokens
+            || self.request_timeout_ms == 0
+            || self.request_timeout_ms > 1_800_000
             || !self.capabilities.tool_calling
             || !self.capabilities.streaming
             || !(self.json_object || self.native_json_schema)

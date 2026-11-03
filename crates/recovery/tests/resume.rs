@@ -11,6 +11,52 @@ struct Crash {
     inner: RecoveryContinuation,
     at: Phase,
 }
+
+struct ObservedPhases(Arc<Mutex<Vec<Phase>>>);
+impl ContinuationStore for ObservedPhases {
+    fn begin(
+        &mut self,
+        _: &mut LocalStore,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<TurnCheckpoint>> {
+        Ok(None)
+    }
+    fn publish(&mut self, _: &mut LocalStore, c: &TurnCheckpoint) -> Result<()> {
+        self.0.lock().unwrap().push(c.phase);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn local_request_rejection_never_marks_inference_pending_or_reserves_usage() {
+    let d = tempfile::tempdir().unwrap();
+    let s = store(d.path(), 100_000);
+    let http = http_fixture(vec![]).await;
+    let phases = Arc::new(Mutex::new(Vec::new()));
+    let mut g = gateway(s, &http, policy())
+        .with_request_limits(melissa_model_gateway::RequestLimits {
+            max_history_bytes: 1,
+        })
+        .unwrap()
+        .with_continuation(Box::new(ObservedPhases(phases.clone())));
+    assert!(
+        g.run(
+            &spec("local-rejected"),
+            &mut FakeTools::default(),
+            Arc::new(AtomicBool::new(false))
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(*phases.lock().unwrap(), vec![Phase::Safe]);
+    let budget = g.store().journal().model_budget(TASK).unwrap();
+    assert_eq!(budget.active_requests, 0);
+    assert_eq!(budget.unknown_requests, 0);
+    assert_eq!(budget.charged_cost_micro_usd, 0);
+    assert_eq!(http.requests.load(Ordering::SeqCst), 0);
+}
 impl ContinuationStore for Crash {
     fn begin(
         &mut self,
