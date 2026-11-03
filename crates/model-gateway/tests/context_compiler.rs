@@ -107,6 +107,83 @@ fn endpoint(protocol: Protocol) -> ProviderEndpoint {
     .unwrap()
 }
 #[test]
+fn local_wire_measurements_never_become_exact_counts_or_modify_requests() {
+    use melissa_model_gateway::local_tokenizer::{LocalTokenizerConfig, LocalWireTokenizer};
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, task, _) = setup(dir.path());
+    let path = dir.path().join("tokenizer.json");
+    let bytes = include_bytes!("fixtures/local-tokenizer.json");
+    std::fs::write(&path, bytes).unwrap();
+    for protocol in [Protocol::OpenAiResponses, Protocol::AnthropicMessages] {
+        let ep = endpoint(protocol);
+        let tokenizer = LocalWireTokenizer::load(
+            &LocalTokenizerConfig {
+                path: path.clone(),
+                blake3: blake3::hash(bytes).to_hex().to_string(),
+            },
+            ep.url.as_str(),
+            protocol,
+            "fixture",
+        )
+        .unwrap();
+        let mut compiler = ContextCompiler::default().with_wire_tokenizer(tokenizer);
+        let transport = HttpTransport::new(true).unwrap();
+        let mut req = request(protocol, 0);
+        let expected = transport.request_body(&ep, &req).unwrap();
+        let (actual, report) = compiler
+            .compile(
+                &mut req,
+                &transport,
+                &ep,
+                100_000,
+                &mut store,
+                &task,
+                "wire",
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(expected, actual);
+        assert!(report.wire_token_measurement.unwrap().token_count > 0);
+        assert!(report.exact_token_count.is_none());
+        assert_eq!(report.capacity_check, "conservative_text_units");
+        assert_eq!(report.reserved_output_tokens, 1024);
+        // The smaller wire token count cannot admit an oversized request.
+        assert!(
+            compiler
+                .compile(
+                    &mut req,
+                    &transport,
+                    &ep,
+                    1100,
+                    &mut store,
+                    &task,
+                    "wire",
+                    vec![]
+                )
+                .is_err()
+        );
+        let mut req = request(protocol, 1);
+        let (_, report) = compiler
+            .compile(
+                &mut req,
+                &transport,
+                &ep,
+                100_000,
+                &mut store,
+                &task,
+                "wire",
+                vec![],
+            )
+            .unwrap();
+        assert!(report.wire_token_measurement.is_none());
+        assert_eq!(
+            report.wire_tokenizer_status.as_deref(),
+            Some("not_measured_images_or_provider_continuation")
+        );
+        assert!(store.journal().model_requests(&task).unwrap().is_empty());
+    }
+}
+#[test]
 fn long_native_histories_keep_pairs_opaque_bytes_and_recover_archived_ranges() {
     for protocol in [Protocol::OpenAiResponses, Protocol::AnthropicMessages] {
         let dir = tempfile::tempdir().unwrap();

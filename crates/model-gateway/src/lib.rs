@@ -4,6 +4,7 @@ pub mod agent_loop;
 pub mod anthropic;
 pub mod context_compiler;
 pub mod continuation;
+pub mod local_tokenizer;
 pub mod openai;
 pub mod output_capabilities;
 pub mod recovery;

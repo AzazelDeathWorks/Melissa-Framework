@@ -54,6 +54,30 @@ impl Fixture {
     }
 }
 #[test]
+fn tokenizer_import_authenticates_before_publication_without_resolving_keys() {
+    let f = Fixture::new();
+    let legacy = f.app().configuration().unwrap()["settings_digest"].clone();
+    let path = f.temp.path().join("tokenizer.json");
+    let bytes = include_bytes!("../../model-gateway/tests/fixtures/local-tokenizer.json");
+    fs::write(&path, bytes).unwrap();
+    let mut settings: Value = serde_json::from_slice(&fs::read(&f.config).unwrap()).unwrap();
+    settings["local_tokenizer"] =
+        json!({"path":path,"blake3":blake3::hash(bytes).to_hex().to_string()});
+    fs::write(&f.config, serde_json::to_vec(&settings).unwrap()).unwrap();
+    let imported = f.app().configure(&f.config).unwrap();
+    assert_ne!(imported["settings_digest"], legacy);
+    assert_eq!(imported["secret_resolved"], false);
+    assert_eq!(
+        imported["local_tokenizer"]["measurement"],
+        "native_wire_only"
+    );
+    assert!(!imported.to_string().contains(path.to_str().unwrap()));
+    let stored = fs::read(f.home.join("settings.enc")).unwrap();
+    fs::write(&path, b"{}").unwrap();
+    assert!(f.app().configure(&f.config).is_err());
+    assert_eq!(fs::read(f.home.join("settings.enc")).unwrap(), stored);
+}
+#[test]
 fn settings_import_and_display_never_resolve_or_disclose_the_credential_reference() {
     let f = Fixture::new();
     let v = f.app().configuration().unwrap();

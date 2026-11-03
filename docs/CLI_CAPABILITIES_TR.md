@@ -49,6 +49,26 @@ maliyet rezervasyonu model kapasitesini esas almaya devam eder. Görseller için
 eşleşen sayıcı yoksa rapor `not_measured_multimodal` yazar; görseli küçültmez
 ve doğrulanmış token kapasitesi iddiasında bulunmaz.
 
+İsteğe bağlı `local_tokenizer` ayarıyla yerel bir Hugging Face `tokenizer.json`
+dosyası bağlanabilir: `{"path":"C:/MelissaPrivate/tokenizer.json","blake3":"DOSYANIN_64_KARAKTER_KUCUK_HARF_BLAKE3_OZETI"}`.
+Dosyayı güvenilir model yayımından ayrıca temin edin; uygulama dosya indirmez,
+uzak Python kodu çalıştırmaz ve model anahtarı okumaz. Import ve çalıştırmada
+dosya özeti doğrulanır. Endpoint, protokol, model veya özet değişirse yürütme
+politikasının kimliği de değişir. Alan eklenmezse eski ayar özeti korunur.
+
+`wire_token_measurement`, tüm native JSON metninin gerçek tokenizer ile
+sayımıdır; sağlayıcının chat template'iyle oluşturduğu **model girdisi token
+sayısı değildir**. Bu nedenle kapasiteyi veya maliyet rezervasyonunu azaltmaz;
+çıktı token ayarını da değiştirmez. Dosya içindeki truncation ve padding sayım
+için kapatılır. Görsel/opaque continuation bulunan isteklerde ölçüm yapılmaz.
+32 MiB üzerindeki tokenizer dosyaları reddedilir; 2 MiB üzerindeki JSON için
+yalnız bu ek ölçüm atlanır, istek kırpılmaz. Bu sınırlar model bağlam limiti değildir.
+
+Yerel dosyanın özetini `cargo run -p melissa-model-gateway --example measure_wire -- --digest C:/MelissaPrivate/tokenizer.json`
+ile alın. Çevrimdışı JSON sayımını denemek için aynı örneğe sırasıyla tokenizer
+yolu, özet ve native request JSON yolu verin. Örnekte HTTP bağlantısı kurulmaz.
+`config show` seçili tokenizer özetini ve `native_wire_only` ölçüm türünü gösterir.
+
 Tam geçmiş tek bir büyüyen JSON dosyası yerine değişmez mesaj nesneleri ve
 manifestlerle saklanır. Önceki tam checkpoint biçimi okunmaya devam eder.
 Çalıştırma politikası değişmiş eski aktif görevlerin devam girişimi ise

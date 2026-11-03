@@ -57,7 +57,7 @@ jobs:
       - name: Skill context tests
         run: cargo +1.98.0 test --locked -p melissa-skill-context --test package_runtime --test context_state --test retrieval --test registry_versions --test incremental_context
       - name: Native context and protocol contracts
-        run: cargo +1.98.0 test --locked -p melissa-model-gateway --lib --test context_compiler --test history_bounds --test reviewed_origin_policy --test agent_loop --test anthropic_protocol --test openai_protocol
+        run: cargo +1.98.0 test --locked -p melissa-model-gateway --lib --test context_compiler --test local_tokenizer --test history_bounds --test reviewed_origin_policy --test agent_loop --test anthropic_protocol --test openai_protocol
       - name: Build-test unit tests
         run: cargo +1.98.0 test --locked -p melissa-build-test --lib
       - name: Web development protocol tests

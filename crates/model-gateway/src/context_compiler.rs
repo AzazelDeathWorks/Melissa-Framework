@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 pub struct ContextCompiler {
     archived: std::collections::BTreeMap<(String, String, String), ArchivedObservation>,
     counter: Option<Box<dyn NativeTokenCounter>>,
+    wire_tokenizer: Option<crate::local_tokenizer::LocalWireTokenizer>,
 }
 /// Trusted-host tokenizer adapter for the complete encoded native request,
 /// including protocol framing, schemas, opaque history and images when present.
@@ -37,6 +38,10 @@ pub struct ContextReport {
     pub reserved_output_tokens: u64,
     pub capacity: u64,
     pub exact_token_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_token_measurement: Option<crate::local_tokenizer::WireTokenMeasurement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_tokenizer_status: Option<String>,
     pub capacity_check: String,
     pub has_opaque_continuation: bool,
     pub archived: Vec<ArchivedObservation>,
@@ -184,6 +189,13 @@ fn archive(
     })
 }
 impl ContextCompiler {
+    pub fn with_wire_tokenizer(
+        mut self,
+        tokenizer: crate::local_tokenizer::LocalWireTokenizer,
+    ) -> Self {
+        self.wire_tokenizer = Some(tokenizer);
+        self
+    }
     pub fn with_counter(mut self, counter: Box<dyn NativeTokenCounter>) -> Result<Self> {
         if counter.policy_id().trim().is_empty() || counter.policy_id().len() > 512 {
             return Err(failure("token counter policy identity"));
@@ -192,12 +204,16 @@ impl ContextCompiler {
         Ok(self)
     }
     pub fn policy_id(&self) -> String {
-        format!(
+        let base = format!(
             "native-context/v1:{}",
             self.counter
                 .as_ref()
                 .map_or("utf8-framing", |c| c.policy_id())
-        )
+        );
+        match &self.wire_tokenizer {
+            Some(t) => format!("{base}:{}", t.policy_id()),
+            None => base,
+        }
     }
     pub fn working_messages(
         &self,
@@ -326,6 +342,27 @@ impl ContextCompiler {
                     .checked_add(request.max_output_tokens)
                     .is_some_and(|n| n <= capacity)
             {
+                let mut wire_tokenizer_status = None;
+                let wire_token_measurement = if let Some(tokenizer) = &self.wire_tokenizer {
+                    if has_images || has_opaque {
+                        wire_tokenizer_status =
+                            Some("not_measured_images_or_provider_continuation".into());
+                        None
+                    } else {
+                        let measured = tokenizer.measure(endpoint, &request.model, &wire)?;
+                        wire_tokenizer_status = Some(
+                            if measured.is_some() {
+                                "measured_wire_only; capacity_and_budget_unchanged"
+                            } else {
+                                "not_measured_binding_or_size"
+                            }
+                            .into(),
+                        );
+                        measured
+                    }
+                } else {
+                    None
+                };
                 return Ok((
                     wire,
                     ContextReport {
@@ -340,6 +377,8 @@ impl ContextCompiler {
                         reserved_output_tokens: request.max_output_tokens,
                         capacity,
                         exact_token_count: exact,
+                        wire_token_measurement,
+                        wire_tokenizer_status,
                         capacity_check: if unknown_images {
                             "not_measured_multimodal"
                         } else if exact.is_some() {

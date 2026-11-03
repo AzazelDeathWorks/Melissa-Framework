@@ -586,7 +586,7 @@ fn gateway(
             melissa_model_gateway::agent_loop::HostRunLimit::new(e.recipe.wall_time_ms)
                 .map_err(gw)?,
         )
-        .with_context_compiler()
+        .with_native_context_compiler(s.context_compiler()?)
         // Use the existing host-selected full history policy. The generic
         // 2 MiB default would reject a valid large model context prematurely;
         // this preserves full history instead of shortening user/tool content.
