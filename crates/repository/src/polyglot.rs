@@ -75,7 +75,7 @@ impl PolyglotIndex {
                 && version == file
             {
                 nodes += count;
-                if nodes > 1_000_000 {
+                if nodes > MAX_SYNTAX_NODES {
                     return Err(Error::Quota("syntax nodes"));
                 }
                 out.symbols.extend(symbols.iter().cloned());
@@ -88,111 +88,32 @@ impl PolyglotIndex {
                 cache.reused_files += 1;
                 continue;
             }
-            let symbol_start = out.symbols.len();
-            let node_start = nodes;
-            let Some(lang) = language(&file.path) else {
+            if language(&file.path).is_none() {
                 out.unsupported_files.push(file.path.clone());
                 cache
                     .entries
                     .insert(file.path.clone(), (file.clone(), vec![], false, true, 0));
                 continue;
-            };
+            }
             let (version, bytes) = repo.read(&file.path)?;
             if version != *file {
                 return Err(Error::Stale("polyglot source"));
             }
-            std::str::from_utf8(&bytes).map_err(|_| Error::Invalid("source UTF-8"))?;
-            let grammar = match lang {
-                "rust" => tree_sitter_rust::LANGUAGE,
-                "python" => tree_sitter_python::LANGUAGE,
-                "javascript" => tree_sitter_javascript::LANGUAGE,
-                "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
-                "tsx" => tree_sitter_typescript::LANGUAGE_TSX,
-                _ => unreachable!(),
-            };
-            let mut parser = tree_sitter::Parser::new();
-            parser
-                .set_language(&grammar.into())
-                .map_err(|_| Error::Unsupported("grammar ABI"))?;
-            let start = Instant::now();
-            let mut progress = |_: &tree_sitter::ParseState| {
-                if cancel.load(Ordering::Acquire) || start.elapsed() > Duration::from_secs(60) {
-                    ControlFlow::Break(())
-                } else {
-                    ControlFlow::Continue(())
-                }
-            };
-            let mut input = |offset: usize, _| bytes.get(offset..).unwrap_or_default();
-            let tree = parser
-                .parse_with_options(
-                    &mut input,
-                    None,
-                    Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
-                )
-                .ok_or(Error::Quota("syntax deadline"))?;
-            if tree.root_node().has_error() {
+            let parsed = parse_file(file, &bytes, cancel, MAX_SYNTAX_NODES - nodes)?
+                .ok_or(Error::Unsupported("language grammar"))?;
+            nodes += parsed.nodes;
+            if parsed.syntax_error {
                 out.syntax_errors.push(file.path.clone());
             }
-            let mut stack = vec![tree.root_node()];
-            while let Some(node) = stack.pop() {
-                check_cancel(cancel)?;
-                nodes += 1;
-                if nodes > 1_000_000 {
-                    return Err(Error::Quota("syntax nodes"));
-                }
-                let k = node.kind();
-                let declaration = matches!(
-                    k,
-                    "function_item"
-                        | "struct_item"
-                        | "enum_item"
-                        | "trait_item"
-                        | "mod_item"
-                        | "function_definition"
-                        | "class_definition"
-                        | "function_declaration"
-                        | "class_declaration"
-                        | "interface_declaration"
-                        | "type_alias_declaration"
-                        | "method_definition"
-                        | "variable_declarator"
-                );
-                if declaration && let Some(name) = node.child_by_field_name("name") {
-                    let text = name
-                        .utf8_text(&bytes)
-                        .map_err(|_| Error::Invalid("symbol UTF-8"))?;
-                    let pos = name.start_position();
-                    let line_start = name.start_byte().saturating_sub(pos.column);
-                    let col = std::str::from_utf8(&bytes[line_start..name.start_byte()])
-                        .map_err(|_| Error::Invalid("symbol column"))?
-                        .encode_utf16()
-                        .count();
-                    out.symbols.push(SyntaxSymbol {
-                        path: file.path.clone(),
-                        file_digest: file.digest.clone(),
-                        language: lang.into(),
-                        name: text.into(),
-                        kind: k.into(),
-                        start_byte: name.start_byte(),
-                        end_byte: name.end_byte(),
-                        line: pos.row,
-                        utf16_column: col,
-                    });
-                }
-                for i in (0..node.named_child_count()).rev() {
-                    if let Some(child) = node.named_child(i as u32) {
-                        stack.push(child);
-                    }
-                }
-            }
+            out.symbols.extend(parsed.symbols.iter().cloned());
             cache.entries.insert(
                 file.path.clone(),
                 (
                     file.clone(),
-                    out.symbols[symbol_start..].to_vec(),
-                    tree.root_node().has_error(),
+                    parsed.symbols,
+                    parsed.syntax_error,
                     false,
-                    nodes - node_start,
+                    parsed.nodes,
                 ),
             );
             cache.parsed_files += 1;
@@ -200,4 +121,112 @@ impl PolyglotIndex {
         repo.validate_snapshot(snapshot, cancel)?;
         Ok(out)
     }
+}
+
+/// Grammar output for one already authenticated file read.
+pub struct FileSyntax {
+    pub symbols: Vec<SyntaxSymbol>,
+    pub syntax_error: bool,
+    pub nodes: usize,
+}
+
+pub const MAX_SYNTAX_NODES: usize = 1_000_000;
+
+pub fn parse_file(
+    file: &crate::FileVersion,
+    bytes: &[u8],
+    cancel: &AtomicBool,
+    node_budget: usize,
+) -> Result<Option<FileSyntax>> {
+    let Some(lang) = language(&file.path) else {
+        return Ok(None);
+    };
+    std::str::from_utf8(bytes).map_err(|_| Error::Invalid("source UTF-8"))?;
+    let grammar = match lang {
+        "rust" => tree_sitter_rust::LANGUAGE,
+        "python" => tree_sitter_python::LANGUAGE,
+        "javascript" => tree_sitter_javascript::LANGUAGE,
+        "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
+        "tsx" => tree_sitter_typescript::LANGUAGE_TSX,
+        _ => unreachable!(),
+    };
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&grammar.into())
+        .map_err(|_| Error::Unsupported("grammar ABI"))?;
+    let start = Instant::now();
+    let mut progress = |_: &tree_sitter::ParseState| {
+        if cancel.load(Ordering::Acquire) || start.elapsed() > Duration::from_secs(60) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    };
+    let mut input = |offset: usize, _| bytes.get(offset..).unwrap_or_default();
+    let tree = parser
+        .parse_with_options(
+            &mut input,
+            None,
+            Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
+        )
+        .ok_or(Error::Quota("syntax deadline"))?;
+    let mut nodes = 0;
+    let mut symbols = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        check_cancel(cancel)?;
+        nodes += 1;
+        if nodes > node_budget {
+            return Err(Error::Quota("syntax nodes"));
+        }
+        let k = node.kind();
+        let declaration = matches!(
+            k,
+            "function_item"
+                | "struct_item"
+                | "enum_item"
+                | "trait_item"
+                | "mod_item"
+                | "function_definition"
+                | "class_definition"
+                | "function_declaration"
+                | "class_declaration"
+                | "interface_declaration"
+                | "type_alias_declaration"
+                | "method_definition"
+                | "variable_declarator"
+        );
+        if declaration && let Some(name) = node.child_by_field_name("name") {
+            let text = name
+                .utf8_text(bytes)
+                .map_err(|_| Error::Invalid("symbol UTF-8"))?;
+            let pos = name.start_position();
+            let line_start = name.start_byte().saturating_sub(pos.column);
+            let col = std::str::from_utf8(&bytes[line_start..name.start_byte()])
+                .map_err(|_| Error::Invalid("symbol column"))?
+                .encode_utf16()
+                .count();
+            symbols.push(SyntaxSymbol {
+                path: file.path.clone(),
+                file_digest: file.digest.clone(),
+                language: lang.into(),
+                name: text.into(),
+                kind: k.into(),
+                start_byte: name.start_byte(),
+                end_byte: name.end_byte(),
+                line: pos.row,
+                utf16_column: col,
+            });
+        }
+        for i in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(i as u32) {
+                stack.push(child);
+            }
+        }
+    }
+    Ok(Some(FileSyntax {
+        symbols,
+        syntax_error: tree.root_node().has_error(),
+        nodes,
+    }))
 }

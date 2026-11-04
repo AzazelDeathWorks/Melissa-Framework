@@ -4,7 +4,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -72,6 +72,21 @@ pub struct RepositorySnapshot {
     pub total_bytes: u64,
     pub atomic_tree_snapshot: bool,
     pub excluded_prefixes: Vec<String>,
+}
+
+/// A source digest paired with an optional host-observed NTFS journal receipt.
+/// Only authenticated, workspace-bound index state may supply a previous value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexedFileVersion {
+    pub version: FileVersion,
+    journal_stamp: Option<(u64, i64)>,
+}
+
+pub struct IndexScan {
+    pub snapshot: RepositorySnapshot,
+    pub files: BTreeMap<String, IndexedFileVersion>,
+    pub changed_bytes: BTreeMap<String, Vec<u8>>,
+    pub bytes_read: u64,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchHit {
@@ -220,11 +235,90 @@ impl Repository {
         self.read_locked(&mut file, path)
     }
     pub fn snapshot(&self, cancel: &AtomicBool) -> Result<RepositorySnapshot> {
+        self.capture(cancel, |path| self.read(path).map(|(version, _)| version))
+    }
+
+    /// Recheck the visible tree using the same pinned path admission as a
+    /// snapshot. Read bytes whenever the OS cannot prove the cached version
+    /// unchanged. Index receipts are for retrieval, never write admission.
+    pub fn scan_index(
+        &self,
+        previous: &BTreeMap<String, IndexedFileVersion>,
+        cancel: &AtomicBool,
+    ) -> Result<IndexScan> {
+        #[cfg(windows)]
+        let journal = crate::file_journal::FileJournal::open(&self.root.file);
+        let mut files = BTreeMap::new();
+        let mut changed_bytes = BTreeMap::new();
+        let mut bytes_read = 0u64;
+        let snapshot = self.capture(cancel, |path| {
+            let mut pin = self.lock(path, false)?;
+            let bytes = pin.file.metadata()?.len();
+            if bytes > self.limits.max_file_bytes {
+                return Err(Error::Quota("file bytes"));
+            }
+            #[cfg(windows)]
+            let journal_stamp = journal.as_ref().and_then(|j| j.stamp(&pin.file));
+            #[cfg(not(windows))]
+            let journal_stamp = None;
+            let old = previous.get(path);
+            let version = if let Some(old) = old
+                && journal_stamp.is_some()
+                && journal_stamp == old.journal_stamp
+                && old.version.path == path
+                && old.version.identity == pin.identity
+                && old.version.bytes == bytes
+            {
+                old.version.clone()
+            } else {
+                let (version, content) = self.read_locked(&mut pin, path)?;
+                bytes_read += version.bytes;
+                if old.is_none_or(|old| old.version.digest != version.digest) {
+                    changed_bytes.insert(path.to_owned(), content);
+                }
+                version
+            };
+            files.insert(
+                path.to_owned(),
+                IndexedFileVersion {
+                    version: version.clone(),
+                    journal_stamp,
+                },
+            );
+            Ok(version)
+        })?;
+        #[cfg(windows)]
+        if journal.is_some_and(|journal| !journal.unchanged()) {
+            return Err(Error::Stale("file journal changed during index scan"));
+        }
+        Ok(IndexScan {
+            snapshot,
+            files,
+            changed_bytes,
+            bytes_read,
+        })
+    }
+
+    fn capture(
+        &self,
+        cancel: &AtomicBool,
+        mut read_version: impl FnMut(&str) -> Result<FileVersion>,
+    ) -> Result<RepositorySnapshot> {
         let mut files = Vec::new();
-        let mut total = 0;
+        let mut total = 0u64;
         let mut seen = BTreeSet::new();
         let mut entries = 0;
-        self.visit("", &mut files, &mut total, &mut seen, &mut entries, cancel)?;
+        self.visit("", &mut seen, &mut entries, cancel, &mut |path| {
+            let version = read_version(path)?;
+            total = total
+                .checked_add(version.bytes)
+                .ok_or(Error::Quota("byte overflow"))?;
+            if total > self.limits.max_total_bytes {
+                return Err(Error::Quota("snapshot bytes"));
+            }
+            files.push(version);
+            Ok(())
+        })?;
         files.sort_by(|a, b| a.path.cmp(&b.path));
         let seal = digest(&serde_json::to_vec(&(
             self.root_identity(),
@@ -244,11 +338,10 @@ impl Repository {
     fn visit(
         &self,
         relative: &str,
-        files: &mut Vec<FileVersion>,
-        total: &mut u64,
         seen: &mut BTreeSet<String>,
         entries: &mut usize,
         cancel: &AtomicBool,
+        file: &mut impl FnMut(&str) -> Result,
     ) -> Result {
         check_cancel(cancel)?;
         let path: PathBuf = if relative.is_empty() {
@@ -288,16 +381,9 @@ impl Repository {
             }
             let kind = entry.file_type()?;
             if kind.is_dir() {
-                self.visit(&child, files, total, seen, entries, cancel)?;
+                self.visit(&child, seen, entries, cancel, file)?;
             } else {
-                let (version, _) = self.read(&child)?;
-                *total = total
-                    .checked_add(version.bytes)
-                    .ok_or(Error::Quota("byte overflow"))?;
-                if *total > self.limits.max_total_bytes {
-                    return Err(Error::Quota("snapshot bytes"));
-                }
-                files.push(version);
+                file(&child)?;
             }
         }
         Ok(())

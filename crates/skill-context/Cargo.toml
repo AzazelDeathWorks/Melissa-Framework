@@ -12,7 +12,7 @@ melissa-model-gateway = { path = "../model-gateway" }
 serde.workspace = true
 serde_json.workspace = true
 blake3.workspace = true
-rusqlite.workspace = true
+rusqlite = { workspace = true, features = ["serialize"] }
 ring = "=0.17.14"
 melissa-repository = { path = "../repository" }
 melissa-container-executor = { path = "../container-executor" }

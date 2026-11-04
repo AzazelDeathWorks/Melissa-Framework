@@ -3,8 +3,9 @@
 use crate::{
     Error, Namespace, Result, digest, json,
     package::{Registry, SkillPolicy},
+    repository_index::{RepositoryIndex, SearchQuery},
     require,
-    retrieval::{self, Domain, SearchScope, Source},
+    retrieval::{Domain, Hit, SearchScope, Source},
     scripts,
     state::{Cache, CacheAdmission, CacheKey, CacheKind, MemoryBook},
 };
@@ -168,7 +169,8 @@ pub struct ContextRuntime {
     state: RuntimeState,
     imported: Vec<MemoryBook>,
     source_inventory: Vec<Source>,
-    search_index: retrieval::SearchIndex,
+    repository_index: Option<RepositoryIndex>,
+    index_binding: [u8; 32],
     parse_cache: melissa_repository::polyglot::ParseCache,
     native_scripts: BTreeMap<String, NativeScriptRoute>,
     native_dispatcher: Option<Box<dyn ToolDispatcher>>,
@@ -240,6 +242,7 @@ impl ContextRuntime {
             registry.load(pin, &grant.skill_policy)?;
         }
         grant.namespace.validate()?;
+        let index_binding = RepositoryIndex::binding(&repo, &grant.namespace, &grant.policy_epoch)?;
         let mut host = Self {
             repo,
             store,
@@ -250,7 +253,8 @@ impl ContextRuntime {
             state: RuntimeState::default(),
             imported: Vec::new(),
             source_inventory: Vec::new(),
-            search_index: retrieval::SearchIndex::new()?,
+            repository_index: None,
+            index_binding,
             parse_cache: Default::default(),
             native_scripts: BTreeMap::new(),
             native_dispatcher: None,
@@ -687,7 +691,6 @@ impl ContextRuntime {
                 // Derived cache eviction cannot discard reviewed project facts.
                 self.state.cache = Cache::default();
                 self.parse_cache = Default::default();
-                self.search_index = retrieval::SearchIndex::new()?;
                 crate::encode_state(&self.state)?
             }
         };
@@ -750,7 +753,8 @@ impl ContextRuntime {
             "artifact_cleanup" => {
                 self.state.cache = Cache::default();
                 self.parse_cache = Default::default();
-                self.search_index = retrieval::SearchIndex::new()?;
+                self.store.clear_repository_index(&self.index_binding)?;
+                self.repository_index = None;
                 self.state
                     .telemetry
                     .entry("cache.explicit_cleanup".into())
@@ -798,27 +802,171 @@ impl ContextRuntime {
             _ => Err(Error("native backend not registered".into())),
         }
     }
+    fn repository_search(&mut self, op: &ContextOperation, cancel: &AtomicBool) -> Result<Value> {
+        let ContextOperation::Search {
+            query,
+            limit,
+            symbols,
+        } = op
+        else {
+            return Err(Error("expected repository search".into()));
+        };
+        require(
+            !cancel.load(Ordering::Acquire),
+            "repository search cancelled",
+        )?;
+        if self.repository_index.is_none() {
+            let restored = self
+                .store
+                .load_repository_index(&self.index_binding)
+                .and_then(|data| {
+                    data.map(|bytes| {
+                        RepositoryIndex::restore(self.index_binding, &bytes).map_err(|_| {
+                            melissa_local_store::StoreError::Integrity(
+                                "derived repository index".into(),
+                            )
+                        })
+                    })
+                    .transpose()
+                });
+            self.repository_index = Some(match restored {
+                Ok(Some(index)) => {
+                    *self
+                        .state
+                        .telemetry
+                        .entry("index.restored".into())
+                        .or_default() += 1;
+                    index
+                }
+                other => {
+                    if other.is_err() {
+                        *self
+                            .state
+                            .telemetry
+                            .entry("index.restore_failed".into())
+                            .or_default() += 1;
+                    }
+                    RepositoryIndex::new(self.index_binding)?
+                }
+            });
+        }
+        let index = self
+            .repository_index
+            .as_mut()
+            .expect("repository index initialized");
+        let report = index.refresh(&self.repo, cancel)?;
+        for (name, increment) in [
+            ("index.source_bytes_read", report.bytes_read),
+            ("index.documents_updated", report.indexed),
+            ("index.files_parsed", report.parsed),
+        ] {
+            let counter = self.state.telemetry.entry(name.into()).or_default();
+            *counter = counter.saturating_add(increment);
+        }
+        require(
+            !cancel.load(Ordering::Acquire),
+            "repository search cancelled",
+        )?;
+        if index.persist(&self.store).is_err() {
+            *self
+                .state
+                .telemetry
+                .entry("index.persist_failed".into())
+                .or_default() += 1;
+        }
+        let now = melissa_execution_broker::unix_ms().map_err(|_| Error("clock".into()))?;
+        let key = self.cache_key(
+            CacheKind::Retrieval,
+            digest(&serde_json::to_vec(&(
+                op,
+                &self.state.semantic_snapshot,
+                &self.state.semantic,
+            ))?),
+            report.snapshot.clone(),
+        )?;
+        let admission = CacheAdmission {
+            authorized_now: true,
+            deterministic_readonly: true,
+            cancelled: cancel.load(Ordering::Acquire),
+        };
+        let index = self
+            .repository_index
+            .as_ref()
+            .expect("repository index initialized");
+        if let Some(bytes) = self.state.cache.get(&key, now, &admission)? {
+            let hits: Vec<Hit> = json(bytes)?;
+            if hits.iter().all(|hit| {
+                hit.source.namespace == self.grant.namespace
+                    && hit.source.domain == Domain::Code
+                    && hit.source.observed_at_ms <= now
+                    && now < hit.source.valid_until_ms
+                    && hit.source.valid_until_ms <= self.grant.expires_at_ms
+            }) {
+                for hit in &hits {
+                    require(
+                        !cancel.load(Ordering::Acquire),
+                        "repository search cancelled",
+                    )?;
+                    index.validate_hit(&self.repo, hit)?;
+                }
+                *self
+                    .state
+                    .telemetry
+                    .entry("retrieval.hit".into())
+                    .or_default() += 1;
+                return Ok(value!({"cached":true,"data":hits}));
+            }
+        }
+        let hits = index.search(
+            &self.repo,
+            &SearchQuery {
+                query,
+                symbols,
+                links: (self.state.semantic_snapshot == report.snapshot)
+                    .then_some(&self.state.semantic),
+                limit: *limit,
+                namespace: &self.grant.namespace,
+                now_ms: now,
+                expires_at_ms: self.grant.expires_at_ms,
+            },
+            cancel,
+        )?;
+        *self
+            .state
+            .telemetry
+            .entry("retrieval.miss".into())
+            .or_default() += 1;
+        self.state.cache.put(
+            key,
+            serde_json::to_vec(&hits)?,
+            now,
+            self.grant.expires_at_ms.min(now.saturating_add(60_000)),
+            &admission,
+        )?;
+        Ok(value!({"cached":false,"data":hits}))
+    }
+
     fn run(
         &mut self,
         op: &ContextOperation,
         ctx: &ToolContext,
         cancel: &AtomicBool,
     ) -> Result<Value> {
+        if matches!(op, ContextOperation::Search { .. }) {
+            return self.repository_search(op, cancel);
+        }
         let (snapshot, sources) = self.sources()?;
         let scope = self.scope(&sources);
         self.source_inventory = sources;
         let now = scope.now_ms;
         let kind = match op {
-            ContextOperation::Search { .. } => CacheKind::Retrieval,
             ContextOperation::SkillLoad { .. } => CacheKind::Prompt,
             _ => CacheKind::ToolResult,
         };
         let key=self.cache_key(kind,digest(&serde_json::to_vec(&value!({"operation":op,"native_semantic_snapshot":self.state.semantic_snapshot,"native_semantic_graph":self.state.semantic}))?),snapshot)?;
         let cacheable = matches!(
             op,
-            ContextOperation::SkillLoad { .. }
-                | ContextOperation::Search { .. }
-                | ContextOperation::Template { .. }
+            ContextOperation::SkillLoad { .. } | ContextOperation::Template { .. }
         );
         let admission = CacheAdmission {
             authorized_now: true,
@@ -843,17 +991,9 @@ impl ContextRuntime {
                         .material()?
                 )
             }
-            ContextOperation::Search {
-                query,
-                limit,
-                symbols,
-            } => value!(self.search_index.search(
-                &self.source_inventory,
-                &scope,
-                query,
-                symbols,
-                *limit
-            )?),
+            ContextOperation::Search { .. } => {
+                unreachable!("search handled before source collection")
+            }
             ContextOperation::MemorySearch { query } => {
                 let mut values = self
                     .state

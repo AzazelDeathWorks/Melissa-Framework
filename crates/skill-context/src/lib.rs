@@ -9,6 +9,7 @@ pub mod context;
 pub mod durable;
 pub mod package;
 pub mod release;
+mod repository_index;
 pub mod retrieval;
 pub mod runtime;
 pub mod scripts;

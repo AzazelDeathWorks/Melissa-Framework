@@ -45,7 +45,7 @@ jobs:
         run: cargo +1.98.0 test --locked -p melissa-workflow --test workflow --test complete_native_race
       - name: Memory envelopes and native checkpoint bounds
         run: |
-          cargo +1.98.0 test --locked -p melissa-skill-context --test context_state --test incremental_context
+          cargo +1.98.0 test --locked -p melissa-skill-context --lib --test context_state --test incremental_context
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo +1.98.0 test --locked -p melissa-skill-context --test native_runtime oversized_native_checkpoint_preserves_previous_reopenable_checkpoint -- --exact
       - name: Local request preflight and provider edge cases
