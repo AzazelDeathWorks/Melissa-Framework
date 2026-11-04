@@ -1151,6 +1151,19 @@ async fn full_skill_assembly_reaches_native_request_without_eval_answers_and_bin
     let again = a.bind(&mut s, &original, &[]).unwrap();
     assert_eq!(bound.user_message, again.user_message);
     let envelope: Value = serde_json::from_str(&bound.user_message).unwrap();
+    let system_section = envelope["context_sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["section"] == "system_contract")
+        .unwrap();
+    let system: Value = serde_json::from_str(system_section["content"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        system["native_system_profile_ref"]["digest"],
+        melissa_skill_context::digest(p.system_prompt_tr.as_bytes())
+    );
+    assert!(system.get("native_system_profile").is_none());
+    assert!(system.get("complete_native_tool_schemas").is_none());
     let sections = envelope["context_sections"]
         .as_array()
         .unwrap()

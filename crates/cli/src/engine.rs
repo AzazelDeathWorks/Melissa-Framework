@@ -235,11 +235,15 @@ impl ToolDispatcher for TaskTools {
                 ));
             }
             if call.name == "history_read" {
-                return melissa_model_gateway::context_compiler::read_history(
+                return melissa_model_gateway::context_compiler::read_history_scoped(
                     &self.store,
                     &ctx,
                     &call.arguments,
                     &cancel,
+                    &self
+                        .repo
+                        .source_visibility_digest()
+                        .map_err(|_| GatewayError::invalid("history source policy"))?,
                 );
             }
             if call.name == "submit_candidate" {
@@ -1104,7 +1108,14 @@ impl App {
                     "Başarısız/belirsiz uzman otomatik tekrar çalıştırılmaz.",
                 ));
             };
-            let mut gateway = gateway(store.connect()?, s, e, key.clone())?;
+            let mut gateway = gateway(store.connect()?, s, e, key.clone())?
+                .with_context_milestone(node.id.clone(), node.goal.clone())
+                .map_err(gw)?
+                .with_context_source_scope(
+                    self.source(&self.workspace(store, &t.task_id)?)?
+                        .source_visibility_digest()?,
+                )
+                .map_err(gw)?;
             let repo_tool = RepositoryDispatcher::new(
                 self.source(&self.workspace(store, &t.task_id)?)?,
                 store.connect()?,

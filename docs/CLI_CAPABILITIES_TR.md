@@ -170,6 +170,10 @@ bu geliştirmede çağrılmadı.
 
 ## Araç kullanımı
 
+Her model isteği için güncel hedef/adım ve araç geçmişi yeniden hazırlanır.
+Uzun gözlemler tam kayıt bağlantılarıyla kısaltılabilir; çıktı/düşünme ayarları
+değişmez. Ayrıntılar ve destek sınırları: [bağlam yönetimi](CONTEXT_TR.md).
+
 Model araçları yalnız ilgili uzman/görev kapsamıyla sunulur. `context_script`
 tanımı kullanılabilir scriptlerin gerçek girdi şemalarını içerir. Native
 `inspect_environment`, `build_symbol_index`, `generate_patch_preview` ve

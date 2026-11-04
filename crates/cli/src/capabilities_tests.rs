@@ -597,6 +597,31 @@ async fn native_cli_semantics_tests_helper_and_result_paging() {
     let mut d = f.development(); // A fresh dispatcher recovers authenticated pages.
     let page=f.call(&mut d,"code_result_page",json!({"artifact_id":"inv-lsp-definition:semantic-service-result","offset":0,"max_bytes":65536}),"semantic-page").await;
     assert!(page.success, "{}", page.content);
+    let sdk_tests = f
+        .call(
+            &mut d,
+            "code_project_tests",
+            serde_json::to_value(melissa_build_test::tools::CodeOperation::Procedure {
+                language: melissa_build_test::full::Language::Python,
+                operation: melissa_build_test::full::Operation::Test {
+                    suite: melissa_build_test::full::TestSuite::UnitIntegration,
+                    repetitions: 1,
+                },
+                harness: None,
+            })
+            .unwrap(),
+            "normalized-sdk-tests",
+        )
+        .await;
+    assert!(sdk_tests.success, "{}", sdk_tests.content);
+    let normalized =
+        melissa_model_gateway::observations::normalize("code_project_tests", &sdk_tests.content)
+            .unwrap();
+    assert_eq!(normalized["status"], "passed");
+    assert!(normalized["passed_count"].as_u64().unwrap() > 0);
+    assert_eq!(normalized["failed_count"], 0);
+    assert_eq!(normalized["protected_acceptance"], false);
+    assert_eq!(normalized["host_source_current"], true);
     let mut context = f.context();
     let tested = f
         .call(
