@@ -13,6 +13,7 @@ pub mod engine;
 pub mod preparation;
 pub mod project_memory;
 pub mod recipe;
+mod repository_signals;
 pub mod resources;
 pub mod settings;
 pub mod views;

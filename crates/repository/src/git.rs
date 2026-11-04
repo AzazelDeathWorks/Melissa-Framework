@@ -21,6 +21,9 @@ pub enum GitOperation {
     Log {
         max_entries: u16,
     },
+    LogPaths {
+        max_entries: u16,
+    },
     WorktreeList,
     /// Destination is inside this task's private Linux workspace. The source
     /// remains untouched. The resulting worktree is quarantined worker output.
@@ -169,6 +172,23 @@ impl GitPlan {
                     "log".into(),
                     "--no-show-signature".into(),
                     "--format=%H%x00%P%x00%s%x00".into(),
+                    format!("--max-count={max_entries}"),
+                    "--".into(),
+                ]);
+            }
+            GitOperation::LogPaths { max_entries } => {
+                if *max_entries == 0 || *max_entries > 1000 {
+                    return Err(Error::Invalid("Git log count"));
+                }
+                argv.extend([
+                    "log".into(),
+                    "--no-show-signature".into(),
+                    "--format=".into(),
+                    "--name-only".into(),
+                    "-z".into(),
+                    "--no-renames".into(),
+                    "--no-ext-diff".into(),
+                    "--no-textconv".into(),
                     format!("--max-count={max_entries}"),
                     "--".into(),
                 ]);

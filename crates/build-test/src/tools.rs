@@ -62,7 +62,8 @@ impl CodeOperation {
             Self::Git { operation } => match operation {
                 melissa_repository::git::GitOperation::Status => "git.status",
                 melissa_repository::git::GitOperation::Diff { .. } => "git.diff",
-                melissa_repository::git::GitOperation::Log { .. } => "git.log",
+                melissa_repository::git::GitOperation::Log { .. }
+                | melissa_repository::git::GitOperation::LogPaths { .. } => "git.log",
                 _ => "git.worktree",
             },
             Self::Procedure { operation, .. } => match operation {

@@ -7,6 +7,7 @@ pub mod assembly;
 pub mod build_cache;
 pub mod context;
 pub mod durable;
+mod graph_view;
 pub mod package;
 pub mod release;
 mod repository_index;

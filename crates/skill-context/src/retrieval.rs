@@ -134,9 +134,13 @@ pub struct Hit {
     pub start_byte: usize,
     pub end_byte: usize,
     pub start_line: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<usize>,
     pub lexical_rank: Option<usize>,
     pub graph_match: bool,
     pub authority: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signals: Vec<String>,
 }
 
 pub(crate) fn query_terms(query: &str) -> Vec<&str> {
@@ -199,9 +203,11 @@ pub(crate) fn make_hit(
             .filter(|&&b| b == b'\n')
             .count()
             + 1,
+        end_line: None,
         lexical_rank,
         graph_match,
         authority: "untrusted_data".into(),
+        signals: vec![],
     }
 }
 

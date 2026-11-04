@@ -35,6 +35,31 @@ oturum içinde çalışır. Bozuk veya eşleşmeyen kopya güncel kaynaklardan y
 oluşturulur. İndeks, görev kayıtlarından ayrı ve yeniden üretilebilir bir
 önbellektir.
 
+### Semboller ve ilgili satırlar
+
+`context_script` içindeki `dependency_graph` çağrısı dosyaları, tanımları,
+importları, çağrı ve referans adaylarını gösterir. İsteğe bağlı `path`,
+`symbol`, `limit`, `node_offset` ve `edge_offset` alanları görünümü daraltır.
+Bir `patch` verildiğinde güncel dosya kimliği, özet ve beklenen baytlar
+doğrulanır. Önerilen değişiklik bellek içinde incelenir ve etkilenen tanımlar
+önceki ve önerilen metin için ayrı gösterilir.
+
+Rust, Python, JavaScript, TypeScript ve TSX için konumlar gerçek gramerlerden
+gelir. Basit yerel importlar görünür dosyalarla eşleştirilir. Dinamik çağrılar,
+takma adlar ve derleyiciye özgü çözümleme için semantik araçlar gerekir.
+Grafik adayları, desteklenmeyen dosyaları ve kısmi ayrıştırmaları açıkça belirtir.
+
+`context_search`, BM25, dosya adı ve yolu, semboller, çağrı adayları, testler
+ve bağımlılıkları birleştirir. Başarılı `code_git` diff ve `log_paths`
+gözlemleri ile güncel kaynakla eşleşen SDK tanıları sıralamaya katkı verebilir.
+Sonuçtaki `signals` alanı kullanılan katkıları, satır ve bayt alanları
+alıntının doğrulanmış konumunu gösterir.
+
+İsteğe bağlı `max_bytes` ve `max_tokens`, kaynak bilgileri dahil serileştirilmiş
+`data` dizisini sınırlar. Token seçeneğinde UTF-8 bayt sayısı muhafazakâr üst
+sınır olarak kullanılır. Küçük bütçelerde alıntı daralır veya sonuç sayısı
+azalır.
+
 ## Boyut hesabı ve zorunlu içerik
 
 Sistem/uzman talimatları, görev/skill/kullanıcı girdisi, güncel hedef, araç

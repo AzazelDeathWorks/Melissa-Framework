@@ -23,7 +23,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
     pin::Pin,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 pub fn limits() -> ContainerLimits {
@@ -348,7 +351,7 @@ impl ToolDispatcher for DevelopmentTools {
         if self.tools.contains("git.status")
             && self.task.allowed_effects.iter().any(|e| e == "git.read")
         {
-            d.push(BoundTool{canonical_id:"git.status".into(),definition:ToolDefinition{name:"code_git".into(),description:"Scoped Git on a captured private copy: status, diff(staged), log(max_entries 1..1000), worktree_list, worktree_create(name, exact commit). No commit/push/host changes, hooks or credentials. Worktree creation needs explicit role/write authority; output is a quarantined artifact. Re-captures source and metadata on each call.".into(),parameters:json!({"type":"object","properties":{"operation":{"type":"string","enum":["status","diff","log","worktree_list","worktree_create"]},"staged":{"type":"boolean"},"max_entries":{"type":"integer","minimum":1,"maximum":1000},"name":{"type":"string"},"commit":{"type":"string"}},"required":["operation"],"additionalProperties":false}),strict:false}});
+            d.push(BoundTool{canonical_id:"git.status".into(),definition:ToolDefinition{name:"code_git".into(),description:"Scoped Git on a captured private copy: status, diff(staged), log(max_entries 1..1000), log_paths(max_entries 1..1000; records ranking evidence), worktree_list, worktree_create(name, exact commit). No commit/push/host changes, hooks or credentials. Worktree creation needs explicit role/write authority; output is a quarantined artifact. Re-captures source and metadata on each call.".into(),parameters:json!({"type":"object","properties":{"operation":{"type":"string","enum":["status","diff","log","log_paths","worktree_list","worktree_create"]},"staged":{"type":"boolean"},"max_entries":{"type":"integer","minimum":1,"maximum":1000},"name":{"type":"string"},"commit":{"type":"string"}},"required":["operation"],"additionalProperties":false}),strict:false}});
         }
         if self.tools.contains("code.references") {
             d.push(BoundTool{canonical_id:"code.references".into(),definition:ToolDefinition{name:"code_semantic".into(),description:"Real rust-analyzer/TypeScript/Pyright query over the current isolated source. Zero-based UTF-16 line/character. No build scripts; does not claim syntactic matches are semantic references.".into(),parameters:json!({"type":"object","properties":{"method":{"type":"string","enum":["definition","references","symbols","diagnostics","hover"]},"path":{"type":"string"},"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0}},"required":["method","path","line","character"],"additionalProperties":false}),strict:false}});
@@ -501,6 +504,7 @@ pub struct CheckedEdits {
     pub task: String,
     pub checker: Option<CodeDispatcher>,
     pub language: Language,
+    pub context: Option<Arc<Mutex<melissa_skill_context::runtime::ContextRuntime>>>,
 }
 impl ToolDispatcher for CheckedEdits {
     fn definitions(&self) -> Vec<BoundTool> {
@@ -522,7 +526,36 @@ impl ToolDispatcher for CheckedEdits {
                 "fs_patch" | "fs_create" | "fs_delete" | "fs_move"
             );
             let id = c.id.clone();
+            let name = c.name.clone();
+            let git_snapshot = if self.context.is_some()
+                && name == "code_git"
+                && melissa_model_gateway::strict_json(&c.arguments)
+                    .ok()
+                    .is_some_and(|v| matches!(v["operation"].as_str(), Some("diff" | "log_paths")))
+            {
+                self.inner.validate_call(&c)?;
+                self.repo.snapshot(&cancel).ok().map(|s| s.digest)
+            } else {
+                None
+            };
             let mut out = self.inner.execute(c, ctx.clone(), cancel.clone()).await?;
+            if let Some(context) = &self.context
+                && !out.cancelled
+                && !out.requires_reconciliation
+                && !cancel.load(Ordering::Acquire)
+                && !out.artifact_refs.is_empty()
+                && let Some(hint) =
+                    crate::repository_signals::observe(&name, &out.content, git_snapshot.as_deref())
+                && (git_snapshot.is_none()
+                    || (out.success
+                        && self
+                            .repo
+                            .snapshot(&cancel)
+                            .is_ok_and(|s| s.digest == hint.snapshot)))
+                && let Ok(mut context) = context.lock()
+            {
+                let _ = context.record_repository_hints(hint.kind, hint.snapshot, hint.paths);
+            }
             if !edit || !out.success || out.requires_reconciliation || out.cancelled {
                 return Ok(out);
             }
@@ -561,7 +594,7 @@ impl ToolDispatcher for CheckedEdits {
                             arguments: serde_json::to_string(&op).unwrap(),
                         },
                         child,
-                        cancel,
+                        cancel.clone(),
                     )
                     .await
                 {
@@ -601,7 +634,19 @@ impl ToolDispatcher for CheckedEdits {
                 Ok(artifact)
             })();
             match receipt {
-                Ok(artifact) => out.artifact_refs.push(artifact),
+                Ok(artifact) => {
+                    out.artifact_refs.push(artifact);
+                    if !out.cancelled
+                        && !out.requires_reconciliation
+                        && !cancel.load(Ordering::Acquire)
+                        && let Some(context) = &self.context
+                        && let Some(hint) = crate::repository_signals::after_edit(&check)
+                        && let Ok(mut context) = context.lock()
+                    {
+                        let _ =
+                            context.record_repository_hints(hint.kind, hint.snapshot, hint.paths);
+                    }
+                }
                 Err(_) => {
                     // The edit already happened even when its diagnostic receipt cannot be saved.
                     out.requires_reconciliation = true;

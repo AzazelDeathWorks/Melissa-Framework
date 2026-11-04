@@ -201,7 +201,7 @@ impl NativeBuildPlan {
                     .is_some_and(|a| !a.is_empty()),
             "no native compiler artifacts",
         )?;
-        let files = archive::inspect_ustar(&report.archive, repo.limits())
+        let files = archive::inspect_ustar_cancellable(&report.archive, repo.limits(), cancel)
             .map_err(|e| Error(e.to_string()))?;
         let mut output = BTreeMap::new();
         for f in files {

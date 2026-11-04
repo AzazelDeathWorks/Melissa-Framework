@@ -209,23 +209,45 @@ impl Repository {
         pin: &mut Pinned,
         path: &str,
     ) -> Result<(FileVersion, Vec<u8>)> {
+        self.read_locked_with_cancel(pin, path, None)
+    }
+
+    fn read_locked_with_cancel(
+        &self,
+        pin: &mut Pinned,
+        path: &str,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(FileVersion, Vec<u8>)> {
         self.check_path(path)?;
         if pin.file.metadata()?.len() > self.limits.max_file_bytes {
             return Err(Error::Quota("file bytes"));
         }
         pin.file.seek(SeekFrom::Start(0))?;
         let mut bytes = Vec::new();
-        pin.file
-            .by_ref()
-            .take(self.limits.max_file_bytes + 1)
-            .read_to_end(&mut bytes)?;
+        let mut bounded = pin.file.by_ref().take(self.limits.max_file_bytes + 1);
+        let content_digest = if let Some(cancel) = cancel {
+            let mut hash = blake3::Hasher::new();
+            loop {
+                check_cancel(cancel)?;
+                let start = bytes.len();
+                let count = bounded.by_ref().take(64 * 1024).read_to_end(&mut bytes)?;
+                if count == 0 {
+                    break;
+                }
+                hash.update(&bytes[start..]);
+            }
+            format!("blake3:{}", hash.finalize().to_hex())
+        } else {
+            bounded.read_to_end(&mut bytes)?;
+            digest(&bytes)
+        };
         if bytes.len() as u64 > self.limits.max_file_bytes {
             return Err(Error::Quota("file bytes"));
         }
         let version = FileVersion {
             path: path.into(),
             identity: pin.identity.clone(),
-            digest: digest(&bytes),
+            digest: content_digest,
             bytes: bytes.len() as u64,
         };
         Ok((version, bytes))
@@ -234,9 +256,19 @@ impl Repository {
         let mut file = self.lock(path, false)?;
         self.read_locked(&mut file, path)
     }
+
+    pub fn read_cancellable(
+        &self,
+        path: &str,
+        cancel: &AtomicBool,
+    ) -> Result<(FileVersion, Vec<u8>)> {
+        check_cancel(cancel)?;
+        self.read_locked_with_cancel(&mut self.lock(path, false)?, path, Some(cancel))
+    }
     pub fn snapshot(&self, cancel: &AtomicBool) -> Result<RepositorySnapshot> {
         self.capture(cancel, |path, pin| {
-            self.read_locked(pin, path).map(|(version, _)| version)
+            self.read_locked_with_cancel(pin, path, Some(cancel))
+                .map(|(version, _)| version)
         })
     }
 
@@ -266,7 +298,7 @@ impl Repository {
         let mut bytes_read = 0u64;
         let snapshot = self.capture(cancel, |path, pin| {
             let old = previous.get(path);
-            let (file, content) = self.observe_index_file(path, pin, stamp(pin), old)?;
+            let (file, content) = self.observe_index_file(path, pin, stamp(pin), old, cancel)?;
             if let Some(content) = content {
                 bytes_read += file.version.bytes;
                 if old.is_none_or(|old| old.version.digest != file.version.digest) {
@@ -290,7 +322,7 @@ impl Repository {
             // observed tree, reusing the fresh file receipts where possible.
             let confirmed = self.capture(cancel, |path, pin| {
                 let (file, content) =
-                    self.observe_index_file(path, pin, stamp(pin), files.get(path))?;
+                    self.observe_index_file(path, pin, stamp(pin), files.get(path), cancel)?;
                 if content.is_some() {
                     bytes_read += file.version.bytes;
                 }
@@ -318,6 +350,7 @@ impl Repository {
         pin: &mut Pinned,
         journal_stamp: Option<(u64, i64)>,
         old: Option<&IndexedFileVersion>,
+        cancel: &AtomicBool,
     ) -> Result<(IndexedFileVersion, Option<Vec<u8>>)> {
         let bytes = pin.file.metadata()?.len();
         if bytes > self.limits.max_file_bytes {
@@ -332,7 +365,7 @@ impl Repository {
         {
             return Ok((old.clone(), None));
         }
-        let (version, content) = self.read_locked(pin, path)?;
+        let (version, content) = self.read_locked_with_cancel(pin, path, Some(cancel))?;
         Ok((
             IndexedFileVersion {
                 version,
@@ -488,17 +521,24 @@ impl Repository {
         // Linear-time substring search; comparing every window cost
         // file size x needle length (up to 64 KiB) with no cancel point.
         let finder = memchr::memmem::Finder::new(needle);
+        let prefix = overlap_table(needle);
+        let periodic = needle.len() >= 64 && prefix[needle.len() - 1] >= needle.len() / 2;
         let match_lines = memchr::memchr_iter(b'\n', needle).count();
         for observed in &snapshot.files {
             check_cancel(cancel)?;
-            let (version, bytes) = self.read(&observed.path)?;
+            let (version, bytes) = self.read_cancellable(&observed.path, cancel)?;
             if version != *observed {
                 return Err(Error::Stale("search file changed"));
             }
             let text = std::str::from_utf8(&bytes).ok();
             let (mut start, mut line, mut counted) = (0, 1, 0);
+            let mut overlap = OverlapCursor::default();
             // Restart one byte past each hit so overlapping matches are kept.
-            while let Some(pos) = find_chunked(&bytes, start, &finder, needle.len(), cancel)? {
+            while let Some(pos) = if periodic {
+                overlap.find(&bytes, needle, &prefix, cancel)?
+            } else {
+                find_chunked(&bytes, start, &finder, needle.len(), cancel)?
+            } {
                 check_cancel(cancel)?;
                 if hits.len() == self.limits.max_search_hits {
                     truncated = true;
@@ -541,6 +581,53 @@ impl Repository {
     }
 }
 
+fn overlap_table(needle: &[u8]) -> Vec<usize> {
+    let mut table = vec![0; needle.len()];
+    let mut count = 0;
+    for i in 1..needle.len() {
+        count = overlap_step(needle, &table, count, needle[i]);
+        table[i] = count;
+    }
+    table
+}
+
+fn overlap_step(needle: &[u8], table: &[usize], mut count: usize, byte: u8) -> usize {
+    while count > 0 && needle[count] != byte {
+        count = table[count - 1];
+    }
+    count + usize::from(needle[count] == byte)
+}
+
+#[derive(Default)]
+struct OverlapCursor {
+    next: usize,
+    matched: usize,
+}
+
+impl OverlapCursor {
+    fn find(
+        &mut self,
+        bytes: &[u8],
+        needle: &[u8],
+        table: &[usize],
+        cancel: &AtomicBool,
+    ) -> Result<Option<usize>> {
+        check_cancel(cancel)?;
+        while let Some(&byte) = bytes.get(self.next) {
+            if self.next.is_multiple_of(16 * 1024) {
+                check_cancel(cancel)?;
+            }
+            self.matched = overlap_step(needle, table, self.matched, byte);
+            self.next += 1;
+            if self.matched == needle.len() {
+                self.matched = table[self.matched - 1];
+                return Ok(Some(self.next - needle.len()));
+            }
+        }
+        Ok(None)
+    }
+}
+
 fn find_chunked(
     bytes: &[u8],
     start: usize,
@@ -568,6 +655,32 @@ fn find_chunked(
 #[cfg(test)]
 mod search_tests {
     use super::*;
+    #[test]
+    fn periodic_overlap_cursor_matches_literal_positions_without_losing_cancellation() {
+        let needle = b"ab".repeat(100);
+        let bytes = b"x"
+            .iter()
+            .copied()
+            .chain(b"ab".repeat(4000))
+            .collect::<Vec<_>>();
+        let expected: Vec<_> = bytes
+            .windows(needle.len())
+            .enumerate()
+            .filter_map(|(i, chunk)| (chunk == needle).then_some(i))
+            .collect();
+        let cancel = AtomicBool::new(false);
+        let prefix = overlap_table(&needle);
+        let mut cursor = OverlapCursor::default();
+        let mut actual = Vec::new();
+        while let Some(pos) = cursor.find(&bytes, &needle, &prefix, &cancel).unwrap() {
+            actual.push(pos);
+        }
+        assert_eq!(actual, expected);
+        assert!(matches!(
+            cursor.find(&bytes, &needle, &prefix, &AtomicBool::new(true)),
+            Err(Error::Cancelled)
+        ));
+    }
     #[test]
     fn chunk_boundaries_overlaps_and_cancellation_preserve_literal_search() {
         let cancel = AtomicBool::new(false);

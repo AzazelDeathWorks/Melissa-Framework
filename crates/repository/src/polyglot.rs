@@ -128,6 +128,7 @@ pub struct FileSyntax {
     pub symbols: Vec<SyntaxSymbol>,
     pub syntax_error: bool,
     pub nodes: usize,
+    pub graph: Option<crate::graph::FileFacts>,
 }
 
 pub const MAX_SYNTAX_NODES: usize = 1_000_000;
@@ -137,6 +138,25 @@ pub fn parse_file(
     bytes: &[u8],
     cancel: &AtomicBool,
     node_budget: usize,
+) -> Result<Option<FileSyntax>> {
+    parse(file, bytes, cancel, node_budget, false)
+}
+
+pub fn parse_index_file(
+    file: &crate::FileVersion,
+    bytes: &[u8],
+    cancel: &AtomicBool,
+    node_budget: usize,
+) -> Result<Option<FileSyntax>> {
+    parse(file, bytes, cancel, node_budget, true)
+}
+
+fn parse(
+    file: &crate::FileVersion,
+    bytes: &[u8],
+    cancel: &AtomicBool,
+    node_budget: usize,
+    index_graph: bool,
 ) -> Result<Option<FileSyntax>> {
     let Some(lang) = language(&file.path) else {
         return Ok(None);
@@ -172,8 +192,10 @@ pub fn parse_file(
         .ok_or(Error::Quota("syntax deadline"))?;
     let mut nodes = 0;
     let mut symbols = Vec::new();
-    let mut stack = vec![tree.root_node()];
-    while let Some(node) = stack.pop() {
+    let mut graph =
+        index_graph.then(|| crate::graph::FileFacts::new(lang, tree.root_node().has_error()));
+    let mut stack = vec![(tree.root_node(), None)];
+    while let Some((node, mut owner)) = stack.pop() {
         check_cancel(cancel)?;
         nodes += 1;
         if nodes > node_budget {
@@ -217,10 +239,16 @@ pub fn parse_file(
                 line: pos.row,
                 utf16_column: col,
             });
+            if let Some(graph) = &mut graph {
+                owner = graph.definition(file, node, name, text, bytes).or(owner);
+            }
+        }
+        if let Some(graph) = &mut graph {
+            graph.observe(node, owner, bytes);
         }
         for i in (0..node.named_child_count()).rev() {
             if let Some(child) = node.named_child(i as u32) {
-                stack.push(child);
+                stack.push((child, owner));
             }
         }
     }
@@ -228,5 +256,6 @@ pub fn parse_file(
         symbols,
         syntax_error: tree.root_node().has_error(),
         nodes,
+        graph,
     }))
 }
