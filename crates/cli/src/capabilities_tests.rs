@@ -1312,3 +1312,29 @@ fn adaptive_readonly_review_has_independent_source_analysis_without_writes() {
         json!([])
     );
 }
+
+#[test]
+fn adaptive_test_authoring_keeps_a_writer_and_a_separate_readonly_verifier() {
+    let f = Fixture::new("melissa.code.implementer");
+    let v = f
+        .app
+        .prepare(
+            &f.source,
+            "main.py add a test helper",
+            &f._temp.path().join("tests-plan.json"),
+            None,
+        )
+        .unwrap();
+    let agents = v["preparation"]["recipe"]["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 3);
+    assert_eq!(agents[0]["profile"], "melissa.code.test-engineer");
+    assert_eq!(agents[0]["write"], true);
+    assert_eq!(agents[1]["profile"], "melissa.code.test-engineer");
+    assert_eq!(agents[1]["write"], false);
+    assert_eq!(agents[2]["profile"], "melissa.code.reviewer");
+    assert_eq!(agents[2]["write"], false);
+    assert_eq!(
+        v["preparation"]["recipe"]["writable_paths"],
+        json!(["main.py"])
+    );
+}

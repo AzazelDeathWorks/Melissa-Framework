@@ -150,12 +150,17 @@ impl App {
         let catalog = crate::resources::catalog()?;
         let profiles = melissa_workflow::adaptive::specialists(&signals, role, &catalog)
             .map_err(|_| Error::Denied("Göreve uygun çalıştırılabilir uzman bulunamadı."))?;
-        let agents = profiles.into_iter().map(|profile| {
+        let last_test = profiles
+            .iter()
+            .rposition(|p| p == "melissa.code.test-engineer");
+        let agents = profiles.into_iter().enumerate().map(|(index,profile)| {
             let can_write = write && !writable.is_empty()
-                && !matches!(profile.as_str(), "melissa.code.repository-analyst" | "melissa.code.reviewer" | "melissa.code.security-reviewer" | "melissa.code.architect" | "melissa.code.test-engineer");
+                && !matches!(profile.as_str(), "melissa.code.repository-analyst" | "melissa.code.reviewer" | "melissa.code.security-reviewer" | "melissa.code.architect")
+                && Some(index) != last_test;
             let purpose = match profile.as_str() {
                 "melissa.code.repository-analyst" => "Identify affected source, dependencies and evidence",
                 "melissa.code.architect" => "Design a scoped change and explicit verification milestones",
+                "melissa.code.test-engineer" if can_write => "Design and implement tests within the approved writable scope, retaining baseline failure evidence",
                 "melissa.code.test-engineer" => "Execute authorized tests and retain diagnostics with source versions",
                 "melissa.code.reviewer" => "Independently review the final source, changes and recorded tests",
                 "melissa.code.security-reviewer" => "Review authorization boundaries and security consequences",

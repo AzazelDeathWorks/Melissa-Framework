@@ -80,7 +80,7 @@ pub fn specialists(s: &Signals, primary: &str, catalog: &Catalog) -> Result<Vec<
     if s.compiler_failure && primary != "debugger" {
         roles.push("debugger");
     }
-    if primary != "reviewer" && primary != "test-engineer" {
+    if primary != "reviewer" {
         roles.push(primary);
     }
     if primary == "debugger" {
@@ -108,7 +108,8 @@ pub fn specialists(s: &Signals, primary: &str, catalog: &Catalog) -> Result<Vec<
             Kind::Authority,
             "specialist cannot publish evidence",
         )?;
-        if !result.contains(&id) {
+        if !result.contains(&id) || (primary == "test-engineer" && role == "test-engineer") {
+            // Authoring tests and independently checking them are separate serial runs.
             result.push(id);
         }
     }
