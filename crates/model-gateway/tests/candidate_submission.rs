@@ -1,6 +1,15 @@
 #![allow(dead_code, unused_imports)]
 //! Native loopback protocol/regression; no live service or private oracle.
 include!("../../workflow/tests/common/gateway.rs");
+
+fn submission_policy() -> GatewayPolicy {
+    // These tests exercise candidate handling across persisted loopback turns.
+    // Slow shared runners can spend several seconds in fixture storage alone.
+    let mut policy = policy();
+    policy.max_wall_time_ms = 30_000;
+    policy.expires_at_unix_ms = melissa_execution_broker::unix_ms().unwrap() + 60_000;
+    policy
+}
 fn output() -> Value {
     json!({"type":"object","properties":{"value":{"type":"integer"}},"required":["value"],"additionalProperties":false})
 }
@@ -121,10 +130,14 @@ async fn intelligent_native_loop_rebuilds_each_turn_and_sends_output_schema_once
         .unwrap()
         .with_counter(Box::new(FixtureNativeCounter))
         .unwrap();
-    let mut g = gateway(store(&dir.path().join("store"), 1_000_000), &http, policy())
-        .with_native_context_compiler(compiler)
-        .with_candidate_submission_tool("submit_result")
-        .unwrap();
+    let mut g = gateway(
+        store(&dir.path().join("store"), 1_000_000),
+        &http,
+        submission_policy(),
+    )
+    .with_native_context_compiler(compiler)
+    .with_candidate_submission_tool("submit_result")
+    .unwrap();
     let mut sink = ExactSink(Sink::new());
     let mut s = typed("smart-candidate");
     s.required_tool_names = BTreeSet::from(["source".into(), "submit_result".into()]);
@@ -181,14 +194,18 @@ async fn intelligent_native_loop_rebuilds_each_turn_and_sends_output_schema_once
 async fn intelligent_schema_mismatch_rejects_before_http_and_budget_reservation() {
     let dir = tempfile::tempdir().unwrap();
     let http = http_fixture(vec![]).await;
-    let mut g = gateway(store(&dir.path().join("s"), 1_000_000), &http, policy())
-        .with_native_context_compiler(
-            melissa_model_gateway::context_compiler::ContextCompiler::default()
-                .with_intelligence(Default::default())
-                .unwrap(),
-        )
-        .with_candidate_submission_tool("submit_result")
-        .unwrap();
+    let mut g = gateway(
+        store(&dir.path().join("s"), 1_000_000),
+        &http,
+        submission_policy(),
+    )
+    .with_native_context_compiler(
+        melissa_model_gateway::context_compiler::ContextCompiler::default()
+            .with_intelligence(Default::default())
+            .unwrap(),
+    )
+    .with_candidate_submission_tool("submit_result")
+    .unwrap();
     assert!(
         g.run(
             &typed("mismatch"),
@@ -211,9 +228,13 @@ async fn typed_submission_finishes_after_one_owned_call_preserving_original_argu
         args,
     )]))])
     .await;
-    let mut gateway = gateway(store(&dir.path().join("s"), 1000000), &http, policy())
-        .with_candidate_submission_tool("submit_result")
-        .unwrap();
+    let mut gateway = gateway(
+        store(&dir.path().join("s"), 1000000),
+        &http,
+        submission_policy(),
+    )
+    .with_candidate_submission_tool("submit_result")
+    .unwrap();
     let mut sink = Sink::new();
     let r = gateway
         .run(
@@ -246,7 +267,11 @@ async fn legacy_default_never_turns_a_tool_call_into_a_final_answer() {
         HttpPlan::sse(text_response("{\"value\":2}", false, true)),
     ])
     .await;
-    let mut gateway = gateway(store(&dir.path().join("s"), 1000000), &http, policy());
+    let mut gateway = gateway(
+        store(&dir.path().join("s"), 1000000),
+        &http,
+        submission_policy(),
+    );
     let mut sink = Sink::new();
     let r = gateway
         .run(
@@ -278,9 +303,13 @@ async fn prior_success_and_exact_output_schema_are_enforced_before_submission_ef
         HttpPlan::sse(tool_response(&[("good", "submit_result", "{\"value\":3}")])),
     ])
     .await;
-    let mut gateway = gateway(store(&dir.path().join("s"), 1000000), &http, policy())
-        .with_candidate_submission_tool("submit_result")
-        .unwrap();
+    let mut gateway = gateway(
+        store(&dir.path().join("s"), 1000000),
+        &http,
+        submission_policy(),
+    )
+    .with_candidate_submission_tool("submit_result")
+    .unwrap();
     let mut sink = Sink::new();
     let mut s = typed("typed_requirements");
     s.required_tool_names = BTreeSet::from(["source".into(), "submit_result".into()]);
@@ -307,9 +336,13 @@ async fn a_submission_batch_cannot_execute_any_peer_effect() {
         HttpPlan::sse(tool_response(&[("good", "submit_result", "{\"value\":2}")])),
     ])
     .await;
-    let mut gateway = gateway(store(&dir.path().join("s"), 1000000), &http, policy())
-        .with_candidate_submission_tool("submit_result")
-        .unwrap();
+    let mut gateway = gateway(
+        store(&dir.path().join("s"), 1000000),
+        &http,
+        submission_policy(),
+    )
+    .with_candidate_submission_tool("submit_result")
+    .unwrap();
     let mut sink = Sink::new();
     let r = gateway
         .run(
@@ -333,9 +366,13 @@ async fn missing_schema_or_tool_never_dispatches_and_opt_in_text_cannot_finalize
             true,
         ))])
         .await;
-        let mut gateway = gateway(store(&dir.path().join("s"), 1000000), &http, policy())
-            .with_candidate_submission_tool("submit_result")
-            .unwrap();
+        let mut gateway = gateway(
+            store(&dir.path().join("s"), 1000000),
+            &http,
+            submission_policy(),
+        )
+        .with_candidate_submission_tool("submit_result")
+        .unwrap();
         let mut sink = Sink::new();
         let mut s = typed("typed_missing");
         if mode == "schema" {
@@ -366,9 +403,13 @@ async fn cancellation_after_submission_observation_never_accepts_a_candidate() {
         "{\"value\":1}",
     )]))])
     .await;
-    let mut gateway = gateway(store(&dir.path().join("s"), 1000000), &http, policy())
-        .with_candidate_submission_tool("submit_result")
-        .unwrap();
+    let mut gateway = gateway(
+        store(&dir.path().join("s"), 1000000),
+        &http,
+        submission_policy(),
+    )
+    .with_candidate_submission_tool("submit_result")
+    .unwrap();
     let mut sink = Sink::new();
     sink.cancel_on_submit = true;
     let r = gateway
