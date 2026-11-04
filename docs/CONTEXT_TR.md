@@ -20,6 +20,21 @@ da, hata ve kaynak durumunu koruyan kısmi bir görünüme dönüştürülebilir
 Gözlem görünümü için varsayılan byte hedefi 16 KiB'dir. Bunlar modelin yanıt
 veya düşünme token sınırları değildir; bu ayarlar değiştirilmez.
 
+## Kalıcı depo araması
+
+`context_search`, çalışma alanı için şifreli bir FTS5 indeksi tutar. Aynı
+çalışma alanındaki yeni görev, kaynak görünürlüğü ve indeks sürümü eşleştiğinde
+indeksi yeniden açar. Görünür dosya listesi güncel tutulur. Kullanılabilir bir
+Windows değişiklik günlüğü değişmediği doğrulanan dosyaların içeriğini tekrar
+okumayı önler. Günlük kullanılamadığında dosya özetleri içerikten hesaplanır.
+Değişen dosyalar yeniden indekslenir, kaldırılanlar aramadan çıkarılır ve
+sonuç alıntıları güncel dosya içeriğiyle doğrulanır.
+
+Kalıcı kopya çalışma alanı başına 64 MiB ile sınırlıdır. Bu sınırı aşan indeks
+oturum içinde çalışır. Bozuk veya eşleşmeyen kopya güncel kaynaklardan yeniden
+oluşturulur. İndeks, görev kayıtlarından ayrı ve yeniden üretilebilir bir
+önbellektir.
+
 ## Boyut hesabı ve zorunlu içerik
 
 Sistem/uzman talimatları, görev/skill/kullanıcı girdisi, güncel hedef, araç

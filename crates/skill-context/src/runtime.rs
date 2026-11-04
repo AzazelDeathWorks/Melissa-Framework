@@ -3,7 +3,7 @@
 use crate::{
     Error, Namespace, Result, digest, json,
     package::{Registry, SkillPolicy},
-    repository_index::{RepositoryIndex, SearchQuery},
+    repository_index::{Persistence, RepositoryIndex, Restore, SearchQuery},
     require,
     retrieval::{Domain, Hit, SearchScope, Source},
     scripts,
@@ -13,7 +13,7 @@ use melissa_core_contracts::{
     Module, TaskState, catalog::Catalog, design::SkillPin, validation::Validate,
 };
 use melissa_local_store::{
-    ArtifactRequest, LocalStore,
+    ArtifactRequest, LocalStore, RepositoryIndexCache,
     journal::{AdmissionRequest, AttemptState, InvocationRequest},
 };
 use melissa_model_gateway::{
@@ -171,6 +171,7 @@ pub struct ContextRuntime {
     source_inventory: Vec<Source>,
     repository_index: Option<RepositoryIndex>,
     index_binding: [u8; 32],
+    index_cache: RepositoryIndexCache,
     parse_cache: melissa_repository::polyglot::ParseCache,
     native_scripts: BTreeMap<String, NativeScriptRoute>,
     native_dispatcher: Option<Box<dyn ToolDispatcher>>,
@@ -194,6 +195,14 @@ pub struct MemoryAnchor {
     pub resource_id: String,
 }
 impl ContextRuntime {
+    /// The CLI supplies a workspace-scoped cache shared across task stores.
+    /// Other hosts can retain the default encrypted task-local cache.
+    pub fn with_repository_index_cache(mut self, cache: RepositoryIndexCache) -> Self {
+        self.index_cache = cache;
+        self.repository_index = None;
+        self
+    }
+
     /// Trusted host bridge to a project-scoped encrypted store. Model tools
     /// cannot import a book, accept a proposal, or choose its namespace.
     pub fn replace_memory_book(&mut self, book: MemoryBook) -> Result<()> {
@@ -243,6 +252,7 @@ impl ContextRuntime {
         }
         grant.namespace.validate()?;
         let index_binding = RepositoryIndex::binding(&repo, &grant.namespace, &grant.policy_epoch)?;
+        let index_cache = store.repository_index_cache();
         let mut host = Self {
             repo,
             store,
@@ -255,6 +265,7 @@ impl ContextRuntime {
             source_inventory: Vec::new(),
             repository_index: None,
             index_binding,
+            index_cache,
             parse_cache: Default::default(),
             native_scripts: BTreeMap::new(),
             native_dispatcher: None,
@@ -753,7 +764,7 @@ impl ContextRuntime {
             "artifact_cleanup" => {
                 self.state.cache = Cache::default();
                 self.parse_cache = Default::default();
-                self.store.clear_repository_index(&self.index_binding)?;
+                self.index_cache.clear(&self.index_binding)?;
                 self.repository_index = None;
                 self.state
                     .telemetry
@@ -816,39 +827,14 @@ impl ContextRuntime {
             "repository search cancelled",
         )?;
         if self.repository_index.is_none() {
-            let restored = self
-                .store
-                .load_repository_index(&self.index_binding)
-                .and_then(|data| {
-                    data.map(|bytes| {
-                        RepositoryIndex::restore(self.index_binding, &bytes).map_err(|_| {
-                            melissa_local_store::StoreError::Integrity(
-                                "derived repository index".into(),
-                            )
-                        })
-                    })
-                    .transpose()
-                });
-            self.repository_index = Some(match restored {
-                Ok(Some(index)) => {
-                    *self
-                        .state
-                        .telemetry
-                        .entry("index.restored".into())
-                        .or_default() += 1;
-                    index
-                }
-                other => {
-                    if other.is_err() {
-                        *self
-                            .state
-                            .telemetry
-                            .entry("index.restore_failed".into())
-                            .or_default() += 1;
-                    }
-                    RepositoryIndex::new(self.index_binding)?
-                }
-            });
+            let (index, restored) = RepositoryIndex::open(&self.index_cache, self.index_binding)?;
+            let counter = match restored {
+                Restore::Loaded => "index.restored",
+                Restore::Missing => "index.cold_start",
+                Restore::Invalid => "index.restore_failed",
+            };
+            *self.state.telemetry.entry(counter.into()).or_default() += 1;
+            self.repository_index = Some(index);
         }
         let index = self
             .repository_index
@@ -867,12 +853,14 @@ impl ContextRuntime {
             !cancel.load(Ordering::Acquire),
             "repository search cancelled",
         )?;
-        if index.persist(&self.store).is_err() {
-            *self
-                .state
-                .telemetry
-                .entry("index.persist_failed".into())
-                .or_default() += 1;
+        let counter = match index.persist(&self.index_cache) {
+            Ok(Persistence::Unchanged) => None,
+            Ok(Persistence::Saved) => Some("index.persisted"),
+            Ok(Persistence::Capacity) => Some("index.capacity_skipped"),
+            Err(_) => Some("index.persist_failed"),
+        };
+        if let Some(counter) = counter {
+            *self.state.telemetry.entry(counter.into()).or_default() += 1;
         }
         let now = melissa_execution_broker::unix_ms().map_err(|_| Error("clock".into()))?;
         let key = self.cache_key(

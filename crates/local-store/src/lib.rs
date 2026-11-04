@@ -17,7 +17,7 @@ mod service;
 pub use artifacts::{ArtifactMetadata, ArtifactRequest, GarbageCollection};
 pub use backup::{BackupBlob, BackupManifest};
 pub use crypto::StoreKey;
-pub use derived_index::MAX_INDEX_BYTES;
+pub use derived_index::{MAX_INDEX_BYTES, RepositoryIndexCache};
 pub use service::{LocalStore, StoreConfig};
 
 pub type StoreResult<T = ()> = Result<T, StoreError>;

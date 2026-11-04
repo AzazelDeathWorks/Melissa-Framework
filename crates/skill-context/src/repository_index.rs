@@ -4,7 +4,7 @@ use crate::{
     Error, Namespace, Result, require,
     retrieval::{Domain, Hit, SourceRef, make_hit, query_terms, ranked_rows, sql},
 };
-use melissa_local_store::{LocalStore, MAX_INDEX_BYTES};
+use melissa_local_store::{MAX_INDEX_BYTES, RepositoryIndexCache};
 use melissa_repository::{
     Repository,
     polyglot::{MAX_SYNTAX_NODES, parse_file},
@@ -38,6 +38,18 @@ pub(crate) struct Refresh {
     pub bytes_read: u64,
     pub indexed: u64,
     pub parsed: u64,
+}
+
+pub(crate) enum Persistence {
+    Unchanged,
+    Saved,
+    Capacity,
+}
+
+pub(crate) enum Restore {
+    Loaded,
+    Missing,
+    Invalid,
 }
 
 pub(crate) struct SearchQuery<'a> {
@@ -86,13 +98,27 @@ impl RepositoryIndex {
         })
     }
 
+    pub(crate) fn open(cache: &RepositoryIndexCache, binding: [u8; 32]) -> Result<(Self, Restore)> {
+        let state = match cache.load(&binding) {
+            Ok(Some(bytes)) => match Self::restore(binding, &bytes) {
+                Ok(index) => return Ok((index, Restore::Loaded)),
+                Err(_) => Restore::Invalid,
+            },
+            Ok(None) => Restore::Missing,
+            Err(_) => Restore::Invalid,
+        };
+        Ok((Self::new(binding)?, state))
+    }
+
     pub(crate) fn restore(binding: [u8; 32], bytes: &[u8]) -> Result<Self> {
         let prefix: [u8; 4] = bytes
             .get(..4)
             .ok_or_else(|| Error("short repository index header".into()))?
             .try_into()
             .expect("exact header length");
-        let end = 4 + u32::from_le_bytes(prefix) as usize;
+        let end = 4usize
+            .checked_add(u32::from_le_bytes(prefix) as usize)
+            .ok_or_else(|| Error("repository index header overflow".into()))?;
         require(
             end < bytes.len() && bytes.len() <= MAX_INDEX_BYTES,
             "repository index size",
@@ -112,9 +138,9 @@ impl RepositoryIndex {
         })
     }
 
-    pub(crate) fn persist(&mut self, store: &LocalStore) -> Result<()> {
+    pub(crate) fn persist(&mut self, cache: &RepositoryIndexCache) -> Result<Persistence> {
         if !self.dirty {
-            return Ok(());
+            return Ok(Persistence::Unchanged);
         }
         let meta = serde_json::to_vec(&self.files)?;
         let page_count: usize = self
@@ -128,18 +154,18 @@ impl RepositoryIndex {
         let size = 4usize
             .saturating_add(meta.len())
             .saturating_add(page_count.saturating_mul(page_size));
-        require(
-            size <= MAX_INDEX_BYTES,
-            "encrypted repository index capacity",
-        )?;
+        if size > MAX_INDEX_BYTES {
+            self.dirty = false;
+            return Ok(Persistence::Capacity);
+        }
         let image = self.db.serialize(MAIN_DB).map_err(sql)?;
         let mut bytes = Vec::with_capacity(size);
         bytes.extend_from_slice(&(meta.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&meta);
         bytes.extend_from_slice(&image);
-        store.save_repository_index(&self.binding, &bytes)?;
+        cache.save(&self.binding, &bytes)?;
         self.dirty = false;
-        Ok(())
+        Ok(Persistence::Saved)
     }
 
     pub(crate) fn refresh(&mut self, repo: &Repository, cancel: &AtomicBool) -> Result<Refresh> {
@@ -356,7 +382,7 @@ fn repo_error(error: melissa_repository::Error) -> Error {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
-    use melissa_local_store::{StoreConfig, StoreKey};
+    use melissa_local_store::StoreKey;
     use melissa_repository::Limits;
     use std::{
         fs::{self, FileTimes, OpenOptions},
@@ -381,7 +407,7 @@ mod tests {
         for dir in 0..16 {
             let folder = root.join(format!("src{dir}"));
             fs::create_dir(&folder).unwrap();
-            for file in 0..32 {
+            for file in 0..128 {
                 fs::write(folder.join(format!("{file}.txt")), &body).unwrap();
             }
         }
@@ -393,31 +419,39 @@ mod tests {
         let repo = Repository::open(&root, Limits::default(), vec!["private".into()]).unwrap();
         let key = StoreKey::generate().unwrap();
         let binding = RepositoryIndex::binding(&repo, &ns, "test").unwrap();
-        let store = LocalStore::open(&store_path, key.clone(), StoreConfig::default()).unwrap();
+        let cache = RepositoryIndexCache::open(&store_path, key.clone()).unwrap();
         let cancel = AtomicBool::new(false);
         let mut index = RepositoryIndex::new(binding).unwrap();
         let start = Instant::now();
         let cold = index.refresh(&repo, &cancel).unwrap();
         let cold_us = start.elapsed().as_micros();
-        assert_eq!((cold.indexed, cold.parsed), (514, 2));
+        assert_eq!((cold.indexed, cold.parsed), (2050, 2));
         assert!(!index.files.contains_key("private/blocked.py"));
         assert_eq!(cold.snapshot, repo.snapshot(&cancel).unwrap().digest);
-        index.persist(&store).unwrap();
-        drop(index);
-        drop(store);
-
-        let store = LocalStore::open(&store_path, key, StoreConfig::default()).unwrap();
         let start = Instant::now();
-        let mut index = RepositoryIndex::restore(
-            binding,
-            &store.load_repository_index(&binding).unwrap().unwrap(),
-        )
-        .unwrap();
+        assert!(matches!(index.persist(&cache).unwrap(), Persistence::Saved));
+        let cold_persist_us = start.elapsed().as_micros();
+        drop(index);
+        drop(cache);
+
+        let cache = RepositoryIndexCache::open(&store_path, key).unwrap();
+        let start = Instant::now();
+        let (mut index, restored) = RepositoryIndex::open(&cache, binding).unwrap();
+        assert!(matches!(restored, Restore::Loaded));
         let warm = index.refresh(&repo, &cancel).unwrap();
         let warm_us = start.elapsed().as_micros();
         assert_eq!((warm.indexed, warm.parsed), (0, 0));
         assert_eq!(warm.snapshot, cold.snapshot);
         assert!(warm.bytes_read <= cold.bytes_read);
+        let start = Instant::now();
+        let repeat = index.refresh(&repo, &cancel).unwrap();
+        let repeat_us = start.elapsed().as_micros();
+        assert_eq!((repeat.indexed, repeat.parsed), (0, 0));
+        assert_eq!(repeat.snapshot, cold.snapshot);
+        assert!(matches!(
+            index.persist(&cache).unwrap(),
+            Persistence::Unchanged
+        ));
         let search = |index: &RepositoryIndex, query: &str, symbols: &[String]| {
             index
                 .search(
@@ -460,27 +494,42 @@ mod tests {
             search(&index, "", &["needlenew".into()])[0].source.id,
             "calc.py"
         );
-        index.persist(&store).unwrap();
+        assert!(matches!(index.persist(&cache).unwrap(), Persistence::Saved));
         let other = Repository::open(&root, Limits::default(), vec!["calc.py".into()]).unwrap();
         let other_binding = RepositoryIndex::binding(&other, &ns, "test").unwrap();
-        assert!(
-            store
-                .load_repository_index(&other_binding)
-                .unwrap()
-                .is_none()
-        );
-        let blob = fs::read(store_path.join("repository-index.v1.enc")).unwrap();
+        assert!(cache.load(&other_binding).unwrap().is_none());
+        cache.clear(&other_binding).unwrap();
+        let path = store_path.join("repository-index.v1.enc");
+        let blob = fs::read(&path).unwrap();
         assert!(
             !blob
                 .windows(b"needlenew".len())
                 .any(|window| window == b"needlenew")
         );
         eprintln!(
-            "REPOSITORY_INDEX cold_bytes={} warm_bytes={} delta_bytes={} cold_us={cold_us} reopen_us={warm_us} delta_us={delta_us} encrypted_index_bytes={}",
+            "REPOSITORY_INDEX cold_bytes={} warm_bytes={} repeat_bytes={} delta_bytes={} cold_refresh_us={cold_us} cold_persist_us={cold_persist_us} reopen_us={warm_us} repeat_us={repeat_us} delta_us={delta_us} encrypted_index_bytes={}",
             cold.bytes_read,
             warm.bytes_read,
+            repeat.bytes_read,
             delta.bytes_read,
             blob.len()
         );
+        let mut tampered = blob;
+        *tampered.last_mut().unwrap() ^= 1;
+        fs::write(path, tampered).unwrap();
+        let (mut rebuilt, restored) = RepositoryIndex::open(&cache, binding).unwrap();
+        assert!(matches!(restored, Restore::Invalid));
+        assert!(rebuilt.refresh(&repo, &AtomicBool::new(true)).is_err());
+        let recovered = rebuilt.refresh(&repo, &cancel).unwrap();
+        assert_eq!((recovered.indexed, recovered.parsed), (2049, 1));
+        assert_eq!(recovered.snapshot, delta.snapshot);
+        assert!(search(&rebuilt, "needleold", &[]).is_empty());
+        assert_eq!(search(&rebuilt, "needlenew", &[])[0].source.id, "calc.py");
+        assert!(matches!(
+            rebuilt.persist(&cache).unwrap(),
+            Persistence::Saved
+        ));
+        let (_, restored) = RepositoryIndex::open(&cache, binding).unwrap();
+        assert!(matches!(restored, Restore::Loaded));
     }
 }

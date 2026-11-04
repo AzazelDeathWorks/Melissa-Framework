@@ -26,6 +26,61 @@ struct Fixture {
     store: LocalStore,
     task: TaskContractV1,
 }
+
+#[tokio::test]
+async fn context_index_survives_a_new_cli_task_and_respects_its_exclusions() {
+    let profile = "melissa.code.implementer";
+    let mut fixture = Fixture::new(profile);
+    let query = json!({"operation":"search","query":"double","limit":10,"symbols":[]});
+    {
+        let mut bridge = fixture.context();
+        let result = fixture
+            .call(&mut bridge, "context_search", query.clone(), "first-index")
+            .await;
+        assert!(result.success, "{}", result.content);
+        assert_eq!(
+            bridge.inner.host().lock().unwrap().telemetry()["index.persisted"],
+            1
+        );
+    }
+    let (store, task) = Fixture::task(&fixture.app, &fixture.source, profile, "b", vec![]);
+    fixture.store = store;
+    fixture.task = task;
+    {
+        let mut bridge = fixture.context();
+        let result = fixture
+            .call(&mut bridge, "context_search", query.clone(), "shared-index")
+            .await;
+        assert!(result.success, "{}", result.content);
+        let v: Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(v["observation"]["data"][0]["source"]["id"], "main.py");
+        let host = bridge.inner.host();
+        let host = host.lock().unwrap();
+        assert_eq!(host.telemetry()["index.restored"], 1);
+        assert_eq!(host.telemetry()["index.documents_updated"], 0);
+        assert_eq!(host.telemetry()["index.files_parsed"], 0);
+    }
+    let (store, task) = Fixture::task(
+        &fixture.app,
+        &fixture.source,
+        profile,
+        "c",
+        vec!["main.py".into()],
+    );
+    fixture.store = store;
+    fixture.task = task;
+    let mut bridge = fixture.context();
+    let result = fixture
+        .call(&mut bridge, "context_search", query, "restricted-index")
+        .await;
+    assert!(result.success, "{}", result.content);
+    let v: Value = serde_json::from_str(&result.content).unwrap();
+    assert_eq!(v["observation"]["data"], json!([]));
+    assert_eq!(
+        bridge.inner.host().lock().unwrap().telemetry()["index.cold_start"],
+        1
+    );
+}
 impl Fixture {
     fn new(profile: &str) -> Self {
         let temp = tempfile::tempdir().unwrap();
@@ -40,13 +95,29 @@ impl Fixture {
         fs::write(source.join("protected.txt"), b"user-owned\r\n").unwrap();
         App::init(&home).unwrap();
         let app = App::open(&home).unwrap();
-        let repo = Repository::open(&source, Limits::default(), vec![]).unwrap();
+        let (store, task) = Self::task(&app, &source, profile, "a", vec![]);
+        Self {
+            _temp: temp,
+            app,
+            source,
+            store,
+            task,
+        }
+    }
+    fn task(
+        app: &App,
+        source: &std::path::Path,
+        profile: &str,
+        id: &str,
+        excludes: Vec<String>,
+    ) -> (LocalStore, TaskContractV1) {
+        let repo = Repository::open(source, Limits::default(), excludes.clone()).unwrap();
         let snapshot = repo.snapshot(&AtomicBool::new(false)).unwrap();
         let mut task: TaskContractV1 = serde_json::from_slice(include_bytes!(
             "../../../tests/fixtures/code01/wire/task-contract-v1.json"
         ))
         .unwrap();
-        task.task_id = format!("task_{}", "a".repeat(32));
+        task.task_id = format!("task_{}", id.repeat(32));
         task.selected_profile_ids = vec![profile.into()];
         task.input_snapshot_digest = snapshot.digest.clone();
         task.allowed_effects = vec![
@@ -65,7 +136,7 @@ impl Fixture {
         task.limits.max_wall_time_ms = 86400000;
         task.limits.max_disk_bytes = 1024 * 1024 * 1024;
         task.limits.max_output_bytes = 64 * 1024 * 1024;
-        let dir = home.join("tasks").join(&task.task_id);
+        let dir = app.home.join("tasks").join(&task.task_id);
         fs::create_dir(&dir).unwrap();
         let mut store =
             LocalStore::open(&dir.join("store"), app.key.clone(), Default::default()).unwrap();
@@ -85,7 +156,7 @@ impl Fixture {
             schema_version: "melissa.cli-workspace/v1".into(),
             root: source.to_str().unwrap().into(),
             limits: Limits::default(),
-            explicit_excludes: vec![],
+            explicit_excludes: excludes,
             snapshot,
             files: BTreeMap::new(),
         };
@@ -97,13 +168,7 @@ impl Fixture {
             &bytes(&workspace).unwrap(),
         )
         .unwrap();
-        Self {
-            _temp: temp,
-            app,
-            source,
-            store,
-            task,
-        }
+        (store, task)
     }
     fn tools(&self) -> BTreeSet<String> {
         resources::catalog().unwrap().profiles[&self.task.selected_profile_ids[0]]

@@ -7,7 +7,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::{Read, Seek, SeekFrom},
-    path::{Path, PathBuf},
+    path::Path,
     sync::atomic::AtomicBool,
 };
 
@@ -235,7 +235,9 @@ impl Repository {
         self.read_locked(&mut file, path)
     }
     pub fn snapshot(&self, cancel: &AtomicBool) -> Result<RepositorySnapshot> {
-        self.capture(cancel, |path| self.read(path).map(|(version, _)| version))
+        self.capture(cancel, |path, pin| {
+            self.read_locked(pin, path).map(|(version, _)| version)
+        })
     }
 
     /// Recheck the visible tree using the same pinned path admission as a
@@ -248,48 +250,59 @@ impl Repository {
     ) -> Result<IndexScan> {
         #[cfg(windows)]
         let journal = crate::file_journal::FileJournal::open(&self.root.file);
+        let stamp = |pin: &Pinned| {
+            #[cfg(windows)]
+            {
+                journal.as_ref().and_then(|j| j.stamp(&pin.file))
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = pin;
+                None
+            }
+        };
         let mut files = BTreeMap::new();
         let mut changed_bytes = BTreeMap::new();
         let mut bytes_read = 0u64;
-        let snapshot = self.capture(cancel, |path| {
-            let mut pin = self.lock(path, false)?;
-            let bytes = pin.file.metadata()?.len();
-            if bytes > self.limits.max_file_bytes {
-                return Err(Error::Quota("file bytes"));
-            }
-            #[cfg(windows)]
-            let journal_stamp = journal.as_ref().and_then(|j| j.stamp(&pin.file));
-            #[cfg(not(windows))]
-            let journal_stamp = None;
+        let snapshot = self.capture(cancel, |path, pin| {
             let old = previous.get(path);
-            let version = if let Some(old) = old
-                && journal_stamp.is_some()
-                && journal_stamp == old.journal_stamp
-                && old.version.path == path
-                && old.version.identity == pin.identity
-                && old.version.bytes == bytes
-            {
-                old.version.clone()
-            } else {
-                let (version, content) = self.read_locked(&mut pin, path)?;
-                bytes_read += version.bytes;
-                if old.is_none_or(|old| old.version.digest != version.digest) {
+            let (file, content) = self.observe_index_file(path, pin, stamp(pin), old)?;
+            if let Some(content) = content {
+                bytes_read += file.version.bytes;
+                if old.is_none_or(|old| old.version.digest != file.version.digest) {
                     changed_bytes.insert(path.to_owned(), content);
                 }
-                version
-            };
-            files.insert(
-                path.to_owned(),
-                IndexedFileVersion {
-                    version: version.clone(),
-                    journal_stamp,
-                },
-            );
+            }
+            let version = file.version.clone();
+            files.insert(path.to_owned(), file);
             Ok(version)
         })?;
         #[cfg(windows)]
-        if journal.is_some_and(|journal| !journal.unchanged()) {
-            return Err(Error::Stale("file journal changed during index scan"));
+        let stable = journal
+            .as_ref()
+            .map(|j| j.verify())
+            .transpose()?
+            .unwrap_or(false);
+        #[cfg(not(windows))]
+        let stable = false;
+        if !stable {
+            // A changed volume cursor could be unrelated activity. Confirm the
+            // observed tree, reusing the fresh file receipts where possible.
+            let confirmed = self.capture(cancel, |path, pin| {
+                let (file, content) =
+                    self.observe_index_file(path, pin, stamp(pin), files.get(path))?;
+                if content.is_some() {
+                    bytes_read += file.version.bytes;
+                }
+                Ok(file.version)
+            })?;
+            #[cfg(windows)]
+            if let Some(journal) = &journal {
+                journal.verify()?;
+            }
+            if confirmed != snapshot {
+                return Err(Error::Stale("repository changed during index scan"));
+            }
         }
         Ok(IndexScan {
             snapshot,
@@ -299,26 +312,63 @@ impl Repository {
         })
     }
 
+    fn observe_index_file(
+        &self,
+        path: &str,
+        pin: &mut Pinned,
+        journal_stamp: Option<(u64, i64)>,
+        old: Option<&IndexedFileVersion>,
+    ) -> Result<(IndexedFileVersion, Option<Vec<u8>>)> {
+        let bytes = pin.file.metadata()?.len();
+        if bytes > self.limits.max_file_bytes {
+            return Err(Error::Quota("file bytes"));
+        }
+        if let Some(old) = old
+            && journal_stamp.is_some()
+            && journal_stamp == old.journal_stamp
+            && old.version.path == path
+            && old.version.identity == pin.identity
+            && old.version.bytes == bytes
+        {
+            return Ok((old.clone(), None));
+        }
+        let (version, content) = self.read_locked(pin, path)?;
+        Ok((
+            IndexedFileVersion {
+                version,
+                journal_stamp,
+            },
+            Some(content),
+        ))
+    }
+
     fn capture(
         &self,
         cancel: &AtomicBool,
-        mut read_version: impl FnMut(&str) -> Result<FileVersion>,
+        mut read_version: impl FnMut(&str, &mut Pinned) -> Result<FileVersion>,
     ) -> Result<RepositorySnapshot> {
         let mut files = Vec::new();
         let mut total = 0u64;
         let mut seen = BTreeSet::new();
         let mut entries = 0;
-        self.visit("", &mut seen, &mut entries, cancel, &mut |path| {
-            let version = read_version(path)?;
-            total = total
-                .checked_add(version.bytes)
-                .ok_or(Error::Quota("byte overflow"))?;
-            if total > self.limits.max_total_bytes {
-                return Err(Error::Quota("snapshot bytes"));
-            }
-            files.push(version);
-            Ok(())
-        })?;
+        self.visit(
+            &self.root,
+            "",
+            &mut seen,
+            &mut entries,
+            cancel,
+            &mut |path, pin| {
+                let version = read_version(path, pin)?;
+                total = total
+                    .checked_add(version.bytes)
+                    .ok_or(Error::Quota("byte overflow"))?;
+                if total > self.limits.max_total_bytes {
+                    return Err(Error::Quota("snapshot bytes"));
+                }
+                files.push(version);
+                Ok(())
+            },
+        )?;
         files.sort_by(|a, b| a.path.cmp(&b.path));
         let seal = digest(&serde_json::to_vec(&(
             self.root_identity(),
@@ -337,20 +387,15 @@ impl Repository {
     }
     fn visit(
         &self,
+        parent: &Pinned,
         relative: &str,
         seen: &mut BTreeSet<String>,
         entries: &mut usize,
         cancel: &AtomicBool,
-        file: &mut impl FnMut(&str) -> Result,
+        file: &mut impl FnMut(&str, &mut Pinned) -> Result,
     ) -> Result {
         check_cancel(cancel)?;
-        let path: PathBuf = if relative.is_empty() {
-            self.root.canonical.clone()
-        } else {
-            self.root.canonical.join(relative.replace('/', "\\"))
-        };
-        let _guard = paths::pin(&path, true, false)?;
-        for entry in fs::read_dir(path)? {
+        for entry in fs::read_dir(&parent.canonical)? {
             check_cancel(cancel)?;
             *entries += 1;
             if *entries > self.limits.max_files {
@@ -362,7 +407,7 @@ impl Repository {
                 .into_string()
                 .map_err(|_| Error::Invalid("non-Unicode entry"))?;
             let child = if relative.is_empty() {
-                name
+                name.clone()
             } else {
                 format!("{relative}/{name}")
             };
@@ -380,11 +425,13 @@ impl Repository {
                 return Err(Error::Denied("case-colliding paths"));
             }
             let kind = entry.file_type()?;
-            if kind.is_dir() {
-                self.visit(&child, seen, entries, cancel, file)?;
-            } else {
-                file(&child)?;
-            }
+            paths::with_read_child(parent, &name, kind.is_dir(), |pin| {
+                if kind.is_dir() {
+                    self.visit(pin, &child, seen, entries, cancel, file)
+                } else {
+                    file(&child, pin)
+                }
+            })?;
         }
         Ok(())
     }

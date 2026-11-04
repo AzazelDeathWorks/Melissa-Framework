@@ -13,6 +13,7 @@ pub(crate) struct FileJournal<'a> {
     root: &'a File,
     id: u64,
     lowest_valid: i64,
+    next: i64,
 }
 
 impl<'a> FileJournal<'a> {
@@ -24,6 +25,7 @@ impl<'a> FileJournal<'a> {
             root,
             id: data.UsnJournalID,
             lowest_valid: data.LowestValidUsn,
+            next: data.NextUsn,
         })
     }
 
@@ -82,9 +84,16 @@ impl<'a> FileJournal<'a> {
         (usn > 0 && usn >= self.lowest_valid).then_some((self.id, usn))
     }
 
-    pub(crate) fn unchanged(&self) -> bool {
-        Self::query(self.root).is_some_and(|data| {
-            data.UsnJournalID == self.id && data.LowestValidUsn == self.lowest_valid
-        })
+    pub(crate) fn verify(&self) -> crate::Result<bool> {
+        let data = Self::query(self.root)
+            .filter(|data| {
+                data.UsnJournalID == self.id
+                    && data.LowestValidUsn == self.lowest_valid
+                    && data.NextUsn >= self.next
+            })
+            .ok_or(crate::Error::Stale(
+                "file journal changed during index scan",
+            ))?;
+        Ok(data.NextUsn == self.next)
     }
 }
