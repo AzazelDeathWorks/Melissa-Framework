@@ -129,7 +129,8 @@ pub(crate) struct Program {
     pub raw_limit: u64,
     pub expected_rustc: String,
     pub expected_cargo: String,
-    pub sources: BTreeMap<String, String>,
+    pub source_manifest_version: String,
+    pub sources: BTreeMap<String, melissa_container_executor::source_manifest::SourceSeal>,
 }
 
 /// Fields are private: a parsed model proposal cannot change the executable,
@@ -177,7 +178,7 @@ impl RustPlan {
             }
             _ => 0,
         };
-        let input = repo.worker_input(source, cancel)?;
+        let input = repo.worker_input_with_budget(source, cancel, limits.disk_bytes)?;
         let mut snapshot = input.snapshot;
         if !snapshot.files.contains_key("Cargo.toml") || !snapshot.files.contains_key("Cargo.lock")
         {
@@ -207,13 +208,6 @@ impl RustPlan {
             ));
         }
         let commands = commands(operation);
-        // BLAKE3 is checked by the Rust host. The helper also compares the exact
-        // input bytes before and after project code; its claims stay untrusted.
-        let sources = snapshot
-            .files
-            .iter()
-            .map(|(p, b)| (p.clone(), hex(b)))
-            .collect();
         let program = Program {
             schema_version: CONTRACT.into(),
             commands: commands.clone(),
@@ -221,11 +215,20 @@ impl RustPlan {
             raw_limit: limits.output_bytes / 3,
             expected_rustc: "rustc 1.98.1 (48a229cea 2026-09-01)".into(),
             expected_cargo: "cargo 1.98.1 (797e8a9bc 2026-08-05)".into(),
-            sources,
+            source_manifest_version: melissa_container_executor::source_manifest::VERSION.into(),
+            sources: melissa_container_executor::source_manifest::seal(&snapshot)
+                .into_iter()
+                .map(|(path, seal)| (path.to_owned(), seal))
+                .collect(),
         };
         snapshot.files.insert(
             ".melissa-code06/driver.py".into(),
-            DRIVER.as_bytes().to_vec(),
+            [
+                melissa_container_executor::source_manifest::VERIFIER,
+                DRIVER,
+            ]
+            .join("\n")
+            .into_bytes(),
         );
         snapshot.files.insert(
             ".melissa-code06/program.json".into(),

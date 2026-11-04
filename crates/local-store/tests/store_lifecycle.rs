@@ -559,3 +559,47 @@ fn unsafe_windows_store_roots_are_rejected_before_any_initialization() {
     }
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
 }
+
+#[cfg(windows)]
+#[test]
+fn pinned_publications_reuse_authenticated_inventory_and_run_periodic_integrity() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("store");
+    let mut store = LocalStore::open(&root, key(), StoreConfig::default())
+        .unwrap()
+        .with_pinned_cas_inventory()
+        .unwrap();
+    create(&mut store, "task:a");
+    for n in 0..128 {
+        store
+            .put_artifact(
+                &request("task:a", &format!("artifact:{n}")),
+                &vec![n as u8; 4096],
+            )
+            .unwrap();
+    }
+    let metrics = store.inventory_metrics().unwrap().unwrap();
+    assert_eq!(metrics.authenticated_blobs, 127);
+    assert!(metrics.reused_blobs > 8_000);
+    eprintln!(
+        "CAS_INVENTORY publications=128 authenticated={} reused={}",
+        metrics.authenticated_blobs, metrics.reused_blobs
+    );
+    let sql = rusqlite::Connection::open(root.join("store.sqlite3")).unwrap();
+    sql.execute(
+        "UPDATE artifacts SET payload=zeroblob(length(payload)) WHERE artifact_id='artifact:0'",
+        [],
+    )
+    .unwrap();
+    assert!(
+        store
+            .put_artifact(&request("task:a", "artifact:128"), b"new")
+            .is_err()
+    );
+    assert!(matches!(
+        store.artifact_metadata("task:a", "artifact:128"),
+        Err(StoreError::NotFound(_))
+    ));
+    drop(store);
+    assert!(LocalStore::open(&root, key(), StoreConfig::default()).is_err());
+}

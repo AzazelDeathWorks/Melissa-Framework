@@ -108,6 +108,7 @@ pub enum MemoryStatus {
     Accepted,
     Rejected,
     Stale,
+    Superseded,
     Deleted,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,6 +139,8 @@ fn memory_review_digest(record: &Memory) -> Result<String> {
 pub struct MemoryBook {
     #[serde(deserialize_with = "read_memory_records")]
     records: BTreeMap<String, Memory>,
+    #[serde(skip)]
+    dirty: BTreeSet<String>,
 }
 fn read_memory_sources<'de, D: serde::Deserializer<'de>>(
     de: D,
@@ -214,20 +217,7 @@ impl Memory {
         }
     }
 }
-struct SourceReferences<'a>(&'a [&'a Source]);
-impl Serialize for SourceReferences<'_> {
-    fn serialize<S: serde::Serializer>(
-        &self,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        use serde::ser::SerializeSeq;
-        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
-        for source in self.0 {
-            seq.serialize_element(&source.reference_view())?;
-        }
-        seq.end()
-    }
-}
+
 fn read_memory_records<'de, D: serde::Deserializer<'de>>(
     de: D,
 ) -> std::result::Result<BTreeMap<String, Memory>, D::Error> {
@@ -319,7 +309,7 @@ impl MemoryBook {
             } else {
                 let mut view = record.view();
                 if supersedes.contains(key) {
-                    view.status = MemoryStatus::Stale;
+                    view.status = MemoryStatus::Superseded;
                 }
                 crate::encoded_len(&view, MAX_MEMORY_RECORD_BYTES)?
             };
@@ -344,7 +334,43 @@ impl MemoryBook {
         current: &[Source],
         excluded: &[String],
     ) {
+        let references: Vec<_> = current.iter().map(Source::reference).collect();
+        self.revalidate_references(namespace, &references, excluded);
+    }
+
+    pub fn dirty_ids(&self) -> &BTreeSet<String> {
+        &self.dirty
+    }
+
+    pub fn mark_persisted(&mut self) {
+        self.dirty.clear();
+    }
+
+    pub fn source_ids<'a>(&'a self, namespace: &'a Namespace) -> impl Iterator<Item = &'a str> {
+        self.records
+            .values()
+            .filter(move |record| {
+                &record.namespace == namespace
+                    && matches!(
+                        record.status,
+                        MemoryStatus::Accepted | MemoryStatus::Proposed
+                    )
+            })
+            .flat_map(|record| record.sources.iter().map(|source| source.id.as_str()))
+    }
+
+    pub fn revalidate_references<'a>(
+        &mut self,
+        namespace: &Namespace,
+        current: impl IntoIterator<Item = &'a crate::retrieval::SourceRef>,
+        excluded: &[String],
+    ) {
         let visibility = melissa_repository::SourceVisibilityPolicy::new(excluded.to_vec());
+        let current: BTreeMap<_, _> = current
+            .into_iter()
+            .filter(|s| &s.namespace == namespace)
+            .map(|s| (s.id.as_str(), s))
+            .collect();
         for record in self
             .records
             .values_mut()
@@ -363,25 +389,19 @@ impl MemoryBook {
             {
                 continue;
             }
-            let refreshed: Option<Vec<_>> = record
-                .sources
-                .iter()
-                .map(|old| {
-                    current
-                        .iter()
-                        .find(|s| {
-                            &s.namespace == namespace
-                                && s.id == old.id
-                                && s.version == old.version
-                                && s.digest == old.digest
-                        })
-                        .map(Source::reference)
+            if record.sources.iter().all(|old| {
+                current.get(old.id.as_str()).is_some_and(|s| {
+                    s.version == old.version && s.digest == old.digest && s.domain == old.domain
                 })
-                .collect();
-            if let Some(sources) = refreshed {
-                record.sources = sources;
+            }) {
+                for old in &mut record.sources {
+                    let observed = current[old.id.as_str()];
+                    old.observed_at_ms = observed.observed_at_ms;
+                    old.valid_until_ms = observed.valid_until_ms;
+                }
             } else {
                 record.status = MemoryStatus::Stale;
+                self.dirty.insert(record.id.clone());
             }
         }
     }
@@ -409,8 +429,27 @@ impl MemoryBook {
         claim: &str,
         sources: &[&Source],
     ) -> Result<String> {
-        namespace.validate()?;
         validate_memory_sources(sources.iter().copied())?;
+        let references = sources
+            .iter()
+            .map(|s| {
+                s.validate()?;
+                Ok((s.reference(), s.content.len() as u64))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let selected: Vec<_> = references.iter().map(|(r, n)| (r, *n)).collect();
+        self.propose_references(id, namespace, key, claim, &selected)
+    }
+
+    pub fn propose_references(
+        &mut self,
+        id: &str,
+        namespace: Namespace,
+        key: &str,
+        claim: &str,
+        sources: &[(&crate::retrieval::SourceRef, u64)],
+    ) -> Result<String> {
+        namespace.validate()?;
         require(
             !id.trim().is_empty()
                 && id.len() <= 512
@@ -422,16 +461,36 @@ impl MemoryBook {
                 && !sources.is_empty(),
             "invalid or duplicate memory proposal",
         )?;
-        for s in sources {
-            s.validate()?;
-            require(s.namespace == namespace, "memory source namespace mismatch")?;
+        let mut seen = BTreeSet::new();
+        let mut source_bytes = 0u64;
+        for &(s, bytes) in sources {
+            source_bytes = source_bytes.saturating_add(bytes);
+            require(
+                s.namespace == namespace
+                    && !s.id.trim().is_empty()
+                    && s.id.len() <= 4096
+                    && !s.version.trim().is_empty()
+                    && s.version.len() <= 4096
+                    && s.digest.strip_prefix("blake3:").is_some_and(|hash| {
+                        hash.len() == 64
+                            && hash
+                                .bytes()
+                                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                    })
+                    && s.observed_at_ms < s.valid_until_ms
+                    && seen.insert(s.id.as_str())
+                    && seen.len() <= MAX_MEMORY_SOURCES
+                    && source_bytes <= MAX_MEMORY_SOURCE_BYTES as u64,
+                "invalid memory source metadata or size",
+            )?;
         }
+        let references: Vec<_> = sources.iter().map(|(reference, _)| *reference).collect();
         let view = MemoryView {
             id,
             namespace: &namespace,
             key,
             claim,
-            sources: SourceReferences(sources),
+            sources: &references,
             status: MemoryStatus::Proposed,
             review_evidence_ref: None,
         };
@@ -441,12 +500,13 @@ impl MemoryBook {
             namespace,
             key: key.into(),
             claim: claim.into(),
-            sources: sources.iter().map(|s| s.reference()).collect(),
+            sources: references.into_iter().cloned().collect(),
             status: MemoryStatus::Proposed,
             review_evidence_ref: None,
         };
         let hash = memory_review_digest(&record)?;
         self.records.insert(id.into(), record);
+        self.dirty.insert(id.into());
         Ok(hash)
     }
     /// Host review decision only; semantic truth is the reviewer's responsibility.
@@ -503,7 +563,8 @@ impl MemoryBook {
                 self.records
                     .get_mut(prior)
                     .expect("conflict set checked")
-                    .status = MemoryStatus::Stale;
+                    .status = MemoryStatus::Superseded;
+                self.dirty.insert(prior.clone());
             }
         }
         let r = self.records.get_mut(id).expect("checked");
@@ -513,6 +574,7 @@ impl MemoryBook {
             MemoryStatus::Rejected
         };
         r.review_evidence_ref = Some(evidence_ref.into());
+        self.dirty.insert(id.into());
         Ok(())
     }
     pub fn search(&self, scope: &SearchScope, query: &str) -> Vec<&Memory> {
@@ -532,7 +594,11 @@ impl MemoryBook {
             .get_mut(id)
             .ok_or_else(|| crate::Error("memory not found".into()))?;
         require(&r.namespace == scope, "memory deletion scope mismatch")?;
+        if r.status == MemoryStatus::Deleted {
+            return Ok(());
+        }
         r.status = MemoryStatus::Deleted;
+        self.dirty.insert(id.into());
         r.claim.clear();
         r.sources.clear();
         r.review_evidence_ref = None;
@@ -546,6 +612,7 @@ impl MemoryBook {
         {
             if matches!(r.status, MemoryStatus::Accepted | MemoryStatus::Proposed) {
                 r.status = MemoryStatus::Stale;
+                self.dirty.insert(r.id.clone());
             }
         }
     }
@@ -622,7 +689,62 @@ pub struct CacheAdmission {
     pub deterministic_readonly: bool,
     pub cancelled: bool,
 }
+const CACHE_MAX_ENTRIES: usize = 256;
+const CACHE_MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+const CACHE_MAX_ENTRY_BYTES: usize = 512 * 1024;
+const CACHE_TTL_MS: u64 = 5 * 60 * 1000;
+
+impl CacheEntry {
+    fn cost(&self) -> Result<usize> {
+        Ok(serde_json::to_vec(&self.key)?
+            .len()
+            .saturating_add(self.bytes.len().saturating_mul(4))
+            .saturating_add(512))
+    }
+}
+
 impl Cache {
+    /// Disposable legacy entries are normalized on restore. All surviving
+    /// entries must still authenticate and match their exact namespace/key.
+    pub(crate) fn restore(&mut self, namespace: &Namespace, now: u64) -> Result<()> {
+        self.entries
+            .retain(|_, entry| &entry.key.namespace == namespace);
+        self.trim(now)?;
+        for (identity, entry) in &self.entries {
+            require(
+                &entry.key.digest()? == identity && digest(&entry.bytes) == entry.digest,
+                "restored cache integrity mismatch",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn trim(&mut self, now: u64) -> Result<()> {
+        self.entries.retain(|_, entry| {
+            entry.expires_ms = entry
+                .expires_ms
+                .min(entry.created_ms.saturating_add(CACHE_TTL_MS));
+            entry.created_ms <= now
+                && now < entry.expires_ms
+                && entry.bytes.len() <= CACHE_MAX_ENTRY_BYTES
+        });
+        let mut sizes = self
+            .entries
+            .iter()
+            .map(|(id, e)| Ok((e.created_ms, id.clone(), e.cost()?)))
+            .collect::<Result<Vec<_>>>()?;
+        sizes.sort_unstable();
+        let mut used = sizes.iter().map(|(_, _, bytes)| *bytes).sum::<usize>();
+        for (_, id, cost) in sizes {
+            if self.entries.len() <= CACHE_MAX_ENTRIES && used <= CACHE_MAX_TOTAL_BYTES {
+                break;
+            }
+            self.entries.remove(&id);
+            used -= cost;
+        }
+        Ok(())
+    }
+
     pub fn put(
         &mut self,
         key: CacheKey,
@@ -638,57 +760,20 @@ impl Cache {
                 && expires > now,
             "unsafe cache insertion",
         )?;
-        // Derived cache is disposable. Bound its serialized footprint so a
-        // large result cannot make a previously readable checkpoint unwritable.
-        const MAX_CACHE_BYTES: usize = 4 * 1024 * 1024;
-        const MAX_CACHE_ENTRIES: usize = 256;
         let identity = key.digest()?;
-        self.entries
-            .retain(|id, e| id != &identity && e.expires_ms > now);
-        let cost = serde_json::to_vec(&key)?
-            .len()
-            .saturating_add(bytes.len().saturating_mul(4))
-            .saturating_add(512);
-        if cost > MAX_CACHE_BYTES {
-            return Ok(());
+        if bytes.len() <= CACHE_MAX_ENTRY_BYTES {
+            self.entries.insert(
+                identity,
+                CacheEntry {
+                    key,
+                    created_ms: now,
+                    expires_ms: expires,
+                    digest: digest(&bytes),
+                    bytes,
+                },
+            );
         }
-        while self.entries.len() >= MAX_CACHE_ENTRIES
-            || self
-                .entries
-                .values()
-                .map(|e| {
-                    e.bytes
-                        .len()
-                        .saturating_mul(4)
-                        .saturating_add(serde_json::to_vec(&e.key).map_or(0, |b| b.len()))
-                        .saturating_add(512)
-                })
-                .sum::<usize>()
-                .saturating_add(cost)
-                > MAX_CACHE_BYTES
-        {
-            let Some(oldest) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, e)| e.created_ms)
-                .map(|(id, _)| id.clone())
-            else {
-                break;
-            };
-            self.entries.remove(&oldest);
-        }
-        let d = digest(&bytes);
-        self.entries.insert(
-            identity,
-            CacheEntry {
-                key,
-                created_ms: now,
-                expires_ms: expires,
-                bytes,
-                digest: d,
-            },
-        );
-        Ok(())
+        self.trim(now)
     }
     pub fn get(
         &self,

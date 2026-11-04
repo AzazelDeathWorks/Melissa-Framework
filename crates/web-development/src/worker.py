@@ -24,7 +24,7 @@ exec(compile((PRIVATE/'sql_runtime.py').read_bytes(),str(PRIVATE/'sql_runtime.py
 def run(argv,**kw):
     return subprocess.run(argv,check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=45,**kw)
 def unchanged():
-    return all((ROOT/p).is_file() and (ROOT/p).read_bytes()==bytes.fromhex(b) for p,b in P['sources'].items())
+    return verify_source_manifest(ROOT, P)
 def rows(cursor):
     data=cursor.fetchmany(1001) if cursor.description else []
     return {'columns':[c[0] for c in (cursor.description or [])], 'rows':[list(r) for r in data[:1000]], 'truncated':len(data)>1000,'rowcount':cursor.rowcount}

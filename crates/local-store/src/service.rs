@@ -54,6 +54,7 @@ pub(crate) struct Instance {
     // Publication, GC and backup use one order: process guard, then SQLite.
     pub files: Mutex<()>,
     pub inventory_readers: AtomicUsize,
+    pub publications_since_check: AtomicUsize,
     #[cfg(windows)]
     pub inventory: Mutex<Option<crate::pinned_inventory::PinnedInventory>>,
     _lease: File,
@@ -91,12 +92,13 @@ impl LocalStore {
             config,
             files: Mutex::new(()),
             inventory_readers: AtomicUsize::new(1),
+            publications_since_check: AtomicUsize::new(0),
             #[cfg(windows)]
             inventory: Mutex::new(None),
             _lease: lease,
         });
         let mut store = Self::connect_instance(instance, true)?;
-        store.integrity_check()?;
+        store.check_artifact_integrity()?;
         // No tool is executed or retried here. Possibly dispatched work becomes
         // explicitly unknown, under the exclusive session lease.
         store.journal.recover_interrupted()?;

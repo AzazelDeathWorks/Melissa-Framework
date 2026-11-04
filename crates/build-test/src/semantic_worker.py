@@ -41,8 +41,7 @@ def record(direction, message):
 
 
 def same_source():
-    return all((ROOT / name).is_file() and not (ROOT / name).is_symlink()
-               and (ROOT / name).read_bytes().hex() == raw for name, raw in P["sources"].items())
+    return verify_source_manifest(ROOT, P)
 
 
 language = P["language"]
@@ -182,7 +181,7 @@ try:
     uri = (ROOT / path).as_uri()
     language_id = "python" if language == "python" else "rust" if language == "rust" else "typescript" if path.endswith((".ts", ".tsx")) else "javascript"
     notification("textDocument/didOpen", {"textDocument": {"uri": uri, "languageId": language_id,
-                 "version": 1, "text": bytes.fromhex(P["sources"][path]).decode("utf-8", "strict")}})
+                 "version": 1, "text": (ROOT / path).read_bytes().decode("utf-8", "strict")}})
     if language == "rust":
         deadline = time.monotonic() + 35
         while not any(n.get("method") == "experimental/serverStatus" and n.get("params", {}).get("quiescent") for n in notifications):

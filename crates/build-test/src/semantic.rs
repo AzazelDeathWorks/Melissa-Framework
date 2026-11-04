@@ -91,7 +91,9 @@ impl SemanticPlan {
                 "build-script mode belongs to Rust Cargo only",
             ));
         }
-        let mut snapshot = repo.worker_input(source, cancel)?.snapshot;
+        let mut snapshot = repo
+            .worker_input_with_budget(source, cancel, limits.disk_bytes)?
+            .snapshot;
         validate_source(&snapshot)?;
         let bytes = snapshot
             .files
@@ -100,10 +102,15 @@ impl SemanticPlan {
         byte_position(bytes, query.line, query.character)?;
         let options = compiler_contract(&snapshot, language)?;
         let sdk = json!({"image":toolchain::COMPLETE_IMAGE,"rust_analyzer":"1.98.1","typescript":toolchain::TYPESCRIPT,"typescript_language_server":toolchain::TS_LSP,"pyright":toolchain::PYRIGHT});
-        let payload = json!({"schema_version":"melissa.semantic-program/v1","language":language.wire(),"query":query,"source_digest":source.digest,"sources":snapshot.files.iter().map(|(p,b)|(p.clone(),hex(b))).collect::<BTreeMap<_,_>>(),"compiler_options":options,"build_scripts":build_scripts,"trace_limit":limits.output_bytes,"sdk":sdk});
+        let payload = json!({"schema_version":"melissa.semantic-program/v1","language":language.wire(),"query":query,"source_digest":source.digest,"source_manifest_version":melissa_container_executor::source_manifest::VERSION,"sources":melissa_container_executor::source_manifest::seal(&snapshot),"compiler_options":options,"build_scripts":build_scripts,"trace_limit":limits.output_bytes,"sdk":sdk});
         snapshot.files.insert(
             ".melissa-code06-semantic/driver.py".into(),
-            DRIVER.as_bytes().to_vec(),
+            [
+                melissa_container_executor::source_manifest::VERIFIER,
+                DRIVER,
+            ]
+            .join("\n")
+            .into_bytes(),
         );
         snapshot.files.insert(
             ".melissa-code06-semantic/program.json".into(),

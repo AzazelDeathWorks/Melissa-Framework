@@ -24,9 +24,7 @@ remaining = program["raw_limit"]
 
 
 def source_matches():
-    return all((ROOT / name).is_file() and not (ROOT / name).is_symlink()
-               and (ROOT / name).read_bytes().hex() == value
-               for name, value in program["sources"].items())
+    return verify_source_manifest(ROOT, program)
 
 
 def run(spec):

@@ -1,5 +1,5 @@
 //! Versioned, closed SDK procedures. Input syntax never grants authority.
-use crate::{Error, Result, hex, toolchain, unhex};
+use crate::{Error, Result, toolchain, unhex};
 use melissa_container_executor::{ContainerLimits, ContainerRequest, Snapshot, TerminationReason};
 use melissa_execution_broker::{
     InvocationIdentity,
@@ -204,7 +204,9 @@ impl ProcedurePlan {
         if matches!(operation,Operation::Test{repetitions,..} if !(1..=16).contains(&repetitions)) {
             return Err(Error::Invalid("explicit test repetitions must be1..16"));
         }
-        let mut snapshot = repo.worker_input(source, cancel)?.snapshot;
+        let mut snapshot = repo
+            .worker_input_with_budget(source, cancel, limits.disk_bytes)?
+            .snapshot;
         validate_source(&snapshot)?;
         let matches = snapshot.files.keys().any(|p| match language {
             Language::Rust => p.ends_with(".rs"),
@@ -260,10 +262,18 @@ impl ProcedurePlan {
         let compiler_options = compiler_contract(&snapshot, language)?;
         let expected_sdk = expected_sdk(language);
         let payload = json!({"schema_version":"melissa.sdk-program/v1","language":language.wire(),"operation":operation,
-            "source_digest":source.digest,"sources":snapshot.files.iter().map(|(p,b)|(p.clone(),hex(b))).collect::<BTreeMap<_,_>>(),
+            "source_digest":source.digest,"source_manifest_version":melissa_container_executor::source_manifest::VERSION,"sources":melissa_container_executor::source_manifest::seal(&snapshot),
             "expected_sdk":expected_sdk,"compiler_options":compiler_options,"harness":harness,"raw_limit":limits.output_bytes/3});
         for (name, bytes) in [
-            ("driver.py", DRIVER.as_bytes().to_vec()),
+            (
+                "driver.py",
+                [
+                    melissa_container_executor::source_manifest::VERIFIER,
+                    DRIVER,
+                ]
+                .join("\n")
+                .into_bytes(),
+            ),
             ("pytest_runner.py", PYTEST.as_bytes().to_vec()),
             ("node_reporter.cjs", NODE_REPORTER.as_bytes().to_vec()),
             ("program.json", serde_json::to_vec(&payload)?),

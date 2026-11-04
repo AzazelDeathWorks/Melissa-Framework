@@ -36,8 +36,7 @@ class ProcedureError(Exception):
 
 
 def same_source():
-    return all((ROOT / p).is_file() and not (ROOT / p).is_symlink()
-               and (ROOT / p).read_bytes().hex() == data for p, data in P["sources"].items())
+    return verify_source_manifest(ROOT, P)
 
 
 def run(stage, argv, env=None):
@@ -183,9 +182,9 @@ def rust():
     suite = P["operation"]["suite"]
     repeats = P["operation"]["repetitions"]
     if suite != "custom":
-        for path, data in P["sources"].items():
+        for path in P["sources"]:
             if path.endswith("Cargo.toml"):
-                manifest = tomllib.loads(bytes.fromhex(data).decode())
+                manifest = tomllib.loads((ROOT / path).read_text(encoding="utf-8"))
                 if manifest.get("lib", {}).get("harness") is False or any(t.get("harness") is False for t in manifest.get("test", [])):
                     raise ProcedureError("unsupported", "custom harness requires explicit host registration")
     if suite in ("unit_integration", "all", "end_to_end", "custom"):

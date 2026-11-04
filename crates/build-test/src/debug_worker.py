@@ -47,8 +47,7 @@ def record(direction, data):
 
 
 def same_source():
-    return all((ROOT / name).is_file() and not (ROOT / name).is_symlink()
-               and (ROOT / name).read_bytes().hex() == value for name, value in P["sources"].items())
+    return verify_source_manifest(ROOT, P)
 
 
 def process(args, stdout=subprocess.PIPE, stdin=subprocess.PIPE):

@@ -155,6 +155,37 @@ pub struct Checkpoint {
     pub data: Value,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredCheckpoint {
+    Indexed(IndexedCheckpoint<Checkpoint>),
+    Legacy(Checkpoint),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IndexedCheckpoint<T> {
+    checkpoint: T,
+    series_prefix: String,
+}
+
+const SERIES_HEAD_PREFIX: &str = "checkpoint-series/v1:";
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SeriesHead {
+    task_id: String,
+    prefix: String,
+    next: u64,
+}
+
+fn series_key(task: &str, prefix: &str) -> String {
+    let mut hash = blake3::Hasher::new();
+    hash.update(&(task.len() as u64).to_le_bytes());
+    hash.update(task.as_bytes());
+    hash.update(prefix.as_bytes());
+    format!("{SERIES_HEAD_PREFIX}{}", hash.finalize().to_hex())
+}
+
 pub struct Journal {
     pub(crate) conn: Connection,
     pub(crate) key: StoreKey,
@@ -459,6 +490,10 @@ impl Journal {
     }
     pub fn task(&self, task_id: &str) -> StoreResult<StoredTask> {
         load_task(&self.conn, &self.key, self.limits, task_id)
+    }
+
+    pub(crate) fn task_on(&self, conn: &Connection, task_id: &str) -> StoreResult<StoredTask> {
+        load_task(conn, &self.key, self.limits, task_id)
     }
     pub fn transition_task(
         &mut self,
@@ -1085,10 +1120,83 @@ impl Journal {
         artifact_id: &str,
         data: Value,
     ) -> StoreResult<Checkpoint> {
+        self.append_checkpoint_on(
+            (checkpoint_id, None),
+            task_id,
+            expected_task_version,
+            artifact_id,
+            data,
+        )
+    }
+
+    /// Publish the checkpoint, its artifact reference, and its authenticated
+    /// series head in the same SQLite transaction.
+    pub fn append_series_checkpoint(
+        &mut self,
+        series: (&str, u64),
+        task_id: &str,
+        expected_task_version: u64,
+        artifact_id: &str,
+        data: Value,
+    ) -> StoreResult<Checkpoint> {
+        let (prefix, sequence) = series;
+        nonblank(prefix)?;
+        if prefix.ends_with(|c: char| c.is_ascii_digit()) {
+            return Err(StoreError::Invalid(
+                "indexed checkpoint prefix ends in a digit".into(),
+            ));
+        }
+        let id = format!("{prefix}{sequence}");
+        self.append_checkpoint_on(
+            (&id, Some((prefix, sequence))),
+            task_id,
+            expected_task_version,
+            artifact_id,
+            data,
+        )
+    }
+
+    fn append_checkpoint_on(
+        &mut self,
+        target: (&str, Option<(&str, u64)>),
+        task_id: &str,
+        expected_task_version: u64,
+        artifact_id: &str,
+        data: Value,
+    ) -> StoreResult<Checkpoint> {
+        let (checkpoint_id, series) = target;
         nonblank(checkpoint_id)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let head = if let Some((prefix, sequence)) = series {
+            let key = series_key(task_id, prefix);
+            let (next, _) = read_series(&tx, &self.key, self.limits, task_id, prefix)?;
+            if next != sequence {
+                return Err(StoreError::Conflict("stale checkpoint series head".into()));
+            }
+            Some((
+                key,
+                SeriesHead {
+                    task_id: task_id.into(),
+                    prefix: prefix.into(),
+                    next: increment(sequence)?,
+                },
+            ))
+        } else {
+            let prefix = checkpoint_id.trim_end_matches(|c: char| c.is_ascii_digit());
+            let indexed: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM store_metadata WHERE name=?1)",
+                [series_key(task_id, prefix)],
+                |row| row.get(0),
+            )?;
+            if indexed {
+                return Err(StoreError::Conflict(
+                    "checkpoint series requires indexed append".into(),
+                ));
+            }
+            None
+        };
         let task = load_task(&tx, &self.key, self.limits, task_id)?;
         check_task_version(&task, expected_task_version)?;
         artifact_owned(&tx, task_id, artifact_id)?;
@@ -1100,83 +1208,51 @@ impl Journal {
             created_at_ms: now()?,
             data,
         };
-        let payload = encode(
-            &self.key,
-            &format!("checkpoint:{checkpoint_id}"),
-            &checkpoint,
-            self.limits.max_payload_bytes,
-        )?;
+        let context = format!("checkpoint:{checkpoint_id}");
+        let payload = match series {
+            Some((prefix, _)) => encode(
+                &self.key,
+                &context,
+                &IndexedCheckpoint {
+                    checkpoint: &checkpoint,
+                    series_prefix: prefix.into(),
+                },
+                self.limits.max_payload_bytes,
+            )?,
+            None => encode(
+                &self.key,
+                &context,
+                &checkpoint,
+                self.limits.max_payload_bytes,
+            )?,
+        };
         tx.execute("INSERT INTO checkpoints(checkpoint_id,task_id,task_version,artifact_id,created_at_ms,payload) VALUES(?1,?2,?3,?4,?5,?6)",params![checkpoint_id,task_id,integer(expected_task_version)?,artifact_id,integer(checkpoint.created_at_ms)?,payload])?;
         add_reference(&tx, task_id, "checkpoint", checkpoint_id, artifact_id)?;
+        if let Some((name, head)) = head {
+            let payload = encode(&self.key, &name, &head, self.limits.max_payload_bytes)?;
+            tx.execute("INSERT INTO store_metadata(name,value) VALUES(?1,?2) ON CONFLICT(name) DO UPDATE SET value=excluded.value",params![name,payload])?;
+        }
         tx.commit()?;
         Ok(checkpoint)
     }
     pub fn checkpoint(&self, checkpoint_id: &str, task_id: &str) -> StoreResult<Checkpoint> {
         let tx = self.conn.unchecked_transaction()?;
-        let row:Option<(String,u64,String,u64,Vec<u8>)>=tx.query_row("SELECT task_id,task_version,artifact_id,created_at_ms,payload FROM checkpoints WHERE checkpoint_id=?1",[checkpoint_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
-        let (owner, version, artifact, created, payload) =
-            row.ok_or_else(|| StoreError::NotFound("checkpoint".into()))?;
-        if owner != task_id {
-            return Err(StoreError::Conflict(
-                "checkpoint belongs to a different task".into(),
-            ));
-        }
-        let cp: Checkpoint = decode(
-            &self.key,
-            &format!("checkpoint:{checkpoint_id}"),
-            &payload,
-            self.limits.max_payload_bytes,
-        )?;
-        if cp.checkpoint_id != checkpoint_id
-            || cp.task_id != owner
-            || cp.task_version != version
-            || cp.artifact_id != artifact
-            || cp.created_at_ms != created
-        {
-            return Err(StoreError::Integrity("checkpoint metadata mismatch".into()));
-        }
-        if load_task(&tx, &self.key, self.limits, task_id)?
-            .record
-            .version
-            < version
-        {
-            return Err(StoreError::Integrity(
-                "checkpoint version is in the future".into(),
-            ));
-        }
-        artifact_owned(&tx, task_id, &artifact)?;
-        require_reference(&tx, task_id, "checkpoint", checkpoint_id, &artifact)?;
+        let (checkpoint, _) = checkpoint_on(&tx, &self.key, self.limits, checkpoint_id, task_id)?;
         tx.commit()?;
-        Ok(cp)
+        Ok(checkpoint)
     }
-    /// Locate a contiguous host-numbered checkpoint series without loading
-    /// every historical artifact. The selected checkpoint is authenticated.
+    /// Authenticate the indexed head and its checkpoint in one read snapshot.
+    /// Legacy series are checked for contiguity until their first indexed write.
     pub fn latest_checkpoint_in_series(
         &self,
         task_id: &str,
         prefix: &str,
     ) -> StoreResult<(u64, Option<Checkpoint>)> {
-        if prefix.is_empty() {
-            return Err(StoreError::Invalid("empty checkpoint prefix".into()));
-        }
-        self.task(task_id)?;
-        let mut stmt = self.conn.prepare("SELECT checkpoint_id FROM checkpoints WHERE task_id=?1 AND substr(checkpoint_id,1,length(?2))=?2 ORDER BY length(checkpoint_id),checkpoint_id")?;
-        let ids = stmt
-            .query_map(params![task_id, prefix], |r| r.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        for (n, id) in ids.iter().enumerate() {
-            if id != &format!("{prefix}{n}") {
-                return Err(StoreError::Integrity(
-                    "checkpoint series has gaps or invalid identities".into(),
-                ));
-            }
-        }
-        Ok((
-            ids.len() as u64,
-            ids.last()
-                .map(|id| self.checkpoint(id, task_id))
-                .transpose()?,
-        ))
+        nonblank(prefix)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let result = read_series(&tx, &self.key, self.limits, task_id, prefix)?;
+        tx.commit()?;
+        Ok(result)
     }
     pub fn events(&self, task_id: &str) -> StoreResult<Vec<JournalEvent>> {
         self.events_on(&self.conn, task_id)
@@ -1396,46 +1472,45 @@ impl Journal {
         for task in tasks {
             self.replay_task_on(&tx, &task)?;
         }
-        let checkpoint_ids = {
-            let mut s=tx.prepare("SELECT checkpoint_id,task_id,task_version,artifact_id,created_at_ms,payload FROM checkpoints ORDER BY checkpoint_id")?;
-            s.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, u64>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, u64>(4)?,
-                    r.get::<_, Vec<u8>>(5)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-        };
-        for (id, task, version, artifact, time, payload) in checkpoint_ids {
-            let checkpoint: Checkpoint = decode(
-                &self.key,
-                &format!("checkpoint:{id}"),
-                &payload,
-                self.limits.max_payload_bytes,
+        let mut managed = std::collections::BTreeMap::new();
+        {
+            let mut statement = tx.prepare("SELECT checkpoint_id,task_id FROM checkpoints")?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let id: String = row.get(0)?;
+                let task: String = row.get(1)?;
+                let (_, series_prefix) = checkpoint_on(&tx, &self.key, self.limits, &id, &task)?;
+                if let Some(prefix) = series_prefix {
+                    managed
+                        .entry(series_key(&task, &prefix))
+                        .or_insert((task, prefix));
+                }
+            }
+        }
+        {
+            let mut statement = tx.prepare(
+                "SELECT name,value FROM store_metadata WHERE name GLOB 'checkpoint-series/v1:*'",
             )?;
-            if checkpoint.checkpoint_id != id
-                || checkpoint.task_id != task
-                || checkpoint.task_version != version
-                || checkpoint.artifact_id != artifact
-                || checkpoint.created_at_ms != time
-            {
-                return Err(StoreError::Integrity("checkpoint metadata mismatch".into()));
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let name: String = row.get(0)?;
+                let payload: Vec<u8> = row.get(1)?;
+                let head: SeriesHead =
+                    decode(&self.key, &name, &payload, self.limits.max_payload_bytes)?;
+                if managed.remove(&name) != Some((head.task_id.clone(), head.prefix.clone()))
+                    || series_count(&tx, &head.task_id, &head.prefix)? != head.next
+                {
+                    return Err(StoreError::Integrity(
+                        "checkpoint series head disagrees with history".into(),
+                    ));
+                }
+                read_series(&tx, &self.key, self.limits, &head.task_id, &head.prefix)?;
             }
-            if load_task(&tx, &self.key, self.limits, &task)?
-                .record
-                .version
-                < version
-            {
-                return Err(StoreError::Integrity(
-                    "checkpoint version is in the future".into(),
-                ));
-            }
-            artifact_owned(&tx, &task, &artifact)?;
-            require_reference(&tx, &task, "checkpoint", &id, &artifact)?;
+        }
+        if !managed.is_empty() {
+            return Err(StoreError::Integrity(
+                "checkpoint series head is missing".into(),
+            ));
         }
         admission::integrity(&tx, &self.key, self.limits)?;
         control_admission::integrity(&tx, &self.key, self.limits)?;
@@ -1458,6 +1533,125 @@ impl Journal {
         destination.close().map_err(|(_, e)| StoreError::Sql(e))?;
         Ok(())
     }
+}
+
+fn checkpoint_on(
+    conn: &Connection,
+    key: &StoreKey,
+    limits: JournalLimits,
+    checkpoint_id: &str,
+    task_id: &str,
+) -> StoreResult<(Checkpoint, Option<String>)> {
+    type Row = (String, u64, String, u64, Vec<u8>);
+    let row: Option<Row> = conn.query_row(
+        "SELECT task_id,task_version,artifact_id,created_at_ms,payload FROM checkpoints WHERE checkpoint_id=?1",
+        [checkpoint_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
+    ).optional()?;
+    let (owner, version, artifact, created, payload) =
+        row.ok_or_else(|| StoreError::NotFound("checkpoint".into()))?;
+    if owner != task_id {
+        return Err(StoreError::Conflict(
+            "checkpoint belongs to a different task".into(),
+        ));
+    }
+    let stored: StoredCheckpoint = decode(
+        key,
+        &format!("checkpoint:{checkpoint_id}"),
+        &payload,
+        limits.max_payload_bytes,
+    )?;
+    let (cp, series_prefix) = match stored {
+        StoredCheckpoint::Indexed(indexed) => (indexed.checkpoint, Some(indexed.series_prefix)),
+        StoredCheckpoint::Legacy(legacy) => (legacy, None),
+    };
+    if cp.checkpoint_id != checkpoint_id
+        || cp.task_id != owner
+        || cp.task_version != version
+        || cp.artifact_id != artifact
+        || cp.created_at_ms != created
+    {
+        return Err(StoreError::Integrity("checkpoint metadata mismatch".into()));
+    }
+    if load_task(conn, key, limits, task_id)?.record.version < version {
+        return Err(StoreError::Integrity(
+            "checkpoint version is in the future".into(),
+        ));
+    }
+    artifact_owned(conn, task_id, &artifact)?;
+    require_reference(conn, task_id, "checkpoint", checkpoint_id, &artifact)?;
+    Ok((cp, series_prefix))
+}
+
+fn series_count(conn: &Connection, task: &str, prefix: &str) -> StoreResult<u64> {
+    let mut statement = conn.prepare("SELECT checkpoint_id FROM checkpoints WHERE task_id=?1 AND substr(checkpoint_id,1,length(?2))=?2 ORDER BY length(checkpoint_id),checkpoint_id")?;
+    let mut rows = statement.query(params![task, prefix])?;
+    let mut next = 0;
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        if id != format!("{prefix}{next}") {
+            return Err(StoreError::Integrity(
+                "checkpoint series has gaps or invalid identities".into(),
+            ));
+        }
+        next = increment(next)?;
+    }
+    Ok(next)
+}
+
+fn read_series(
+    conn: &Connection,
+    key: &StoreKey,
+    limits: JournalLimits,
+    task: &str,
+    prefix: &str,
+) -> StoreResult<(u64, Option<Checkpoint>)> {
+    load_task(conn, key, limits, task)?;
+    let name = series_key(task, prefix);
+    let payload: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT value FROM store_metadata WHERE name=?1",
+            [&name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let head = payload
+        .map(|bytes| decode::<SeriesHead>(key, &name, &bytes, limits.max_payload_bytes))
+        .transpose()?;
+    let next = match &head {
+        Some(head) if head.task_id == task && head.prefix == prefix && head.next > 0 => {
+            let following: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM checkpoints WHERE checkpoint_id=?1 AND task_id=?2)",
+                params![format!("{prefix}{}", head.next), task],
+                |row| row.get(0),
+            )?;
+            if following {
+                return Err(StoreError::Integrity(
+                    "checkpoint series head was rolled back".into(),
+                ));
+            }
+            head.next
+        }
+        Some(_) => {
+            return Err(StoreError::Integrity(
+                "invalid checkpoint series head".into(),
+            ));
+        }
+        None => series_count(conn, task, prefix)?,
+    };
+    let checkpoint = next
+        .checked_sub(1)
+        .map(|sequence| checkpoint_on(conn, key, limits, &format!("{prefix}{sequence}"), task))
+        .transpose()?;
+    if checkpoint
+        .as_ref()
+        .and_then(|(_, series_prefix)| series_prefix.as_deref())
+        != head.as_ref().map(|_| prefix)
+    {
+        return Err(StoreError::Integrity(
+            "checkpoint series head binding mismatch".into(),
+        ));
+    }
+    Ok((next, checkpoint.map(|(checkpoint, _)| checkpoint)))
 }
 
 fn increment(value: u64) -> StoreResult<u64> {

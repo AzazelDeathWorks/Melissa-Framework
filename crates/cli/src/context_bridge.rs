@@ -38,14 +38,14 @@ impl ToolDispatcher for ContextBridge {
             self.validate_call(&c)?;
             let memory = matches!(c.name.as_str(), "memory_search" | "memory_propose");
             if memory && self.project.is_none() {
-                let project =
+                let mut project =
                     ProjectMemory::open(&self.location.home, self.location.key.clone(), &self.repo)
                         .map_err(map)?;
                 self.inner
                     .host()
                     .lock()
                     .map_err(|_| map(Error::Store))?
-                    .replace_memory_book(project.book.clone())
+                    .use_external_project_memory(std::mem::take(&mut project.book))
                     .map_err(|_| map(Error::Store))?;
                 // Keep the exclusive project lease through this agent session.
                 // Host review runs after it ends, preventing lost concurrent edits.
@@ -56,13 +56,12 @@ impl ToolDispatcher for ContextBridge {
                 return result;
             }
             let project = self.project.as_mut().ok_or_else(|| map(Error::Store))?;
-            project.book = self
-                .inner
-                .host()
-                .lock()
-                .map_err(|_| map(Error::Store))?
-                .memory_book();
-            if project.save(&namespace(&self.repo)).is_err() {
+            let host = self.inner.host();
+            let mut host = host.lock().map_err(|_| map(Error::Store))?;
+            if project
+                .save_book(host.memory_book_mut(), &namespace(&self.repo))
+                .is_err()
+            {
                 return Ok(ToolExecution {
                     content: "Project memory write needs reconciliation; do not repeat blindly."
                         .into(),

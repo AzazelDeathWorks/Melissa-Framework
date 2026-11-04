@@ -183,7 +183,9 @@ impl WebPlan {
         limits: ContainerLimits,
         cancel: &AtomicBool,
     ) -> Result<Self> {
-        let mut snapshot = repo.worker_input(source, cancel)?.snapshot;
+        let mut snapshot = repo
+            .worker_input_with_budget(source, cancel, limits.disk_bytes)?
+            .snapshot;
         if registration.services.is_empty()
             || registration.services.len() > 3
             || snapshot
@@ -275,20 +277,18 @@ impl WebPlan {
                 return Err(Error::Invalid("SQL statement source registration"));
             }
         }
-        let sources: BTreeMap<_, _> = snapshot
-            .files
-            .iter()
-            .map(|(p, b)| {
-                (
-                    p.clone(),
-                    b.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                )
-            })
-            .collect();
-        let program = serde_json::json!({"schema_version":"melissa.web-program/v1","registration":registration,"source_digest":source.digest,"sources":sources,"response_limit":limits.output_bytes.min(4*1024*1024),"artifact_limit":limits.export_bytes.min(limits.output_bytes/3).min(64*1024*1024),"playwright_version":"1.64.0"});
+        let program = serde_json::json!({"schema_version":"melissa.web-program/v1","registration":registration,"source_digest":source.digest,"source_manifest_version":melissa_container_executor::source_manifest::VERSION,"sources":melissa_container_executor::source_manifest::seal(&snapshot),"response_limit":limits.output_bytes.min(4*1024*1024),"artifact_limit":limits.export_bytes.min(limits.output_bytes/3).min(64*1024*1024),"playwright_version":"1.64.0"});
         for (p, b) in [
             ("program.json", serde_json::to_vec(&program)?),
-            ("worker.py", include_bytes!("worker.py").to_vec()),
+            (
+                "worker.py",
+                [
+                    melissa_container_executor::source_manifest::VERIFIER,
+                    include_str!("worker.py"),
+                ]
+                .join("\n")
+                .into_bytes(),
+            ),
             ("browser.cjs", include_bytes!("browser.cjs").to_vec()),
             ("sql_runtime.py", include_bytes!("sql_runtime.py").to_vec()),
         ] {

@@ -64,20 +64,30 @@ impl Cas {
     }
 
     pub fn put(&self, plaintext: &[u8]) -> StoreResult<BlobInfo> {
+        if plaintext.len() as u64 > self.max_blob_bytes {
+            return Err(StoreError::Quota(
+                "blob exceeds configured byte limit".into(),
+            ));
+        }
+        self.put_prehashed(plaintext, &digest_for(plaintext))
+    }
+
+    /// Only for the store's publication path, which computes the digest for
+    /// quota admission over these exact bytes before creating the blob.
+    pub(crate) fn put_prehashed(&self, plaintext: &[u8], digest: &str) -> StoreResult<BlobInfo> {
         self.validate_directories()?;
         if plaintext.len() as u64 > self.max_blob_bytes {
             return Err(StoreError::Quota(
                 "blob exceeds configured byte limit".into(),
             ));
         }
-        let digest = digest_for(plaintext);
-        let path = self.blob_path(&digest)?;
+        let path = self.blob_path(digest)?;
         match fs::symlink_metadata(&path) {
-            Ok(_) => return self.verified_info(&digest),
+            Ok(_) => return self.verified_info(digest),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        let envelope = self.key.seal(plaintext, &blob_aad(&digest))?;
+        let envelope = self.key.seal(plaintext, &blob_aad(digest))?;
         let mut staged = tempfile::Builder::new()
             .prefix(STAGE_PREFIX)
             .suffix(STAGE_SUFFIX)
@@ -89,12 +99,12 @@ impl Cas {
             Ok(published) => {
                 published.sync_all()?;
                 sync_directory(&self.root.join("blobs"))?;
-                self.verified_info(&digest)
+                self.verified_info(digest)
             }
             Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
                 // A concurrent successful writer may win; verify its complete
                 // ciphertext instead of assuming an existing name is healthy.
-                self.verified_info(&digest)
+                self.verified_info(digest)
             }
             Err(error) => Err(error.error.into()),
         }

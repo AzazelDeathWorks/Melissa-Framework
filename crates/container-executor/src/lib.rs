@@ -1,6 +1,8 @@
 //! Trusted-host Docker executor: immutable Linux image, read-only root and one
 //! capacity-bounded tmpfs. No worker receives host mounts or daemon access.
 use serde::{Deserialize, Serialize};
+pub mod source_manifest;
+
 use std::{collections::BTreeMap, fmt, sync::atomic::AtomicBool};
 mod archive;
 pub mod recovery;
@@ -184,7 +186,7 @@ pub struct Snapshot {
     pub files: BTreeMap<String, Vec<u8>>,
 }
 impl Snapshot {
-    /// Validate transfer metadata before allocating or hex-encoding file bytes.
+    /// Validate transfer metadata before materializing file bodies.
     pub fn preflight<'a>(
         files: impl IntoIterator<Item = (&'a str, u64)>,
         max_bytes: u64,
