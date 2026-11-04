@@ -238,13 +238,22 @@ fn policy() -> GatewayPolicy {
     }
 }
 fn gateway(store: LocalStore, http: &HttpFixture, policy: GatewayPolicy) -> Gateway {
+    fixture_gateway(store, http, policy, "fixture-provider", "fixture-model")
+}
+fn fixture_gateway(
+    store: LocalStore,
+    http: &HttpFixture,
+    policy: GatewayPolicy,
+    provider: &str,
+    model: &str,
+) -> Gateway {
     Gateway::new(
         store,
         Catalog::load_definitions(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap(),
         vec![ModelRegistration {
             registration_id: "fixture-route".into(),
             endpoint: ProviderEndpoint::new(
-                "fixture-provider".into(),
+                provider.into(),
                 RESOURCE.into(),
                 AUTH.into(),
                 Protocol::OpenAiResponses,
@@ -253,7 +262,7 @@ fn gateway(store: LocalStore, http: &HttpFixture, policy: GatewayPolicy) -> Gate
                 ApiKey::new("fixture-not-a-secret".into()).unwrap(),
             )
             .unwrap(),
-            model_id: "fixture-model".into(),
+            model_id: model.into(),
             capabilities: Capabilities {
                 tool_calling: true,
                 structured_output: true,
@@ -1494,4 +1503,146 @@ async fn unpriced_model_with_exhausted_cost_budget_stops_as_budget_exhausted() {
         .unwrap();
     assert_eq!(result.status, RunStatus::BudgetExhausted);
     assert_eq!(http.requests.load(Ordering::SeqCst), 0);
+}
+
+// State-dependent tool availability, with a changed declaration and an
+// unregistered name offered by the fixture after the first action.
+struct ChangingTools(FakeTools);
+impl ToolDispatcher for ChangingTools {
+    fn definitions(&self) -> Vec<BoundTool> {
+        let mut tools = self.0.definitions();
+        if self.0.executed.load(Ordering::SeqCst) != 0 {
+            tools[0].definition.parameters["properties"]["value"]["minLength"] = json!(1);
+            let mut new = tools[0].clone();
+            new.definition.name = "unregistered".into();
+            tools.push(new);
+        }
+        tools
+    }
+    fn validate_call(&self, call: &ToolCall) -> Result<()> {
+        self.0.validate_call(call)
+    }
+    fn execute<'a>(
+        &'a mut self,
+        call: ToolCall,
+        context: ToolContext,
+        cancelled: Arc<AtomicBool>,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolExecution>> + Send + 'a>> {
+        self.0.execute(call, context, cancelled)
+    }
+}
+
+#[tokio::test]
+async fn same_model_baseline_and_live_projection_use_distinct_wire_schemas() {
+    for projected in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let http = http_fixture(vec![
+            HttpPlan::sse(tool_response(&[(
+                "first",
+                "process_exec",
+                r#"{"value":"first"}"#,
+            )])),
+            HttpPlan::sse(tool_response(&[(
+                "second",
+                "process_exec",
+                r#"{"value":"second"}"#,
+            )])),
+            HttpPlan::sse(text_response("A candidate", false, true)),
+        ])
+        .await;
+        let mut g = gateway(store(dir.path(), 100_000), &http, policy());
+        if projected {
+            g = g.with_live_tool_projection();
+        }
+        let mut tools = ChangingTools(FakeTools::default());
+        let result = g
+            .run(
+                &spec("tool-projection"),
+                &mut tools,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+        let bodies = http.bodies.lock().unwrap();
+        assert_eq!(bodies[0]["model"], bodies[1]["model"]);
+        assert_eq!(bodies[0]["tools"].as_array().unwrap().len(), 1);
+        assert!(!bodies[1].to_string().contains("unregistered"));
+        if projected {
+            assert!(bodies[1]["tools"].is_null() || bodies[1]["tools"] == json!([]));
+            assert_eq!(tools.0.executed.load(Ordering::SeqCst), 1);
+        } else {
+            assert_eq!(bodies[1]["tools"], bodies[0]["tools"]);
+            assert_eq!(tools.0.executed.load(Ordering::SeqCst), 2);
+        }
+        assert!(!result.task_accepted);
+    }
+}
+
+#[tokio::test]
+async fn settled_provider_boundary_starts_clean_native_wire_and_keeps_task_charges() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = http_fixture(vec![
+        HttpPlan::sse(tool_response(&[(
+            "provider-a-call",
+            "process_exec",
+            r#"{"value":"from-a"}"#,
+        )])),
+        HttpPlan::sse(text_response("Candidate A", false, true)),
+    ])
+    .await;
+    let second = http_fixture(vec![HttpPlan::sse(text_response(
+        "Candidate B",
+        false,
+        true,
+    ))])
+    .await;
+    let db = store(dir.path(), 100_000);
+    let mut a = fixture_gateway(
+        db.connect().unwrap(),
+        &first,
+        policy(),
+        "fixture-a",
+        "fixture-model-a",
+    );
+    let mut b = fixture_gateway(
+        db.connect().unwrap(),
+        &second,
+        policy(),
+        "fixture-b",
+        "fixture-model-b",
+    );
+    let cancel = Arc::new(AtomicBool::new(false));
+    let r = a
+        .run(
+            &spec("specialist-a"),
+            &mut FakeTools::default(),
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status, RunStatus::FinalCandidate);
+    let settled = db.journal().model_budget(TASK).unwrap();
+    assert_eq!(settled.active_requests, 0);
+    assert_eq!(settled.unknown_requests, 0);
+    let r = b
+        .run(&spec("specialist-b"), &mut FakeTools::default(), cancel)
+        .await
+        .unwrap();
+    assert_eq!(r.status, RunStatus::FinalCandidate);
+    let requests = db.journal().model_requests(TASK).unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].reservation.provider_id, "fixture-a");
+    assert_eq!(requests[2].reservation.provider_id, "fixture-b");
+    let body = &second.bodies.lock().unwrap()[0];
+    assert_eq!(body["model"], "fixture-model-b");
+    assert!(body["previous_response_id"].is_null());
+    assert!(!body.to_string().contains("provider-a-call"));
+    assert!(
+        db.journal()
+            .model_budget(TASK)
+            .unwrap()
+            .charged_cost_micro_usd
+            > settled.charged_cost_micro_usd
+    );
+    assert!(!r.task_accepted);
 }

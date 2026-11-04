@@ -170,6 +170,39 @@ oluşturmadan toparlanabilir.
 Bu bağlantılar yerel protokol ve süreç testleriyle sınanır. Canlı modelin
 plan kalitesi ve görev başarısı ayrıca ölçülmelidir.
 
+## Model havuzu ve araç profilleri
+
+Mevcut ayar dosyasındaki model havuzun ilk üyesidir. İsteğe bağlı
+`model_pool` listesine `{"id":"ikinci","settings":{...}}` biçiminde üyeler
+eklenebilir. Her `settings` nesnesi, iç içe havuz alanı olmadan, ana
+[ayar örneğindeki](../examples/cli/settings.template.json) tam model
+alanlarını kullanır. Model kimliği, protokol, fiyat, bağlam kapasitesi ve
+anahtar referansı her üye için ayrı tanımlanır. `config show` ve görev
+onayından önceki plan, havuzu anahtar referanslarını göstermeden listeler.
+Eski tek model ayarları çalışmaya devam eder.
+
+Her üyede `tool_profile` olarak `precision`, `terminal` veya `hybrid`
+seçilebilir. Varsayılan `precision`, kaynak gezintisi, kesin patch ve
+tipli SDK işlemleri kullanır. `terminal`, görevde izinli SDK işlemlerini
+`sandbox_check` ve `sandbox_tests` gibi kısa komutlarla sunar. Komutlar
+çalışma dizini, ortam değişkeni veya serbest argv kabul etmez.
+`hybrid`, yapılandırılmış gezinti ve testleri seçili kısa komutlarla
+birleştirir. Araç şemaları uzman, görev ve o anda erişilebilir araçlara
+göre süzülür. Saklı veya kapsam dışı çağrılar yürütülmez.
+
+`measurements` nesnesinde isteğe bağlı `task_success_ppm` ve
+`p95_latency_ms` verilebilir. Ölçüm yoksa değer bilinmiyor kalır.
+Basit işlerde maliyet ve gecikme, karmaşık iş ve incelemelerde ölçülmüş
+kalite öne çıkar. Havuz seçiminde görünen ilk bağlamın UTF-8 boyutu ve
+tam bağlam üzerinden hesaplanan maliyet üst sınırı kullanılır. Gateway,
+gönderilen isteği ve kalan bütçeyi ayrıca doğrular.
+
+Seçilen model, onaylı ayarlar ve uzman oturumuyla kaydedilir. Aynı oturum
+devam ederken seçim değişmez. Yeni uzman kendi model oturumunu açar;
+önceki sağlayıcının yerel protokol durumu aktarılmaz. Sağlayıcı çağrılarının
+maliyeti aynı görev bütçesinden düşer. Sonucu belirsiz işlemler yeni
+yönlendirme için durdurma sebebidir.
+
 ## Görev hazırlamak
 
 ```powershell

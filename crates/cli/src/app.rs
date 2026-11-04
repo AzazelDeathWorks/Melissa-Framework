@@ -346,14 +346,18 @@ impl App {
         if let Some(path) = &recipe.source_ref {
             reject_private(path)?;
         }
-        if let crate::settings::Credential::File { path } = &settings.credential {
-            reject_private(path)?;
+        for (_, model) in settings.models() {
+            if let crate::settings::Credential::File { path } = &model.credential {
+                reject_private(path)?;
+            }
         }
         if recipe
             .domain
             .as_ref()
             .is_some_and(|d| d.kind == crate::domain::Kind::Frontend)
-            && !settings.capabilities.vision
+            && !settings
+                .models()
+                .any(|(_, model)| model.capabilities.vision)
         {
             return Err(Error::Denied(
                 "Frontend tarifi gerçek görsel girdi destekli model gerektirir.",
@@ -490,10 +494,21 @@ impl App {
                 .into_iter()
                 .collect();
             let s = self.settings()?;
-            task.allowed_resource_ids
-                .push(format!("provider:{}", s.provider_id));
-            task.authorization_refs
-                .push(format!("authorization:provider:{}", s.provider_id));
+            if s.digest()? != e.settings_digest {
+                return Err(Error::Conflict(
+                    "Model settings changed during task preparation.",
+                ));
+            }
+            for provider in s
+                .models()
+                .map(|(_, m)| &m.provider_id)
+                .collect::<std::collections::BTreeSet<_>>()
+            {
+                task.allowed_resource_ids
+                    .push(format!("provider:{provider}"));
+                task.authorization_refs
+                    .push(format!("authorization:provider:{provider}"));
+            }
             task.allowed_effects = vec![
                 "workspace.read".into(),
                 "workspace.propose_patch".into(),
@@ -552,7 +567,7 @@ impl App {
         }
         let t = s.transition_task(&id, 0, TaskState::Planned, None)?;
         let meaning = if execution.is_some() {
-            "Authorize the displayed recipe, exact source, provider-settings digest, scoped writable paths, isolated build/protected checks and paid model use within the task budget; final acceptance still requires protected host evidence"
+            "Authorize the displayed recipe, exact source, displayed model settings and approved providers, scoped writable paths, isolated build/protected checks and paid model use within the task budget; final acceptance still requires protected host evidence"
         } else {
             "Acknowledge this frozen source-review plan; no process, model, patch or completion permission is granted"
         };
@@ -589,6 +604,11 @@ impl App {
                 json!("Gateway_workflow_scoped_repository_CODE03_protected_QA");
             value["execution_plan"] = e.recipe.public_plan();
             value["settings_digest"] = json!(e.settings_digest);
+            if let Ok(settings) = self.settings()
+                && settings.digest()? == e.settings_digest
+            {
+                value["execution_plan"]["approved_models"] = settings.model_summary();
+            }
             value["expires_at_ms"] = json!(e.expires_at_ms);
             value["runtime_digest"] = json!(e.runtime_digest);
             if let Ok(control) = self.live(id) {

@@ -330,3 +330,32 @@ fn new_executable_tasks_approve_serial_verification_even_from_a_single_step_reci
     assert_eq!(v["model_budget"]["active_requests"], 0);
     assert_eq!(v["model_budget"]["known_cost_micro_usd"], 0);
 }
+
+#[test]
+fn approved_model_pool_is_displayed_without_reading_alternative_credentials() {
+    let f = Fixture::new();
+    let mut config: Value = serde_json::from_slice(&fs::read(&f.config).unwrap()).unwrap();
+    let mut alternate = config.clone();
+    alternate["provider_id"] = json!("alternative-fixture");
+    alternate["endpoint"] = json!("https://alternate.example.invalid/v1/responses");
+    alternate["model"] = json!("alternate-model");
+    alternate["credential"] =
+        json!({"kind":"environment","name":"MELISSA_UNUSED_POOL_FIXTURE_KEY"});
+    alternate["tool_profile"] = json!("terminal");
+    config["model_pool"] = json!([{"id":"alternate","settings":alternate}]);
+    fs::write(&f.config, serde_json::to_vec(&config).unwrap()).unwrap();
+    let imported = f.app().configure(&f.config).unwrap();
+    assert_eq!(imported["secret_resolved"], false);
+    assert_eq!(imported["models"].as_array().unwrap().len(), 2);
+    let task = f.task();
+    let plan = &task["execution_plan"]["approved_models"];
+    assert_eq!(plan[1]["tool_profile"], "terminal");
+    assert_eq!(plan[1]["provider"], "alternative-fixture");
+    assert!(!task.to_string().contains("MELISSA_UNUSED_POOL_FIXTURE_KEY"));
+    assert_eq!(task["model_budget"]["active_requests"], 0);
+    let approved_digest = task["settings_digest"].clone();
+    config["model_pool"][0]["settings"]["tool_profile"] = json!("hybrid");
+    fs::write(&f.config, serde_json::to_vec(&config).unwrap()).unwrap();
+    let changed = f.app().configure(&f.config).unwrap();
+    assert_ne!(changed["settings_digest"], approved_digest);
+}

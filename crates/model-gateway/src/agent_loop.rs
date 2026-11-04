@@ -1,8 +1,8 @@
 //! Single-agent vertical slice. The model proposes, trusted policy grants,
 //! CODE-03 executes, CODE-02 persists. A final answer is always a candidate.
 use crate::{
-    DecoderLimits, ErrorKind, GatewayError, Message, ModelResponse, RequestLimits, Result,
-    StopReason, TurnRequest,
+    DecoderLimits, ErrorKind, GatewayError, Message, RequestLimits, Result, StopReason,
+    TurnRequest,
     output_capabilities::{OutputCapabilityRegistration, OutputCapabilityRegistry, OutputMode},
     routing::{ModelRegistration, RouteRequirements, select_routes_for_output_mode},
     tools::{ToolContext, ToolDispatcher},
@@ -123,6 +123,7 @@ pub struct Gateway {
     policy: GatewayPolicy,
     transport: HttpTransport,
     json_object_output: bool,
+    live_tool_projection: bool,
     output_capabilities: OutputCapabilityRegistry,
     unknown_permits: BTreeMap<String, OwnedSemaphorePermit>,
     continuation: Option<Box<dyn crate::continuation::ContinuationStore>>,
@@ -195,6 +196,7 @@ impl Gateway {
             policy,
             transport: HttpTransport::new(local_only)?,
             json_object_output: false,
+            live_tool_projection: false,
             output_capabilities: OutputCapabilityRegistry::default(),
             unknown_permits: BTreeMap::new(),
             continuation: None,
@@ -203,6 +205,12 @@ impl Gateway {
             vision: None,
             context_compiler: None,
         })
+    }
+    /// Advertise only the currently available subset of the approved declarations.
+    /// A backend cannot introduce a new name, grant or altered schema mid-run.
+    pub fn with_live_tool_projection(mut self) -> Self {
+        self.live_tool_projection = true;
+        self
     }
     /// Opt-in host configuration; the legacy constructor keeps its 30-minute bound.
     /// The continuation binding includes the actual selected duration.
@@ -587,6 +595,9 @@ impl Gateway {
         } else {
             String::new()
         };
+        if self.continuation.is_some() && self.live_tool_projection {
+            binding = digest(&encoded(&(binding, "live-tool-projection/v1"))?);
+        }
         if self.continuation.is_some() {
             let image_details = self
                 .models
@@ -659,7 +670,7 @@ impl Gateway {
             })?;
         }
         for turn in next_turn..self.policy.max_turns {
-            let mut accepted: Option<(ModelResponse, String)> = None;
+            let mut accepted = None;
             let mut tried = BTreeSet::new();
             for attempt in 0..self.policy.max_requests {
                 if cancelled.load(Ordering::Acquire)
@@ -719,11 +730,27 @@ impl Gateway {
                     .as_ref()
                     .map(|c| c.working_messages(&messages, &spec.task_id, &spec.run_id))
                     .unwrap_or_else(|| (messages.clone(), vec![]));
+                let advertised = if self.live_tool_projection {
+                    let current = dispatcher.definitions();
+                    definitions
+                        .iter()
+                        .filter(|original| {
+                            current.iter().any(|live| {
+                                live.canonical_id == original.canonical_id
+                                    && live.definition.name == original.definition.name
+                                    && live.definition.parameters == original.definition.parameters
+                                    && live.definition.strict == original.definition.strict
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    definitions.iter().collect::<Vec<_>>()
+                };
                 let mut request = TurnRequest {
                     model: model.model_id.clone(),
                     system_prompt: system.clone(),
                     messages: working_messages,
-                    tools: definitions.iter().map(|v| v.definition.clone()).collect(),
+                    tools: advertised.iter().map(|v| v.definition.clone()).collect(),
                     max_output_tokens: spec.max_output_tokens.min(model.max_output_tokens),
                     output_schema: if typed_schema {
                         None
@@ -1088,7 +1115,7 @@ impl Gateway {
                 }
                 if let Some(response) = outcome.response {
                     selected = Some(index);
-                    accepted = Some((response, request_id));
+                    accepted = Some((response, request_id, advertised));
                     break;
                 }
                 let kind = outcome
@@ -1164,7 +1191,7 @@ impl Gateway {
                     .min(self.policy.max_backoff_ms);
                 tokio::select! {_=tokio::time::sleep(Duration::from_millis(delay))=>{},_=crate::transport::wait_cancelled(&combined)=>{}}
             }
-            let Some((response, request_id)) = accepted else {
+            let Some((response, request_id, advertised)) = accepted else {
                 result.status = RunStatus::ProviderFailed;
                 return self.complete(result);
             };
@@ -1285,7 +1312,7 @@ impl Gateway {
             for call in &response.calls {
                 if self.recovery.is_some() {
                     if let Some(definition) =
-                        definitions.iter().find(|d| d.definition.name == call.name)
+                        advertised.iter().find(|d| d.definition.name == call.name)
                     {
                         if let Err(e) = crate::schema::validate_output(
                             &definition.definition.parameters,
@@ -1320,9 +1347,8 @@ impl Gateway {
                 {
                     preflight_error = true;
                 }
-                if !wire_names.contains(&call.name)
-                    || !seen_calls.insert(call.id.clone())
-                    || definitions
+                if !seen_calls.insert(call.id.clone())
+                    || advertised
                         .iter()
                         .find(|d| d.definition.name == call.name)
                         .is_none_or(|d| {

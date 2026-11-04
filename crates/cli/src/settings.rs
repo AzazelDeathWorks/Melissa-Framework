@@ -7,7 +7,7 @@ use crate::{
 };
 use melissa_model_gateway::{
     Protocol,
-    routing::{Capabilities, RateCard},
+    routing::{Capabilities, Measurements, RateCard},
     transport::{ApiKey, EndpointTrust, ProviderEndpoint},
 };
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,13 @@ pub enum Credential {
     File { path: PathBuf },
     Environment { name: String },
 }
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoolModel {
+    pub id: String,
+    pub settings: Settings,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -47,6 +54,15 @@ pub struct Settings {
     pub native_json_schema: bool,
     pub single_attempt: bool,
     pub rate_card: RateCard,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_pool: Vec<PoolModel>,
+    #[serde(default, skip_serializing_if = "Measurements::is_empty")]
+    pub measurements: Measurements,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::model_tools::ToolProfile::is_precision"
+    )]
+    pub tool_profile: crate::model_tools::ToolProfile,
 }
 fn default_request_timeout() -> u64 {
     1_800_000
@@ -56,6 +72,25 @@ fn is_default_request_timeout(value: &u64) -> bool {
 }
 impl Settings {
     pub fn validate(&self) -> Result {
+        if self.model_pool.len() > 15 {
+            return Err(Error::Usage("Model pool supports at most 16 models."));
+        }
+        let mut ids = std::collections::BTreeSet::from(["cli-selected"]);
+        let mut models = std::collections::BTreeSet::from([(&self.provider_id, &self.model)]);
+        self.validate_model()?;
+        for entry in &self.model_pool {
+            if !melissa_workflow::plan::identifier(&entry.id)
+                || !ids.insert(&entry.id)
+                || !entry.settings.model_pool.is_empty()
+                || !models.insert((&entry.settings.provider_id, &entry.settings.model))
+            {
+                return Err(Error::Usage("Invalid or duplicate model pool entry."));
+            }
+            entry.settings.validate_model()?;
+        }
+        Ok(())
+    }
+    fn validate_model(&self) -> Result {
         if let Some(config) = &self.local_tokenizer {
             config
                 .validate()
@@ -109,9 +144,31 @@ impl Settings {
         let endpoint = self.endpoint_with_key(
             ApiKey::new("configuration-validation".into()).map_err(|_| Error::Store)?,
         )?;
-        self.rate_card
-            .validate(&endpoint)
-            .map_err(|_| Error::Usage("Maliyet tarifesi kaynağı geçersiz."))
+        crate::model_pool::output_capability(
+            &self.registration("configuration-check", endpoint, self.request_timeout_ms),
+            self,
+            "configuration-validation",
+        )?;
+        Ok(())
+    }
+    pub(crate) fn models(&self) -> impl Iterator<Item = (&str, &Settings)> {
+        std::iter::once(("cli-selected", self)).chain(
+            self.model_pool
+                .iter()
+                .map(|entry| (entry.id.as_str(), &entry.settings)),
+        )
+    }
+    pub(crate) fn model_summary(&self) -> Value {
+        json!(self.models().map(|(id, m)| json!({
+            "id":id,"provider":m.provider_id,"model":m.model,"origin":url::Url::parse(&m.endpoint).ok().map(|url|url.origin().ascii_serialization()),
+            "protocol":m.protocol,"tool_profile":m.tool_profile,"measurements":m.measurements,
+            "context_tokens":m.context_tokens,"max_output_tokens":m.max_output_tokens,
+            "json_object":m.json_object,"native_json_schema":m.native_json_schema,
+            "capabilities":m.capabilities,
+            "rate_card_digest":m.rate_card.digest(),
+            "input_micro_usd_per_million":m.rate_card.input_micro_usd_per_million,
+            "output_micro_usd_per_million":m.rate_card.output_micro_usd_per_million
+        })).collect::<Vec<_>>())
     }
     pub(crate) fn endpoint_with_key(&self, key: ApiKey) -> Result<ProviderEndpoint> {
         let mut endpoint = ProviderEndpoint::new(
@@ -197,7 +254,9 @@ impl App {
         let value: Settings = decode(&data)?;
         value.validate()?;
         // Validate the pinned public artifact without resolving any API key.
-        let _ = value.context_compiler()?;
+        for (_, model) in value.models() {
+            let _ = model.context_compiler()?;
+        }
         let encoded = self.key.seal(&bytes(&value)?, b"melissa.cli.settings.v1")?;
         let temp = self.home.join(format!("settings-{}.tmp", nonce()?));
         let mut file = fs::OpenOptions::new()
@@ -224,7 +283,7 @@ impl App {
     pub fn configuration(&self) -> Result<Value> {
         let s = self.settings()?;
         Ok(
-            json!({"command":"config show","settings_digest":s.digest()?,"provider":s.provider_id,"model":s.model,"endpoint":s.endpoint,"protocol":s.protocol,"context_tokens":s.context_tokens,"max_output_tokens":s.max_output_tokens,"capabilities":s.capabilities,"json_object":s.json_object,"native_json_schema":s.native_json_schema,"local_tokenizer":s.local_tokenizer.as_ref().map(|c| json!({"blake3":c.blake3,"measurement":"native_wire_only"})),"credential":"[REDACTED: reference only]","secret_resolved":false}),
+            json!({"command":"config show","settings_digest":s.digest()?,"provider":s.provider_id,"model":s.model,"endpoint":s.endpoint,"protocol":s.protocol,"context_tokens":s.context_tokens,"max_output_tokens":s.max_output_tokens,"capabilities":s.capabilities,"json_object":s.json_object,"native_json_schema":s.native_json_schema,"local_tokenizer":s.local_tokenizer.as_ref().map(|c| json!({"blake3":c.blake3,"measurement":"native_wire_only"})),"credential":"[REDACTED: reference only]","secret_resolved":false,"models":s.model_summary()}),
         )
     }
 }
