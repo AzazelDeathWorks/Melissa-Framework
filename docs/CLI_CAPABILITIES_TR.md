@@ -121,6 +121,55 @@ Worker aktarımı en çok 1024 dosya/64 MiB kabul eder ve kopyalama öncesinde
 denetlenir. Ustar aktarımı 155 byte önek/100 byte son ad alanına sığan uzun
 yolları destekler; desteklenmeyen yol veya boyut açık hata olarak kalır.
 
+## Uyarlanan sıralı uzman yürütmesi
+
+`task prepare`, dosya kapsamını, depo büyüklüğünü, kaynakta görülen import
+ilişkilerini, test kapsamını ve işlem riskini birlikte değerlendirir.
+Karmaşıklık sonucu `simple`, `moderate`, `complex`, `long_horizon` veya
+`high_risk` olur. Import ilişkileri adaydır; anlamsal çözümleme kanıtı
+olarak gösterilmez. İnceleme sınırına ulaşılırsa `incomplete` açıkça yazılır.
+Maliyet tahmini için ölçüm yoksa değer bilinmiyor kalır; yetkili süre ve
+maliyet yalnız operatörün kabul tarifinden alınır.
+
+Basit bir uygulama değişikliği implementer → test-engineer → reviewer
+sırasını kullanır. Mimari işlerde repository-analyst ve architect,
+derleme sorunlarında debugger, yüksek riskte security-reviewer eklenir.
+Yalnız mevcut katalogdaki çalıştırılabilir profiller seçilir.
+Salt okunur görevlerde yazma yetkisi verilmez.
+
+Yeni yürütülebilir CLI görevlerinde bağımsız test-engineer ve son reviewer
+eksikse görev sözleşmesi oluşturulmadan eklenir; onay ekranı bütün seçilen
+profilleri gösterir. En az üç seri adım `adaptive_serial` yürütmesini
+kullanır. Aynı anda bir uzman çalışır. Son yazma işleminden sonra test ve
+bağımsız inceleme zorunludur. Önceden kaydedilmiş görevlerin sözleşmeleri
+ve genel çekirdek API'leri değiştirilmez.
+
+Uzman `task_plan_propose` ile kalan adımlar için öneri kaydedebilir.
+Öneri güncel kaynak ve plan özetiyle bağlanır, yalnız ilk onaylanan uzman
+şablonlarını kullanır ve mevcut uzman bitince uygulanır. Model yeni araç,
+dosya kapsamı, yetki, kabul ölçütü veya bütçe belirleyemez. Tamamlanmış
+adımlar korunur. Aynı planın tekrarı ve sınırsız yeniden planlama reddedilir.
+
+Kalıcı görev kaydı hedefi, tamamlanan adımları, değişen dosyaları, aday
+bulguları, başarısız denemeleri, gerçek kontrol kayıtlarını ve kalan bütçeyi
+saklar. Uzmanlar kısa aday özetleri ve kanıt referanslarıyla devralır.
+Bütün konuşma geçmişi devir paketine kopyalanmaz. `task_evidence_read` ile
+kayıtta referansı bulunan aday veya genel kontrol kanıtları sayfalanabilir;
+özel kabul çıktıları ve rastgele kayıt kimlikleri bu araçtan okunamaz. Aday bulguları doğrulanmış
+olgulardan ayrı tutulur; kaynak değişince eski başarılı kontrol bilgisi
+güncel doğrulama sayılmaz. Modelin aday üretmesi görevi kabul etmez;
+kabul edilen çıktı yalnız korumalı host doğrulamasından sonra kaydedilir.
+
+`task progress`, bu kayıtla birlikte yürütücünün kararını gösterir.
+Tekrarlanan kontrol başarısızlığı, bütçe/süre dolması ve sonucu belirsiz
+işlemler ilerlemeyi durdurur. Plan değişimi önceki maliyeti, başarısızlıkları
+ve bitiş zamanını sıfırlamaz. Uzman ataması ve devir paketi aynı kalıcı
+checkpoint içindedir; bu sınırdaki kesinti yeni uzman veya mükerrer çağrı
+oluşturmadan toparlanabilir.
+
+Bu bağlantılar yerel protokol ve süreç testleriyle sınanır. Canlı modelin
+plan kalitesi ve görev başarısı ayrıca ölçülmelidir.
+
 ## Görev hazırlamak
 
 ```powershell

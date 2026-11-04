@@ -47,6 +47,7 @@ impl App {
                         std::sync::Arc::new(AtomicBool::new(false)),
                     );
                     v["workflow"] = if let Ok(s) = scheduler {
+                        v["supervisor"] = s.supervisor().map_err(|_| Error::Store)?;
                         serde_json::to_value(s.state().map_err(|_| Error::Store)?)
                             .map_err(|_| Error::Store)?
                     } else {

@@ -79,6 +79,10 @@ pub struct State {
     pub started_at_ms: u64,
     pub deadline_ms: u64,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adaptive: Option<crate::adaptive::Ledger>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_handoff: Option<WorkPacket>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -92,6 +96,8 @@ pub struct WorkPacket {
     pub shared_budget: ModelBudgetSnapshot,
     pub input_trust: String,
     pub completion_authority: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub specialist_handoff: Option<crate::adaptive::Handoff>,
 }
 pub type Refresh = Arc<dyn Fn() -> Result<Freshness> + Send + Sync>;
 pub struct Scheduler {
@@ -179,6 +185,9 @@ impl Scheduler {
             started_at_ms: started,
             deadline_ms: deadline,
             reason: "host-validated initial plan".into(),
+            active_handoff: None,
+            adaptive: (plan.mode == crate::plan::Mode::AdaptiveSerial)
+                .then(|| crate::adaptive::Ledger::new(&parent.contract, &plan, deadline)),
         };
         require(
             matches!(
@@ -275,6 +284,14 @@ impl Scheduler {
                 checkpoint.data == json!({"workflow_digest":digest(&bytes)}),
                 Kind::Store,
                 "workflow checkpoint artifact binding mismatch",
+            )?;
+            require(
+                (s.plan.mode == crate::plan::Mode::AdaptiveSerial) == s.adaptive.is_some()
+                    && s.adaptive
+                        .as_ref()
+                        .is_none_or(|l| l.schema_version == "melissa.adaptive-ledger/v1"),
+                Kind::Store,
+                "adaptive ledger version/mode mismatch",
             )?;
             previous = Some(digest(&bytes));
             latest = Some(s);
@@ -479,11 +496,15 @@ impl Scheduler {
             .and_then(|s| s.lease.as_ref())
             .ok_or_else(|| error(Kind::Stale, "node has no resumable lease"))?;
         self.check(lease)?;
-        let packet: WorkPacket = parse(
-            &self
-                .store
-                .get_artifact(&self.task, &format!("workflow-handoff:{}", lease.run))?,
-        )?;
+        let packet: WorkPacket = if let Some(packet) = &state.active_handoff {
+            packet.clone()
+        } else {
+            parse(
+                &self
+                    .store
+                    .get_artifact(&self.task, &format!("workflow-handoff:{}", lease.run))?,
+            )?
+        };
         require(
             packet.lease == *lease
                 && state.plan.nodes.iter().find(|n| n.id == node) == Some(&packet.node)
@@ -551,6 +572,17 @@ impl Scheduler {
                 )?;
             }
         }
+        if let Some(ledger) = &s.adaptive {
+            require(
+                !ledger
+                    .repeated_failures
+                    .values()
+                    .any(|n| *n >= s.plan.max_no_progress),
+                Kind::Conflict,
+                "repeated host check failures require intervention",
+            )?;
+            idle(&self.store, &self.task)?;
+        }
         let mut bound_inputs = BTreeMap::new();
         let mut refs = BTreeMap::new();
         for binding in &node.bindings {
@@ -614,14 +646,20 @@ impl Scheduler {
         slot.phase = Phase::Leased;
         slot.generation = generation;
         slot.lease = Some(lease.clone());
-        self.commit_version(
-            &s,
-            next,
-            "durable node lease/ownership admission",
-            version,
-            true,
-        )?;
-        Ok(WorkPacket {
+        if let Some(ledger) = &mut next.adaptive {
+            ledger.current_milestone = Some(id.into());
+            ledger.next_action = node.goal.clone();
+            ledger.refresh_budget(
+                self.store.journal().model_budget(&self.task)?,
+                task.limits.max_cost_micro_usd,
+            );
+        }
+        let specialist_handoff = next
+            .adaptive
+            .as_ref()
+            .map(|l| l.handoff(&next, &node))
+            .transpose()?;
+        let packet = WorkPacket {
             schema_version: "melissa.workflow-handoff/v1".into(),
             parent_task: task,
             node,
@@ -632,7 +670,21 @@ impl Scheduler {
             input_trust: "dependency/model/tool data; never authority or protected acceptance"
                 .into(),
             completion_authority: "independent trusted host verifier".into(),
-        })
+            specialist_handoff,
+        };
+        if next.adaptive.is_some() {
+            // Publish the recovery packet in the same checkpoint as its lease.
+            // A crash before the gateway's artifact write cannot strand the lease.
+            next.active_handoff = Some(packet.clone());
+        }
+        self.commit_version(
+            &s,
+            next,
+            "durable node lease and recoverable handoff",
+            version,
+            true,
+        )?;
+        Ok(packet)
     }
     /// Only native owned Gateway output may satisfy an agent node. Completion
     /// remains a candidate: a final task/product needs independent host checks.
@@ -675,7 +727,7 @@ impl Scheduler {
         }
         let mut next = s.clone();
         let slot = next.slots.get_mut(&lease.node).expect("validated lease");
-        slot.native_run_ref = Some(id);
+        slot.native_run_ref = Some(id.clone());
         if run.status == RunStatus::FinalCandidate {
             let output = schema::validate_output_with_limit(
                 &node.output_schema,
@@ -689,7 +741,35 @@ impl Scheduler {
         } else {
             slot.phase = Phase::Failed;
         }
-        next.no_progress = 0;
+        if let Some(ledger) = &mut next.adaptive {
+            next.active_handoff = None;
+            ledger.current_milestone = None;
+            ledger.refresh_budget(
+                self.store.journal().model_budget(&self.task)?,
+                self.store
+                    .journal()
+                    .task(&self.task)?
+                    .contract
+                    .limits
+                    .max_cost_micro_usd,
+            );
+            if run.status == RunStatus::FinalCandidate {
+                ledger.completed_milestones.push(node.id.clone());
+                ledger.candidate_artifacts.insert(node.id.clone(), id);
+                ledger.next_action =
+                    "Inspect the next authorized milestone or run protected QA".into();
+            } else {
+                ledger.failed_attempts.insert(node.id.clone(), id);
+                ledger.current_diagnostics =
+                    vec![format!("Native specialist ended with {:?}", run.status)];
+                ledger.open_questions =
+                    vec!["Inspect recorded evidence and propose a bounded recovery plan".into()];
+                ledger.next_action = "Host review of failed attempt required".into();
+                next.no_progress = next.no_progress.saturating_add(1);
+            }
+        } else {
+            next.no_progress = 0;
+        }
         self.commit_version(
             &s,
             next,
@@ -746,6 +826,48 @@ impl Scheduler {
         )?;
         plan.validate(&parent.contract, catalog)?;
         require(
+            (plan.mode == crate::plan::Mode::AdaptiveSerial) == s.adaptive.is_some(),
+            Kind::Authority,
+            "cannot change adaptive ledger mode after execution starts",
+        )?;
+        if let Some(ledger) = &s.adaptive {
+            require(
+                plan.mode == crate::plan::Mode::AdaptiveSerial
+                    && plan.max_no_progress == s.plan.max_no_progress
+                    && plan.workspace_digest == s.plan.workspace_digest
+                    && plan.policy_digest == s.plan.policy_digest
+                    && ledger.revision_count < s.plan.max_no_progress,
+                Kind::Authority,
+                "adaptive mode/revision limit",
+            )?;
+            for node in &plan.nodes {
+                require(
+                    ledger.templates.values().any(|template| {
+                        template.profile == node.profile
+                            && template.tools == node.tools
+                            && template.effects == node.effects
+                            && template.resources == node.resources
+                            && template.authorizations == node.authorizations
+                            && template.claims == node.claims
+                            && template.skills == node.skills
+                            && template.output_schema == node.output_schema
+                            && template.literal_input == node.literal_input
+                    }),
+                    Kind::Authority,
+                    "revision exceeds initially approved specialist template",
+                )?;
+            }
+            require(
+                s.plan
+                    .nodes
+                    .iter()
+                    .filter(|n| s.slots[&n.id].phase == Phase::Candidate)
+                    .all(|n| plan.nodes.iter().any(|new| new == n)),
+                Kind::Stale,
+                "completed adaptive milestone must be retained",
+            )?;
+        }
+        require(
             plan.task == s.plan.task
                 && plan.id == s.plan.id
                 && plan.revision == s.plan.revision + 1
@@ -801,7 +923,20 @@ impl Scheduler {
         let mut next = s.clone();
         next.plan = plan;
         next.slots = slots;
-        next.no_progress = 0;
+        next.active_handoff = None;
+        if let Some(ledger) = &mut next.adaptive {
+            ledger.revision_count += 1;
+            if let Some(proposal) = ledger.pending_proposal.take() {
+                ledger
+                    .applied_proposals
+                    .insert(crate::digest(&serde_json::to_vec(
+                        &proposal.remaining_steps,
+                    )?));
+            }
+            ledger.next_action = "Run the next revised serial milestone".into();
+        } else {
+            next.no_progress = 0;
+        }
         self.commit_version(
             &s,
             next,
@@ -810,6 +945,303 @@ impl Scheduler {
             true,
         )
     }
+    /// Host-observed source state. The caller reads through the task's pinned
+    /// repository capability; model tools cannot populate this receipt.
+    pub fn observe_source(
+        &mut self,
+        source: String,
+        changed: std::collections::BTreeSet<String>,
+    ) -> Result<State> {
+        let state = self.state()?;
+        require(
+            crate::plan::hash(&source)
+                && changed.len() <= 10000
+                && changed.iter().all(|p| crate::plan::path(p) && p != "/"),
+            Kind::Invalid,
+            "source receipt format",
+        )?;
+        if state.adaptive.is_none() {
+            return Ok(state);
+        }
+        require(
+            !state
+                .slots
+                .values()
+                .any(|s| matches!(s.phase, Phase::Leased | Phase::NeedsReconciliation)),
+            Kind::Conflict,
+            "source handoff requires a settled specialist",
+        )?;
+        self.fresh(&state)?;
+        idle(&self.store, &self.task)?;
+        let mut next = state.clone();
+        let ledger = next.adaptive.as_mut().expect("checked");
+        if ledger.source_version == source && ledger.changed_files == changed {
+            return Ok(state);
+        }
+        ledger
+            .verified_facts
+            .retain(|key, value| !key.starts_with("successful_check:") || value == &source);
+        ledger.source_version = source.clone();
+        ledger.changed_files = changed;
+        ledger
+            .verified_facts
+            .insert("host_observed_source_digest".into(), source);
+        self.commit(
+            &state,
+            next,
+            "host-observed repository source for specialist handoff",
+        )
+    }
+
+    /// Trusted adapter observation; this is not a model-facing fact writer.
+    pub fn observe_check(
+        &mut self,
+        lease: &Lease,
+        tool: &str,
+        source: &str,
+        success: bool,
+        content: &str,
+    ) -> Result<()> {
+        require(
+            identifier(tool) && crate::plan::hash(source) && content.len() <= 4 * 1024 * 1024,
+            Kind::Invalid,
+            "check receipt bounds",
+        )?;
+        let state = self.state()?;
+        let version = self.check_state(&state, lease)?;
+        if state.adaptive.is_none() {
+            return Ok(());
+        }
+        let artifact = format!("workflow-check:{}:{}", lease.run, state.sequence);
+        let receipt = serde_json::to_vec(
+            &json!({"tool":tool,"run":lease.run,"source_digest":source,"success":success,"content":content,"task_accepted":false}),
+        )?;
+        self.store.put_artifact(
+            &ArtifactRequest {
+                artifact_id: artifact.clone(),
+                task_id: self.task.clone(),
+                content_type: "application/json".into(),
+                logical_type: "workflow.host-check".into(),
+                schema_version: "v1".into(),
+                retain_until_ms: 0,
+                legal_hold: false,
+            },
+            &receipt,
+        )?;
+        let mut next = state.clone();
+        let ledger = next.adaptive.as_mut().expect("checked");
+        require(
+            ledger.observation_refs.len() < 256 || ledger.observation_refs.contains_key(tool),
+            Kind::Invalid,
+            "check tool capacity",
+        )?;
+        ledger
+            .observation_refs
+            .insert(tool.into(), artifact.clone());
+        ledger.current_diagnostics = vec![format!(
+            "{tool}: {}; source={source}; evidence={artifact}",
+            if success { "PASS" } else { "FAIL" }
+        )];
+        if success {
+            ledger
+                .verified_facts
+                .insert(format!("successful_check:{tool}"), source.into());
+            ledger
+                .open_questions
+                .retain(|q| q != &format!("Resolve failed check: {tool}"));
+        } else {
+            let signature = digest(format!("{tool}:{source}").as_bytes());
+            require(
+                ledger.repeated_failures.len() < 256
+                    || ledger.repeated_failures.contains_key(&signature),
+                Kind::Invalid,
+                "failure signature capacity",
+            )?;
+            let count = ledger.repeated_failures.entry(signature).or_default();
+            *count = count.saturating_add(1);
+            let question = format!("Resolve failed check: {tool}");
+            if !ledger.open_questions.contains(&question) {
+                ledger.open_questions.push(question);
+            }
+        }
+        self.commit_version(
+            &state,
+            next,
+            "source-bound host check observation",
+            version,
+            true,
+        )?;
+        Ok(())
+    }
+
+    pub fn propose(&mut self, lease: &Lease, proposal: crate::adaptive::Proposal) -> Result<State> {
+        let state = self.state()?;
+        let version = self.check_state(&state, lease)?;
+        require(
+            state
+                .adaptive
+                .as_ref()
+                .is_some_and(|l| l.pending_proposal.is_none()),
+            Kind::Conflict,
+            "one pending planner proposal per boundary",
+        )?;
+        crate::adaptive::revise(&state, &proposal)?;
+        let mut next = state.clone();
+        next.adaptive.as_mut().expect("checked").pending_proposal = Some(proposal);
+        self.commit_version(
+            &state,
+            next,
+            "untrusted bounded plan proposal awaiting host boundary",
+            version,
+            true,
+        )
+    }
+
+    pub fn apply_proposal(&mut self, source: &str, catalog: &Catalog) -> Result<bool> {
+        let state = self.state()?;
+        let Some(proposal) = state
+            .adaptive
+            .as_ref()
+            .and_then(|l| l.pending_proposal.as_ref())
+        else {
+            return Ok(false);
+        };
+        require(
+            !state
+                .slots
+                .values()
+                .any(|s| matches!(s.phase, Phase::Leased | Phase::NeedsReconciliation)),
+            Kind::Conflict,
+            "planner activation requires a settled boundary",
+        )?;
+        self.fresh(&state)?;
+        idle(&self.store, &self.task)?;
+        require(
+            state
+                .adaptive
+                .as_ref()
+                .is_some_and(|l| l.source_version == source),
+            Kind::Stale,
+            "activation requires the host-observed current source",
+        )?;
+        if proposal.source_version != source {
+            let mut next = state.clone();
+            let ledger = next.adaptive.as_mut().expect("checked");
+            ledger.pending_proposal = None;
+            ledger.current_diagnostics =
+                vec!["Plan proposal rejected because its source changed".into()];
+            next.no_progress = next.no_progress.saturating_add(1);
+            self.commit(&state, next, "stale planner proposal rejected")?;
+            return Ok(false);
+        }
+        let plan = crate::adaptive::revise(&state, proposal)?;
+        self.revise(plan, catalog)?;
+        Ok(true)
+    }
+
+    /// Only the authenticated task completion record can promote a delivery.
+    /// Calling twice after a recovered final publication is harmless.
+    pub fn record_acceptance(&mut self, artifact: &str) -> Result<()> {
+        let state = self.state()?;
+        if state.adaptive.is_none() {
+            return Ok(());
+        }
+        let task = self.store.journal().task(&self.task)?;
+        let meta = self.store.artifact_metadata(&self.task, artifact)?;
+        require(
+            task.record.state == TaskState::Completed
+                && task.record.final_artifact_digest.as_ref() == Some(&meta.digest),
+            Kind::Authority,
+            "only host-completed final artifact is accepted",
+        )?;
+        let mut next = state.clone();
+        let ledger = next.adaptive.as_mut().expect("checked");
+        if ledger.accepted_artifacts.iter().any(|id| id == artifact) {
+            return Ok(());
+        }
+        ledger.accepted_artifacts.push(artifact.into());
+        ledger
+            .verified_facts
+            .insert("host_accepted_final_digest".into(), meta.digest);
+        ledger.next_action = "Task completed by protected host acceptance".into();
+        ledger.open_questions.clear();
+        self.commit(&state, next, "authenticated host acceptance")?;
+        Ok(())
+    }
+
+    pub fn supervisor(&self) -> Result<Value> {
+        let state = self.state()?;
+        let budget = self.store.journal().model_budget(&self.task)?;
+        let parent = self.store.journal().task(&self.task)?;
+        let decision = if parent.record.state == TaskState::Completed {
+            "completed"
+        } else if state.cancel_requested || self.cancelled.load(Ordering::Acquire) {
+            "cancelled"
+        } else if state
+            .slots
+            .values()
+            .any(|s| s.phase == Phase::NeedsReconciliation)
+            || budget.unknown_requests > 0
+        {
+            "reconciliation_required"
+        } else if budget.budget_exceeded || now()? >= state.deadline_ms {
+            "budget_or_deadline_exhausted"
+        } else if state.no_progress >= state.plan.max_no_progress
+            || state.adaptive.as_ref().is_some_and(|l| {
+                l.repeated_failures
+                    .values()
+                    .any(|n| *n >= state.plan.max_no_progress)
+            })
+        {
+            "no_progress_stop"
+        } else if state.slots.values().any(|s| s.phase == Phase::Leased)
+            || budget.active_requests > 0
+        {
+            "specialist_active"
+        } else if state
+            .adaptive
+            .as_ref()
+            .is_some_and(|l| l.pending_proposal.is_some())
+        {
+            "validate_pending_plan"
+        } else if state.slots.values().any(|s| s.phase == Phase::Failed) {
+            "replan_required"
+        } else if state.slots.values().all(|s| s.phase == Phase::Candidate) {
+            "protected_qa_ready"
+        } else {
+            "next_specialist_ready"
+        };
+        let recommended = if decision == "replan_required" {
+            state
+                .adaptive
+                .as_ref()
+                .map(|ledger| {
+                    let mut templates = Vec::new();
+                    for role in [
+                        "melissa.code.debugger",
+                        "melissa.code.implementer",
+                        "melissa.code.test-engineer",
+                        "melissa.code.reviewer",
+                    ] {
+                        if let Some((id, _)) =
+                            ledger.templates.iter().find(|(_, n)| n.profile == role)
+                        {
+                            templates.push(id.clone());
+                        }
+                    }
+                    templates
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        Ok(
+            json!({"decision":decision,"recommended_remaining_templates":recommended,"active_specialists":state.slots.values().filter(|s| s.phase == Phase::Leased).count(),
+            "revision":state.plan.revision,"no_progress":state.no_progress,"shared_budget":budget,
+            "next_milestone":state.plan.nodes.iter().find(|n| state.slots[&n.id].phase == Phase::Pending).map(|n| &n.id)}),
+        )
+    }
+
     pub fn no_progress(&mut self, reason: &str) -> Result<State> {
         require(
             !reason.trim().is_empty(),

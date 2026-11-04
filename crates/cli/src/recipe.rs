@@ -56,6 +56,41 @@ fn default_language() -> Language {
     Language::Python
 }
 impl Recipe {
+    /// New executable tasks always keep independent testing and final review.
+    /// This is done before the task contract and its operator approval exist.
+    /// Deserializing/resuming a historical recipe never rewrites its authority.
+    pub(crate) fn with_serial_verification(mut self) -> Result<Self> {
+        self.validate()?;
+        let review = if self
+            .agents
+            .last()
+            .is_some_and(|s| s.profile == "melissa.code.reviewer" && !s.write)
+        {
+            self.agents.pop().expect("checked")
+        } else {
+            Step {profile:"melissa.code.reviewer".into(),goal:"Independently inspect final source and recorded evidence; report remaining defects and submit a source-bound candidate for protected host QA.".into(),write:false}
+        };
+        if !self
+            .agents
+            .last()
+            .is_some_and(|s| s.profile == "melissa.code.test-engineer" && !s.write)
+        {
+            self.agents.push(Step{profile:"melissa.code.test-engineer".into(),goal:"Run authorized checks on final source, inspect failures, and retain source-bound evidence. Do not claim task acceptance.".into(),write:false});
+        }
+        if self.agents.len() == 1 {
+            self.agents.insert(
+                0,
+                Step {
+                    profile: "melissa.code.repository-analyst".into(),
+                    goal: "Inspect the task's source, dependencies and verification scope.".into(),
+                    write: false,
+                },
+            );
+        }
+        self.agents.push(review);
+        self.validate()?;
+        Ok(self)
+    }
     pub fn read(path: &Path) -> Result<Self> {
         let path = absolute(path)?;
         let r = melissa_repository::Repository::open(

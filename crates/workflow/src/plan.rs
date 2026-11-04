@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub enum Mode {
     SingleAgent,
     ConditionalDelegation,
+    AdaptiveSerial,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -180,6 +181,9 @@ impl Plan {
                 Kind::Invalid,
                 "delegation needs an explicit task reason",
             )?;
+        }
+        if self.mode == Mode::AdaptiveSerial {
+            crate::adaptive::validate_serial(self)?;
         }
         let mut ids = BTreeMap::new();
         for n in &self.nodes {

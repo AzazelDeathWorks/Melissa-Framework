@@ -74,3 +74,5 @@ pub fn digest(bytes: &[u8]) -> String {
 pub fn now() -> Result<u64> {
     melissa_execution_broker::unix_ms().map_err(|_| error(Kind::Store, "host clock unavailable"))
 }
+
+pub mod adaptive;
