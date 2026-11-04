@@ -200,7 +200,7 @@ impl ContinuationStore for JournalContinuation {
             let(fresh,cost,requests)=self.current(store, pending.as_deref())?;
             require(state.result.task_id==self.task&&state.result.run_id==self.run,"checkpoint task mismatch")?;
             let transcript = self.messages.save(store, &self.task, &self.run, state.messages).map_err(|e|crate::Error(e.to_string()))?;
-            let e=Envelope{state:state.metadata(),transcript:Some(transcript),freshness:fresh,charged_cost:cost,known_requests:requests};let bytes=serde_json::to_vec(&e)?;
+            let e=Envelope{state:state.metadata(),transcript:Some(transcript),freshness:fresh,charged_cost:cost,known_requests:requests};let bytes=crate::encode_state(&e)?;
             let id=self.cp(self.sequence);let artifact=format!("{id}:artifact");
             let meta=store.put_artifact(&ArtifactRequest{artifact_id:artifact.clone(),task_id:self.task.clone(),content_type:"application/json".into(),logical_type:"gateway.native_continuation".into(),schema_version:"melissa.gateway-continuation/v1".into(),retain_until_ms:0,legal_hold:false},&bytes)?;
             let v=store.journal().task(&self.task)?.record.version;

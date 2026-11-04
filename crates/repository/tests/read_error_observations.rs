@@ -44,6 +44,159 @@ async fn call(
 }
 
 #[tokio::test]
+async fn artifact_pages_cannot_reintroduce_sources_excluded_by_a_new_host_scope() {
+    use melissa_repository::{Limits, Repository};
+    let (_temp, repo, store, policy) = support::fixture(&[]);
+    let root = repo.root_path().to_owned();
+    fs::write(root.join("private.txt"), b"EXCLUDED_SENTINEL_84019").unwrap();
+    let peer = store.connect().unwrap();
+    let tools = RepositoryToolPolicy {
+        files: policy,
+        read_repository: true,
+        enabled_tools: ["fs_read", "fs_artifact_page"].map(String::from).into(),
+    };
+    let mut original = RepositoryDispatcher::new(repo, store, tools.clone()).unwrap();
+    let read = call(
+        &mut original,
+        "fs_read",
+        json!({"path":"private.txt"}),
+        "old-scope",
+    )
+    .await
+    .unwrap();
+    let args = json!({"artifact_id":"inv:old-scope:tool-result",
+        "digest":format!("blake3:{}", blake3::hash(read.content.as_bytes()).to_hex()),
+        "offset":0,"max_bytes":65536});
+    assert!(
+        call(
+            &mut original,
+            "fs_artifact_page",
+            args.clone(),
+            "same-scope"
+        )
+        .await
+        .unwrap()
+        .success
+    );
+    let restricted =
+        Repository::open(&root, Limits::default(), vec!["private.txt".into()]).unwrap();
+    let mut restricted = RepositoryDispatcher::new(restricted, peer, tools).unwrap();
+    assert!(
+        call(
+            &mut restricted,
+            "fs_read",
+            json!({"path":"private.txt"}),
+            "restricted-read"
+        )
+        .await
+        .is_err()
+    );
+    let outcome = call(&mut restricted, "fs_artifact_page", args, "restricted-page").await;
+    assert!(
+        outcome.is_err(),
+        "old artifact bypassed current source visibility"
+    );
+    assert!(
+        !outcome
+            .unwrap_err()
+            .to_string()
+            .contains("EXCLUDED_SENTINEL_84019")
+    );
+}
+
+#[tokio::test]
+async fn excluded_sentinel_is_denied_across_read_hash_page_search_symbols_and_preview() {
+    use melissa_repository::{ByteEdit, FilePatch, Limits, PatchProposal, Repository};
+    let (_temp, repo, store, policy) = support::fixture(&[]);
+    let root = repo.root_path().to_owned();
+    let sentinel = b"pub fn EXCLUDED_SENTINEL_84019() {}\n";
+    fs::write(root.join("hidden.rs"), sentinel).unwrap();
+    fs::write(root.join("visible.rs"), b"pub fn visible() {}\n").unwrap();
+    let before = repo.read("hidden.rs").unwrap().0;
+    let hidden_hash = before.digest.clone();
+    let patch = PatchProposal {
+        schema_version: "melissa.repository-patch/v1".into(),
+        root_identity: repo.root_identity().into(),
+        files: vec![FilePatch {
+            before: before.clone(),
+            edits: vec![ByteEdit {
+                start: 0,
+                end: sentinel.len() as u64,
+                expected: sentinel.to_vec(),
+                replacement: b"new".to_vec(),
+            }],
+        }],
+    };
+    let repo = Repository::open(&root, Limits::default(), vec!["hidden.rs".into()]).unwrap();
+    let mut dispatcher = RepositoryDispatcher::new(
+        repo,
+        store,
+        RepositoryToolPolicy {
+            files: policy,
+            read_repository: true,
+            enabled_tools: [
+                "fs_read",
+                "fs_hash",
+                "fs_read_page",
+                "fs_snapshot",
+                "fs_search",
+                "code_symbols",
+                "code_references",
+                "code_polyglot_symbols",
+                "fs_diff",
+                "code_patch_propose",
+            ]
+            .map(String::from)
+            .into(),
+        },
+    )
+    .unwrap();
+    for (n, (tool, args)) in [
+        ("fs_read", json!({"path":"hidden.rs"})),
+        ("fs_hash", json!({"path":"HIDDEN.RS"})),
+        (
+            "fs_read_page",
+            json!({"before":before,"offset":0,"max_bytes":100}),
+        ),
+        ("fs_diff", serde_json::to_value(&patch).unwrap()),
+        ("code_patch_propose", serde_json::to_value(&patch).unwrap()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let error = call(&mut dispatcher, tool, args, &format!("denied-{n}"))
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().contains("EXCLUDED_SENTINEL_84019"));
+        assert!(!error.to_string().contains(&hidden_hash));
+    }
+    for (n, (tool, args)) in [
+        ("fs_snapshot", json!({})),
+        ("fs_search", json!({"bytes":sentinel.as_slice()})),
+        ("code_symbols", json!({})),
+        ("code_polyglot_symbols", json!({})),
+        ("code_references", json!({"name":"EXCLUDED_SENTINEL_84019"})),
+        ("fs_read", json!({"path":"visible.rs"})),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let output = call(&mut dispatcher, tool, args, &format!("allowed-{n}"))
+            .await
+            .unwrap();
+        assert!(output.success);
+        assert!(!output.content.contains(&hidden_hash));
+        // The policy may name excluded paths; no source entry or hash may leak.
+        let value: Value = serde_json::from_str(&output.content).unwrap();
+        if let Some(files) = value["result"]["files"].as_array() {
+            assert!(files.iter().all(|f| f["path"] != "hidden.rs"));
+        }
+        assert!(!output.content.contains("EXCLUDED_SENTINEL_84019"));
+    }
+    assert_eq!(fs::read(root.join("hidden.rs")).unwrap(), sentinel);
+}
+
+#[tokio::test]
 async fn missing_parent_read_can_be_corrected_after_explicit_mkdir_in_the_same_task() {
     let (_temp, repo, store, policy) = support::fixture(&["scratch"]);
     let root = repo.root_path().to_owned();

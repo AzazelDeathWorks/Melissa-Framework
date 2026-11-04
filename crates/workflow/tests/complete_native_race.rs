@@ -24,6 +24,21 @@ fn catalog() -> Catalog {
 }
 #[tokio::test]
 async fn complete_native_does_not_overwrite_concurrent_needs_reconciliation() {
+    completion_race(0).await;
+}
+#[tokio::test]
+async fn complete_native_cannot_publish_after_parent_task_cancellation() {
+    completion_race(1).await;
+}
+#[tokio::test]
+async fn complete_native_rechecks_cancellation_after_refresh_callback() {
+    completion_race(2).await;
+}
+#[tokio::test]
+async fn complete_native_fences_changed_active_parent_version() {
+    completion_race(3).await;
+}
+async fn completion_race(mode: u8) {
     let d = tempfile::tempdir().unwrap();
     let st = store(&d.path().join("s"), 1_000_000);
     let p = Plan {
@@ -67,25 +82,45 @@ async fn complete_native_does_not_overwrite_concurrent_needs_reconciliation() {
     let other = Arc::new(Mutex::new(Some(st.connect().unwrap())));
     let armed: Arc<Mutex<Option<Lease>>> = Arc::new(Mutex::new(None));
     let (o2, a2, f2) = (other.clone(), armed.clone(), fresh.clone());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let flag = cancel.clone();
     let refresh: Refresh = Arc::new(move || {
         if let Some(lease) = a2.lock().unwrap().take() {
-            let f3 = f2.clone();
-            let mut second = Scheduler::open(
-                o2.lock().unwrap().take().unwrap(),
-                TASK.into(),
-                "flow".into(),
-                Arc::new(move || Ok(f3.clone())),
-                Arc::new(AtomicBool::new(false)),
-            )
-            .unwrap();
-            second
-                .mark_uncertain(&lease, "concurrent worker reported unknown effect")
+            if mode == 1 || mode == 3 {
+                let mut store = o2.lock().unwrap().take().unwrap();
+                let version = store.journal().task(TASK).unwrap().record.version;
+                store
+                    .transition_task(
+                        TASK,
+                        version,
+                        if mode == 1 {
+                            TaskState::Cancelled
+                        } else {
+                            TaskState::Repairing
+                        },
+                        None,
+                    )
+                    .unwrap();
+            } else if mode == 2 {
+                flag.store(true, Ordering::Release);
+            } else {
+                let f3 = f2.clone();
+                let mut second = Scheduler::open(
+                    o2.lock().unwrap().take().unwrap(),
+                    TASK.into(),
+                    "flow".into(),
+                    Arc::new(move || Ok(f3.clone())),
+                    Arc::new(AtomicBool::new(false)),
+                )
                 .unwrap();
+                second
+                    .mark_uncertain(&lease, "concurrent worker reported unknown effect")
+                    .unwrap();
+            }
         }
         Ok(f2.clone())
     });
-    let mut s =
-        Scheduler::create(st, p, &catalog(), refresh, Arc::new(AtomicBool::new(false))).unwrap();
+    let mut s = Scheduler::create(st, p, &catalog(), refresh, cancel).unwrap();
     let packet = s.acquire("a", "worker", 30000).unwrap();
     let http = http_fixture(vec![HttpPlan::sse(text_response(
         r#"{"value":7}"#,
@@ -105,10 +140,14 @@ async fn complete_native_does_not_overwrite_concurrent_needs_reconciliation() {
     let res = s.complete_native(&packet.lease);
     assert!(
         res.is_err(),
-        "complete_native overwrote a concurrently committed NeedsReconciliation"
+        "complete_native accepted a stale completion in race {mode}"
     );
     assert_eq!(
         s.state().unwrap().slots["a"].phase,
-        Phase::NeedsReconciliation
+        if mode == 0 {
+            Phase::NeedsReconciliation
+        } else {
+            Phase::Leased
+        }
     );
 }

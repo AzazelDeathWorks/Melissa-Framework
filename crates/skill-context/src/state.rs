@@ -136,30 +136,138 @@ fn memory_review_digest(record: &Memory) -> Result<String> {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryBook {
+    #[serde(deserialize_with = "read_memory_records")]
     records: BTreeMap<String, Memory>,
 }
 fn read_memory_sources<'de, D: serde::Deserializer<'de>>(
     de: D,
 ) -> std::result::Result<Vec<crate::retrieval::SourceRef>, D::Error> {
     use serde::de::Error as _;
-    let mut values = Vec::<serde_json::Value>::deserialize(de)?;
-    let mut result = Vec::with_capacity(values.len());
-    for value in &mut values {
-        // Read legacy books losslessly from immutable artifacts, verifying any
-        // embedded content before converting it to provenance. New books omit it.
-        if value.get("content").is_some() {
-            let old: Source = serde_json::from_value(value.clone()).map_err(D::Error::custom)?;
-            old.validate().map_err(D::Error::custom)?;
-            result.push(old.reference());
-        } else {
-            result.push(serde_json::from_value(value.take()).map_err(D::Error::custom)?);
+    struct Sources;
+    impl<'de> serde::de::Visitor<'de> for Sources {
+        type Value = Vec<crate::retrieval::SourceRef>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("bounded unique memory sources")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut result = Vec::new();
+            let mut ids = BTreeSet::new();
+            let mut legacy_bytes = 0usize;
+            while let Some(value) = seq.next_element::<serde_json::Value>()? {
+                if result.len() >= MAX_MEMORY_SOURCES {
+                    return Err(A::Error::custom("too many memory sources"));
+                }
+                // Verify legacy embedded content once, then keep references only.
+                let reference: crate::retrieval::SourceRef = if value.get("content").is_some() {
+                    let old: Source = serde_json::from_value(value).map_err(A::Error::custom)?;
+                    legacy_bytes = legacy_bytes
+                        .checked_add(old.content.len())
+                        .ok_or_else(|| A::Error::custom("memory source bytes overflow"))?;
+                    if legacy_bytes > MAX_MEMORY_SOURCE_BYTES {
+                        return Err(A::Error::custom("memory source bytes exceed envelope"));
+                    }
+                    old.validate().map_err(A::Error::custom)?;
+                    old.reference()
+                } else {
+                    serde_json::from_value(value).map_err(A::Error::custom)?
+                };
+                if !ids.insert(reference.id.clone()) {
+                    return Err(A::Error::custom("duplicate memory source"));
+                }
+                result.push(reference);
+            }
+            Ok(result)
         }
     }
-    Ok(result)
+    de.deserialize_seq(Sources)
 }
 /// Host allocation bounds, checked on borrowed sources before cloning content.
 pub const MAX_MEMORY_SOURCES: usize = 128;
 pub const MAX_MEMORY_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_MEMORY_RECORDS: usize = 4096;
+pub const MAX_MEMORY_RECORD_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_MEMORY_REVIEW_REF_BYTES: usize = 4096;
+
+#[derive(Serialize)]
+struct MemoryView<'a, S: Serialize> {
+    id: &'a str,
+    namespace: &'a Namespace,
+    key: &'a str,
+    claim: &'a str,
+    sources: S,
+    status: MemoryStatus,
+    review_evidence_ref: Option<&'a str>,
+}
+impl Memory {
+    fn view(&self) -> MemoryView<'_, &[crate::retrieval::SourceRef]> {
+        MemoryView {
+            id: &self.id,
+            namespace: &self.namespace,
+            key: &self.key,
+            claim: &self.claim,
+            sources: &self.sources,
+            status: self.status,
+            review_evidence_ref: self.review_evidence_ref.as_deref(),
+        }
+    }
+}
+struct SourceReferences<'a>(&'a [&'a Source]);
+impl Serialize for SourceReferences<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for source in self.0 {
+            seq.serialize_element(&source.reference_view())?;
+        }
+        seq.end()
+    }
+}
+fn read_memory_records<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> std::result::Result<BTreeMap<String, Memory>, D::Error> {
+    use serde::de::Error as _;
+    struct Records;
+    impl<'de> serde::de::Visitor<'de> for Records {
+        type Value = BTreeMap<String, Memory>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("bounded unique memory records")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut records = BTreeMap::new();
+            let mut bytes = b"{\"records\":{}}".len();
+            while let Some(id) = map.next_key::<String>()? {
+                if records.len() >= MAX_MEMORY_RECORDS || records.contains_key(&id) {
+                    return Err(A::Error::custom("duplicate or too many memory records"));
+                }
+                let record: Memory = map.next_value()?;
+                if record.id != id || id.is_empty() || id.len() > 512 {
+                    return Err(A::Error::custom("invalid memory identity"));
+                }
+                let size = crate::encoded_len(&record, MAX_MEMORY_RECORD_BYTES)
+                    .map_err(A::Error::custom)?;
+                bytes += size
+                    + crate::encoded_len(&id, 4096).map_err(A::Error::custom)?
+                    + 1
+                    + usize::from(!records.is_empty());
+                if bytes > crate::MAX_STATE_BYTES {
+                    return Err(A::Error::custom("memory book exceeds envelope"));
+                }
+                records.insert(id, record);
+            }
+            Ok(records)
+        }
+    }
+    de.deserialize_map(Records)
+}
 pub fn validate_memory_sources<'a>(sources: impl IntoIterator<Item = &'a Source>) -> Result<()> {
     let mut ids = BTreeSet::new();
     let mut total = 0usize;
@@ -180,6 +288,48 @@ impl MemoryBook {
     pub fn records(&self) -> &BTreeMap<String, Memory> {
         &self.records
     }
+    /// Size the resulting book using borrowed views, before any mutation or
+    /// source-reference cloning. JSON escaping counts toward the same bound
+    /// used by durable save/restore.
+    fn preflight<T: Serialize>(
+        &self,
+        id: &str,
+        replacement: &T,
+        supersedes: &BTreeSet<String>,
+    ) -> Result<()> {
+        let adding = !self.records.contains_key(id);
+        require(
+            self.records.len() + usize::from(adding) <= MAX_MEMORY_RECORDS,
+            "too many memory records",
+        )?;
+        let replacement_bytes = crate::encoded_len(replacement, MAX_MEMORY_RECORD_BYTES)?;
+        let mut total = b"{\"records\":{}}".len();
+        let mut count = 0usize;
+        let mut add = |key: &str, size: usize| -> Result<()> {
+            total += crate::encoded_len(&key, 4096)? + 1 + size + usize::from(count != 0);
+            count += 1;
+            require(
+                total <= crate::MAX_STATE_BYTES,
+                "memory book exceeds host envelope",
+            )
+        };
+        for (key, record) in &self.records {
+            let size = if key == id {
+                replacement_bytes
+            } else {
+                let mut view = record.view();
+                if supersedes.contains(key) {
+                    view.status = MemoryStatus::Stale;
+                }
+                crate::encoded_len(&view, MAX_MEMORY_RECORD_BYTES)?
+            };
+            add(key, size)?;
+        }
+        if adding {
+            add(id, replacement_bytes)?;
+        }
+        Ok(())
+    }
     /// Re-observe authenticated current source bytes at a later task/session.
     /// Expired observation time alone does not erase a fact; changed source does.
     /// This never promotes proposals, rejected records or tombstones.
@@ -194,6 +344,7 @@ impl MemoryBook {
         current: &[Source],
         excluded: &[String],
     ) {
+        let visibility = melissa_repository::SourceVisibilityPolicy::new(excluded.to_vec());
         for record in self
             .records
             .values_mut()
@@ -205,12 +356,11 @@ impl MemoryBook {
             ) {
                 continue;
             }
-            if record.sources.iter().any(|s| {
-                excluded.iter().any(|p| {
-                    s.id.eq_ignore_ascii_case(p)
-                        || s.id.to_lowercase().starts_with(&(p.to_lowercase() + "/"))
-                })
-            }) {
+            if record
+                .sources
+                .iter()
+                .any(|s| !visibility.as_ref().is_ok_and(|p| !p.excludes(&s.id)))
+            {
                 continue;
             }
             let refreshed: Option<Vec<_>> = record
@@ -276,6 +426,16 @@ impl MemoryBook {
             s.validate()?;
             require(s.namespace == namespace, "memory source namespace mismatch")?;
         }
+        let view = MemoryView {
+            id,
+            namespace: &namespace,
+            key,
+            claim,
+            sources: SourceReferences(sources),
+            status: MemoryStatus::Proposed,
+            review_evidence_ref: None,
+        };
+        self.preflight(id, &view, &BTreeSet::new())?;
         let record = Memory {
             id: id.into(),
             namespace,
@@ -287,10 +447,6 @@ impl MemoryBook {
         };
         let hash = memory_review_digest(&record)?;
         self.records.insert(id.into(), record);
-        if let Err(error) = crate::encode_state(self) {
-            self.records.remove(id);
-            return Err(error);
-        }
         Ok(hash)
     }
     /// Host review decision only; semantic truth is the reviewer's responsibility.
@@ -314,6 +470,7 @@ impl MemoryBook {
                     || digest(&serde_json::to_vec(record)?) == expected)
                 && record.namespace == scope.namespace
                 && !evidence_ref.trim().is_empty()
+                && evidence_ref.len() <= MAX_MEMORY_REVIEW_REF_BYTES
                 && record.sources.iter().all(|s| scope.allows_ref(s)),
             "stale/unreviewable memory proposal",
         )?;
@@ -332,6 +489,15 @@ impl MemoryBook {
             !accept || &conflicts == supersedes,
             "memory conflict requires explicit full supersession",
         )?;
+        let mut reviewed = record.view();
+        reviewed.status = if accept {
+            MemoryStatus::Accepted
+        } else {
+            MemoryStatus::Rejected
+        };
+        reviewed.review_evidence_ref = Some(evidence_ref);
+        let none = BTreeSet::new();
+        self.preflight(id, &reviewed, if accept { supersedes } else { &none })?;
         if accept {
             for prior in supersedes {
                 self.records

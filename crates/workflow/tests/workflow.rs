@@ -415,6 +415,21 @@ fn no_progress_stops_admission_until_explicit_revision() {
     s.no_progress("same observations").unwrap();
     assert!(s.acquire("a", "worker:a", 10000).is_err());
 }
+
+#[test]
+fn oversized_scheduler_checkpoint_cannot_replace_reopenable_state() {
+    let (_dir, mut scheduler) = setup();
+    let before = serde_json::to_vec(&scheduler.state().unwrap()).unwrap();
+    assert!(
+        scheduler
+            .no_progress(&format!("reason{}", "\n".repeat(8 * 1024 * 1024)))
+            .is_err()
+    );
+    assert_eq!(
+        serde_json::to_vec(&scheduler.state().unwrap()).unwrap(),
+        before
+    );
+}
 #[test]
 fn plan_revision_cannot_restart_the_shared_wall_clock() {
     let (_d, mut s) = setup();

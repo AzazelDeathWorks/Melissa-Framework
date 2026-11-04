@@ -433,6 +433,14 @@ impl Host {
                 let bytes = self
                     .store
                     .get_artifact(&self.policy.files.task_id, &p.artifact_id)?;
+                let envelope: Value = serde_json::from_slice(&bytes)?;
+                if envelope["source_visibility_digest"] != self.repo.source_visibility_digest()? {
+                    // Old or differently scoped results must be re-observed.
+                    // A historical artifact is evidence, never renewed access.
+                    return Err(Error::Denied(
+                        "artifact source visibility differs from current host scope",
+                    ));
+                }
                 if digest(&bytes) != p.digest {
                     return Err(Error::Stale("artifact page digest"));
                 }
@@ -533,7 +541,7 @@ impl Host {
                 e
             }
         })?;
-        let content=json!({"schema_version":"melissa.repository-tool-result/v1","tool_id":canonical,"task_id":c.task_id,"invocation_id":c.invocation_id,"result":value,"task_accepted":false,"requires_reconciliation":false}).to_string();
+        let content=json!({"schema_version":"melissa.repository-tool-result/v1","source_visibility_digest":self.repo.source_visibility_digest()?,"tool_id":canonical,"task_id":c.task_id,"invocation_id":c.invocation_id,"result":value,"task_accepted":false,"requires_reconciliation":false}).to_string();
         let max = self
             .store
             .journal()

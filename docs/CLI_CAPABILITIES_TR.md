@@ -29,6 +29,34 @@ dosyalar `unsupported_files` listesinde açıkça gösterilir.
 
 Hindsight kurulmadı veya bağlanmadı. Buradaki bellek mevcut yerel çekirdeği kullanır.
 
+### Kaynak erişimi ve kayıt bütünlüğü
+
+`SourceVisibilityPolicy`, genel çalışma klasörü okuma yetkisinin içindeki
+kaynak kapsamını belirler. Dışlanan dosyalar doğrudan okuma, hash, sayfalama,
+arama, sembol, anlamsal konum, bağlam ve bellek yollarından geri alınamaz.
+Windows dosya kimliği, alias ve reparse denetimleri ayrıca uygulanır.
+Kaynak politikası dışlanan yolların adını gösterebilir; dosya içeriğini veya
+içerik özetini göstermez. Git/paket için ayrı host yakalama politikaları korunur.
+
+Depo araç çıktıları kök kimliği ve kaynak politikası özetiyle bağlanır.
+Farklı kapsamda üretilmiş veya bu bağı taşımayan eski sonuçların sayfalanması
+reddedilir; güncel yetkiyle yeniden gözlem gerekir. Eski kanıtlar silinmez.
+
+Bellek önerileri en fazla 128 benzersiz kaynağa ve toplam 8 MiB kaynak
+içeriğine dayanabilir. Saklanan veri kaynakların kopyası değil referansıdır.
+Bir kayıt en fazla 2 MiB, kitap 4096 kayıt ve kodlanmış toplam 16 MiB olabilir;
+inceleme kanıtı referansı en fazla 4096 byte'tır. JSON kaçışları da sayılır.
+Öneri ve inceleme bu sınırları değişiklikten önce denetler; başarısız inceleme
+önceki kabul edilmiş bilgiyi geçersiz kılamaz. Eski gömülü kaynaklı kayıtlar
+aynı sınırlar içinde doğrulanıp referansa çevrilerek okunur.
+
+Checkpoint yazma ve okuma aynı 16 MiB JSON zarfını kullanır; büyük konuşma
+geçmişi ayrı mesaj nesnelerinde kalır. Sığmayan veya okunamayacak JSON yeni
+checkpoint yayımlanmadan reddedilir, önceki geçerli kayıt korunur. Bunlar host
+kayıt sınırlarıdır; modelin bağlamı, düşünme veya çıktı-token ayarı azaltılmaz.
+Tamamlama kaydı, doğrulanan görev sürümü ve workflow sırasına bağlıdır;
+iptal, süresi dolmuş lease veya eşzamanlı uzlaştırma eski sonucu kabul ettiremez.
+
 ### Uzun oturum ve kayıt davranışı
 
 Görev süresiyle tek API isteğinin bekleme süresi ayrıdır. `request_timeout_ms`

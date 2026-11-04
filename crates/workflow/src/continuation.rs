@@ -155,7 +155,9 @@ impl ContinuationStore for WorkflowContinuation {
                     Kind::Store,
                     "continuation index/content mismatch",
                 )?;
-                last = Some(serde_json::from_slice::<Envelope>(&bytes)?);
+                last = Some(melissa_model_gateway::checkpoint::decode::<Envelope>(
+                    &bytes,
+                )?);
             }
             if let Some(mut last) = last {
                 if let Some(manifest) = &last.transcript {
@@ -249,7 +251,7 @@ impl ContinuationStore for WorkflowContinuation {
                 known_input: input,
                 known_output: output,
             };
-            let bytes = serde_json::to_vec(&e)?;
+            let bytes = melissa_model_gateway::checkpoint::encode(&e)?;
             let id = self.cp(self.sequence);
             let artifact = format!("{id}:artifact");
             let task = &self.packet.parent_task.task_id;

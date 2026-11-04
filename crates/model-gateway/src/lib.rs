@@ -2,6 +2,7 @@
 //! never creates tool authority or constitutes independent task acceptance.
 pub mod agent_loop;
 pub mod anthropic;
+pub mod checkpoint;
 pub mod context_compiler;
 pub mod continuation;
 pub mod local_tokenizer;

@@ -941,6 +941,55 @@ fn continuation(
         }),
     )
 }
+
+#[test]
+fn oversized_native_checkpoint_preserves_previous_reopenable_checkpoint() {
+    use melissa_model_gateway::{
+        agent_loop::RunResult,
+        continuation::{ContinuationStore, Phase, TurnCheckpoint},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let mut store = store(&dir.path().join("store"), 1000000);
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut hook = continuation("size-bound", repo.clone(), flag.clone());
+    let mut state = TurnCheckpoint {
+        schema_version: "melissa.gateway-turn-checkpoint/v1".into(),
+        binding_digest: cdigest(b"binding"),
+        phase: Phase::Safe,
+        next_turn: 0,
+        messages: vec![],
+        seen_calls: BTreeSet::new(),
+        successful: BTreeSet::new(),
+        selected_model: None,
+        result: RunResult {
+            schema_version: "melissa.model-run-result/v1".into(),
+            run_id: "size-bound".into(),
+            task_id: TASK.into(),
+            status: RunStatus::NoAction,
+            answer: None,
+            request_ids: vec![],
+            tool_calls: 0,
+            artifact_refs: vec![],
+            requires_reconciliation: false,
+            task_accepted: false,
+        },
+    };
+    hook.publish(&mut store, &state).unwrap();
+    state.result.answer = Some("\n".repeat(melissa_skill_context::MAX_STATE_BYTES / 2));
+    assert!(
+        hook.publish(&mut store, &state).is_err(),
+        "oversized native checkpoint was published"
+    );
+    drop(hook);
+    let mut reopened = continuation("size-bound", repo, flag);
+    let restored = reopened
+        .begin(&mut store, &state.binding_digest, TASK, "size-bound")
+        .unwrap()
+        .unwrap();
+    assert!(restored.result.answer.is_none());
+    assert!(store.journal().model_requests(TASK).unwrap().is_empty());
+}
 #[tokio::test]
 async fn durable_gateway_resume_reopens_encrypted_journal_without_repeating_a_settled_tool_or_budget()
  {

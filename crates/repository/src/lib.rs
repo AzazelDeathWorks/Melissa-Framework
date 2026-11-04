@@ -17,11 +17,13 @@ pub mod snapshot;
 pub mod symbols;
 pub mod tools;
 pub mod unified;
+pub mod visibility;
 
 pub use broker::{AbsentPath, AuthorizedMutation, FileMutation, MutationProposal, MutationReceipt};
 pub use broker::{AuthorizedPatch, PatchBroker, PatchPolicy, PatchReceipt};
 pub use patch::{ByteEdit, FilePatch, PatchProposal};
 pub use snapshot::{FileVersion, Limits, Repository, RepositorySnapshot, SearchHit, SearchResult};
+pub use visibility::SourceVisibilityPolicy;
 
 #[derive(Debug)]
 pub enum Error {
