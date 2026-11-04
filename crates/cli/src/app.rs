@@ -603,6 +603,10 @@ impl App {
             value["execution_backend"] =
                 json!("Gateway_workflow_scoped_repository_CODE03_protected_QA");
             value["execution_plan"] = e.recipe.public_plan();
+            value["execution_plan"]["verification"] =
+                crate::verification::Policy::for_recipe(&e.recipe).plan(&e.recipe);
+            value["execution_plan"]["timing"] = json!({"task_wall_time_ms":e.recipe.wall_time_ms,
+                "task_deadline_ms":e.expires_at_ms,"default_sdk_tool_wall_time_ms":crate::development::limits().wall_time_ms});
             value["settings_digest"] = json!(e.settings_digest);
             if let Ok(settings) = self.settings()
                 && settings.digest()? == e.settings_digest

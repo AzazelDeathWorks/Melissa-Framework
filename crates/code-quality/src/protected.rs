@@ -816,10 +816,13 @@ impl ProtectedQa {
         let log_digest=self.record("suite_result",&json!({"source_digest":program.source,"suite_digest":suite.digest,"passed":passed,"total":total,"negative_passed":negative_passed,"positive_logs":logs,"negative_logs":negative_logs}))?;
         source.current(repo, cancel)?;
         self.authority()?;
-        if passed != total || negative_passed == total {
+        if negative_passed == total {
             return Err(Error::Denied(
-                "protected QA positive or negative control failed",
+                "protected QA negative control unexpectedly passed",
             ));
+        }
+        if passed != total {
+            return Err(Error::Denied("protected QA positive cases failed"));
         }
         let mut receipt = QaReceipt {
             source_digest: program.source.clone(),

@@ -203,6 +203,38 @@ devam ederken seçim değişmez. Yeni uzman kendi model oturumunu açar;
 maliyeti aynı görev bütçesinden düşer. Sonucu belirsiz işlemler yeni
 yönlendirme için durdurma sebebidir.
 
+## Uzun görevler ve teşhise dayalı onarım
+
+Görev onayı, toplam duvar süresi ve bitiş zamanını belirler. Model
+isteğinin zaman aşımı model ayarından, SDK işleminin sınırı worker
+politikasından gelir. Toplam süre dolduğunda yürütücü çalışmayı durdurur.
+Süre veya harcama plan değişiminde yeniden başlatılmaz.
+
+Uzman devrindeki teşhisler hata sınıfı, güncel kaynak özeti, dosya/satır,
+varsa sembol, başarısız test kimliği, son değişiklik ve kanıt referansını
+taşır. Aynı kaynakta tekrarlar sınırlanır. Kaynağı ve işlemi aynı olan
+başarılı sabit kontroller daha önceki gerçek kanıtı kullanabilir. Çıktı
+bunun bir tekrar çalıştırma olmadığını açıkça belirtir.
+
+Güvenli model turu, kaynak görüntüsünü ve bütçeyi aynı kalıcı kayıtla
+bağlar. Uzman bitişindeki görev kaydı, plan, kaynak ve görev sürümünü de
+saklar. `task resume` eski yürütücünün durduğunu, kaynağın güncelliğini,
+görev sürümünü ve muhasebeyi kontrol eder. Sonucu belirsiz bir çağrı veya
+çalışan worker otomatik olarak yeniden başlatılmaz.
+
+Açıkça tanımlanmış geliştirme testleri `code_tests` ile çalışır.
+İkiden fazla açık test varsa `code_targeted_tests`, operatörün listesinde
+bulunan en az iki farklı vakayı seçebilir. Özel kabul testleri yalnız
+son bağımsız doğrulayıcıya açıktır. Mimari ve geniş değişikliklerde
+yapılandırılmış açık test paketinin tamamı güncel kaynakta geçmelidir.
+Güvenlik uzmanı seçilen görevlerde son doğrulamaya izole statik tarama
+da eklenir. Tam yayın, lisans ve paket güvenliği ayrıca kabul ister.
+
+Güncel, onarılabilir bir hata kalırsa seri yürütücü ilk onaylı yazıcı,
+test uzmanı ve inceleme şablonlarından sınırlı bir onarım planı kurar.
+Onarım güncel kaynakta geçen test kanıtı gerektirir. Eksik SDK, belirsiz
+etki veya aynı teşhisin sürmesi kendi koşullarıyla durdurulur.
+
 ## Görev hazırlamak
 
 ```powershell

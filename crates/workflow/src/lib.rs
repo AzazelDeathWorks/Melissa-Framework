@@ -76,3 +76,4 @@ pub fn now() -> Result<u64> {
 }
 
 pub mod adaptive;
+pub mod diagnostics;

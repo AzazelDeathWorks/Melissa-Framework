@@ -19,14 +19,30 @@ impl ToolDispatcher for NoTools {
     }
 }
 fn setup() -> (tempfile::TempDir, Arc<Mutex<Scheduler>>) {
+    setup_with_writer(false)
+}
+fn setup_with_writer(writer: bool) -> (tempfile::TempDir, Arc<Mutex<Scheduler>>) {
+    setup_until(writer, u64::MAX)
+}
+fn setup_until(writer: bool, deadline: u64) -> (tempfile::TempDir, Arc<Mutex<Scheduler>>) {
     let d = tempfile::tempdir().unwrap();
     let store = store(&d.path().join("s"), 1000000);
     let task = store.journal().task(TASK).unwrap().contract;
     let mut previous = None;
-    let nodes=[("implementation","melissa.code.implementer"),("tests","melissa.code.test-engineer"),("review","melissa.code.reviewer")].into_iter().map(|(id,profile)|{
+    let mut nodes:Vec<Node>=[("implementation","melissa.code.implementer"),("tests","melissa.code.test-engineer"),("review","melissa.code.reviewer")].into_iter().map(|(id,profile)|{
         let after=previous.iter().cloned().collect();let bindings=vec![];previous=Some(id.to_string());
         Node{id:id.into(),profile:profile.into(),goal:format!("Perform bounded stage {id}"),after,bindings,literal_input:json!({}),tools:BTreeSet::new(),effects:BTreeSet::from(["workspace.read".into()]),resources:BTreeSet::from([task.workspace_ref.clone()]),authorizations:BTreeSet::new(),claims:vec![],output_schema:json!({"type":"object","properties":{"value":{"type":"integer"}},"required":["value"],"additionalProperties":false}),skills:vec![]}
     }).collect();
+    if writer {
+        nodes[0]
+            .effects
+            .insert("workspace.apply_patch_scoped".into());
+        nodes[0].claims.push(Claim {
+            resource: task.workspace_ref.clone(),
+            path: "main.py".into(),
+            access: Access::Write,
+        });
+    }
     let p = Plan {
         schema_version: "melissa.workflow-plan/v1".into(),
         id: "cooperation".into(),
@@ -50,12 +66,13 @@ fn setup() -> (tempfile::TempDir, Arc<Mutex<Scheduler>>) {
     };
     let catalog =
         Catalog::load_definitions(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
-    let scheduler = Scheduler::create(
+    let scheduler = Scheduler::create_until(
         store,
         p,
         &catalog,
         Arc::new(move || Ok(fresh.clone())),
         Arc::new(AtomicBool::new(false)),
+        deadline,
     )
     .unwrap();
     (d, Arc::new(Mutex::new(scheduler)))
@@ -592,4 +609,125 @@ async fn failed_specialist_can_return_as_new_serial_step_without_erasing_attempt
         1
     );
     assert_eq!(http.requests.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn diagnostic_repair_reuses_approved_authority_and_requires_current_retest() {
+    let (_dir, owner) = setup_with_writer(true);
+    let (rt, http) = driver(
+        owner.clone(),
+        vec![response(), response(), response(), response(), response()],
+    )
+    .await;
+    rt.run("implementation").await.unwrap();
+    {
+        let mut s = owner.lock().unwrap();
+        let packet = s.acquire("tests", "host", 30000).unwrap();
+        s.observe_check(&packet.lease,"code_project_tests",&packet.parent_task.input_snapshot_digest,
+            false,&json!({"schema_version":"melissa.sdk-result/v1","status":"failed",
+                "details":{"runs":[{"id":"test_contract","status":"failed"}],
+                    "diagnostics":[{"level":"error","file":"/work/main.py","line":4,"message":"assertion failed","symbol":"increment"}]}}).to_string()).unwrap();
+    }
+    rt.resume("tests").await.unwrap();
+    let (writer, tests, review, source) = {
+        let mut s = owner.lock().unwrap();
+        let old = s.state().unwrap();
+        let old_source = old.adaptive.as_ref().unwrap().source_version.clone();
+        s.checkpoint_milestone().unwrap();
+        *s = reopen(&s);
+        s.validate_milestone(&old_source).unwrap();
+        assert!(
+            s.validate_milestone(&melissa_workflow::digest(b"changed"))
+                .is_err()
+        );
+        assert!(s.repair_from_diagnostics(&catalog()).unwrap());
+        assert!(s.validate_milestone(&old_source).is_err());
+        let current = s.state().unwrap();
+        assert_eq!(current.deadline_ms, old.deadline_ms);
+        let ledger = current.adaptive.unwrap();
+        assert_eq!(
+            ledger.repairs[0].diagnostic.failed_tests,
+            vec!["test_contract"]
+        );
+        assert_eq!(
+            ledger.repairs[0].diagnostic.related_diagnostics[0].line_range,
+            Some([4, 4])
+        );
+        assert_eq!(
+            ledger.repairs[0].diagnostic.related_diagnostics[0]
+                .affected_file
+                .as_deref(),
+            Some("main.py")
+        );
+        let writer = &current.plan.nodes[2];
+        assert_eq!(writer.claims, old.plan.nodes[0].claims);
+        (
+            writer.id.clone(),
+            current.plan.nodes[3].id.clone(),
+            current.plan.nodes[4].id.clone(),
+            melissa_workflow::digest(b"repaired source"),
+        )
+    };
+    rt.run(&writer).await.unwrap();
+    {
+        let mut s = owner.lock().unwrap();
+        s.observe_source(source.clone(), BTreeSet::from(["main.py".into()]))
+            .unwrap();
+        let packet = s.acquire(&tests, "host", 30000).unwrap();
+        assert_eq!(
+            packet
+                .specialist_handoff
+                .as_ref()
+                .unwrap()
+                .repair
+                .as_ref()
+                .unwrap()
+                .diagnostic
+                .failed_tests,
+            vec!["test_contract"]
+        );
+        assert!(
+            s.check_evidence(&packet.lease, "code_project_tests", &source)
+                .unwrap()
+                .is_none()
+        );
+        s.observe_check(
+            &packet.lease,
+            "code_project_tests",
+            &source,
+            true,
+            r#"{"status":"passed"}"#,
+        )
+        .unwrap();
+        assert!(
+            s.check_evidence(&packet.lease, "code_project_tests", &source)
+                .unwrap()
+                .is_some()
+        );
+    }
+    rt.resume(&tests).await.unwrap();
+    assert!(
+        !owner
+            .lock()
+            .unwrap()
+            .repair_from_diagnostics(&catalog())
+            .unwrap()
+    );
+    rt.run(&review).await.unwrap();
+    assert_eq!(http.requests.load(Ordering::SeqCst), 5);
+    assert_eq!(
+        owner.lock().unwrap().supervisor().unwrap()["decision"],
+        "protected_qa_ready"
+    );
+}
+
+#[test]
+fn approved_absolute_deadline_bounds_every_specialist_lease() {
+    let deadline = melissa_execution_broker::unix_ms().unwrap() + 20_000;
+    let (_d, owner) = setup_until(false, deadline);
+    let mut s = owner.lock().unwrap();
+    assert_eq!(s.state().unwrap().deadline_ms, deadline);
+    let packet = s.acquire("implementation", "host", 30_000).unwrap();
+    assert_eq!(packet.lease.expires_at_ms, deadline);
+    assert_eq!(packet.specialist_handoff.unwrap().deadline_ms, deadline);
 }

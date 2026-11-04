@@ -81,3 +81,5 @@ pub(crate) fn digest(b: &[u8]) -> String {
 
 mod model_pool;
 pub mod model_tools;
+
+mod verification;

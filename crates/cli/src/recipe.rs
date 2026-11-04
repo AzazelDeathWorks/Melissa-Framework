@@ -251,12 +251,23 @@ impl Recipe {
         self.candidate_schema.clone().unwrap_or_else(||json!({"type":"object","properties":{"summary":{"type":"string"},"source_digest":{"type":"string"}},"required":["summary","source_digest"],"additionalProperties":false}))
     }
     pub fn development_suite(&self) -> Result<Suite> {
-        if self.development_checks.is_empty() {
-            return self.suite();
+        self.development_selection(None)
+    }
+    pub(crate) fn development_selection(&self, ids: Option<&BTreeSet<String>>) -> Result<Suite> {
+        if let Some(ids) = ids
+            && (ids.len() < 2
+                || ids
+                    .iter()
+                    .any(|id| !self.development_checks.iter().any(|case| &case.id == id)))
+        {
+            return Err(Error::Denied(
+                "Targeted cases must be distinct IDs from the approved public suite.",
+            ));
         }
         Suite::new(
             self.development_checks
                 .iter()
+                .filter(|case| ids.is_none_or(|ids| ids.contains(&case.id)))
                 .map(|c| Case {
                     id: c.id.clone(),
                     input: c.input.clone(),
@@ -264,7 +275,7 @@ impl Recipe {
                 })
                 .collect(),
         )
-        .map_err(|_| Error::Usage("Geliştirme testleri geçersiz."))
+        .map_err(|_| Error::Usage("No valid public development suite is configured."))
     }
     pub fn public_plan(&self) -> Value {
         if let Some(domain) = &self.domain {

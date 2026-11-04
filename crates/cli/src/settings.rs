@@ -162,7 +162,7 @@ impl Settings {
         json!(self.models().map(|(id, m)| json!({
             "id":id,"provider":m.provider_id,"model":m.model,"origin":url::Url::parse(&m.endpoint).ok().map(|url|url.origin().ascii_serialization()),
             "protocol":m.protocol,"tool_profile":m.tool_profile,"measurements":m.measurements,
-            "context_tokens":m.context_tokens,"max_output_tokens":m.max_output_tokens,
+            "context_tokens":m.context_tokens,"max_output_tokens":m.max_output_tokens,"request_timeout_ms":m.request_timeout_ms,
             "json_object":m.json_object,"native_json_schema":m.native_json_schema,
             "capabilities":m.capabilities,
             "rate_card_digest":m.rate_card.digest(),
