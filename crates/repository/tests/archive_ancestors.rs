@@ -70,3 +70,16 @@ fn many_flat_entries_are_accepted() {
         5_000
     );
 }
+
+#[test]
+fn cancelled_archive_inspection_returns_no_partial_import() {
+    let bytes = tar(&[("d/f", b'0')]);
+    assert!(matches!(
+        archive::inspect_ustar_cancellable(
+            &bytes,
+            &Limits::default(),
+            &std::sync::atomic::AtomicBool::new(true)
+        ),
+        Err(Error::Cancelled)
+    ));
+}

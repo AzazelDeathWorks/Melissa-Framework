@@ -9,7 +9,10 @@ pub mod analysis;
 pub mod archive;
 pub mod broker;
 pub mod discovery;
+#[cfg(windows)]
+mod file_journal;
 pub mod git;
+pub mod graph;
 pub mod patch;
 mod paths;
 pub mod polyglot;

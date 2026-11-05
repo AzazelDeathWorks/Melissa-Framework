@@ -26,6 +26,167 @@ struct Fixture {
     store: LocalStore,
     task: TaskContractV1,
 }
+
+#[tokio::test]
+async fn context_index_survives_a_new_cli_task_and_respects_its_exclusions() {
+    let profile = "melissa.code.implementer";
+    let mut fixture = Fixture::new(profile);
+    let query = json!({"operation":"search","query":"double","limit":10,"symbols":[]});
+    {
+        let mut bridge = fixture.context();
+        let result = fixture
+            .call(&mut bridge, "context_search", query.clone(), "first-index")
+            .await;
+        assert!(result.success, "{}", result.content);
+        assert_eq!(
+            bridge.inner.host().lock().unwrap().telemetry()["index.persisted"],
+            1
+        );
+    }
+    let (store, task) = Fixture::task(&fixture.app, &fixture.source, profile, "b", vec![]);
+    fixture.store = store;
+    fixture.task = task;
+    {
+        let mut bridge = fixture.context();
+        let result = fixture
+            .call(&mut bridge, "context_search", query.clone(), "shared-index")
+            .await;
+        assert!(result.success, "{}", result.content);
+        let v: Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(v["observation"]["data"][0]["source"]["id"], "main.py");
+        let host = bridge.inner.host();
+        let host = host.lock().unwrap();
+        assert_eq!(host.telemetry()["index.restored"], 1);
+        assert_eq!(host.telemetry()["index.documents_updated"], 0);
+        assert_eq!(host.telemetry()["index.files_parsed"], 0);
+    }
+    let (store, task) = Fixture::task(
+        &fixture.app,
+        &fixture.source,
+        profile,
+        "c",
+        vec!["main.py".into()],
+    );
+    fixture.store = store;
+    fixture.task = task;
+    let mut bridge = fixture.context();
+    let result = fixture
+        .call(&mut bridge, "context_search", query, "restricted-index")
+        .await;
+    assert!(result.success, "{}", result.content);
+    let v: Value = serde_json::from_str(&result.content).unwrap();
+    assert_eq!(v["observation"]["data"], json!([]));
+    assert_eq!(
+        bridge.inner.host().lock().unwrap().telemetry()["index.cold_start"],
+        1
+    );
+}
+
+#[tokio::test]
+async fn context_graph_and_budgeted_search_return_current_related_code() {
+    let profile = "melissa.code.implementer";
+    let mut f = Fixture::new(profile);
+    let mut calc = "# boşluk ve kaynak konumu\n".repeat(400);
+    calc.push_str("def choose(n):\n    return n + 1\n");
+    fs::write(f.source.join("calc.py"), &calc).unwrap();
+    fs::create_dir(f.source.join("tests")).unwrap();
+    fs::write(
+        f.source.join("tests/test_calc.py"),
+        "from calc import choose\ndef test_choice():\n    assert choose(2) == 3\n",
+    )
+    .unwrap();
+    fs::create_dir(f.source.join("private")).unwrap();
+    fs::write(
+        f.source.join("private/secret.py"),
+        "def choose(n): return 'hidden_fixture'",
+    )
+    .unwrap();
+    fs::write(f.source.join("noise.txt"), "choose ".repeat(500)).unwrap();
+    let (store, task) = Fixture::task(&f.app, &f.source, profile, "b", vec!["private".into()]);
+    f.store = store;
+    f.task = task;
+    let mut context = f.context();
+    let graph = f.call(&mut context, "context_script", json!({
+        "operation":"common_script","id":"dependency_graph","input":{"path":"calc.py","symbol":"choose","limit":4}
+    }), "phase-c-graph").await;
+    assert!(graph.success, "{}", graph.content);
+    let output: Value = serde_json::from_str(&graph.content).unwrap();
+    let data = &output["observation"]["data"];
+    assert_eq!(data["nodes"][0]["definitions"][0]["name"], "choose");
+    assert!(
+        data["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "call_candidate"
+                && e["related_test"]["name"] == "test_choice"
+                && e["target"]["id"]["path"] == "calc.py"
+                && e["compiler_resolved"] == false)
+    );
+    assert!(!graph.content.contains("private/secret.py"));
+
+    let file = f.repo().read("calc.py").unwrap().0;
+    let pos = calc.rfind('1').unwrap();
+    let patch = json!({"schema_version":"melissa.repository-patch/v1","root_identity":f.repo().root_identity(),
+        "files":[{"before":file,"edits":[{"start":pos,"end":pos+1,"expected":[49],"replacement":[50]}]}]});
+    let affected = f.call(&mut context, "context_script", json!({
+            "operation":"common_script","id":"dependency_graph","input":{"patch":patch,"limit":2}
+    }), "phase-c-patch").await;
+    assert!(affected.success, "{}", affected.content);
+    let output: Value = serde_json::from_str(&affected.content).unwrap();
+    assert_eq!(
+        output["observation"]["data"]["edges"][0]["kind"],
+        "affected_symbol"
+    );
+    assert_eq!(
+        output["observation"]["data"]["edges"][0]["source"]["name"],
+        "choose"
+    );
+    assert_eq!(
+        output["observation"]["data"]["edges"][1]["kind"],
+        "affected_symbol_preview"
+    );
+    assert_eq!(
+        output["observation"]["data"]["edges"][1]["definition"]["name"],
+        "choose"
+    );
+    assert_eq!(fs::read_to_string(f.source.join("calc.py")).unwrap(), calc);
+
+    let query = json!({"operation":"search","query":"choose","symbols":["choose"],"limit":3,"max_bytes":3400,"max_tokens":3000});
+    let search = f
+        .call(
+            &mut context,
+            "context_search",
+            query.clone(),
+            "phase-c-search",
+        )
+        .await;
+    assert!(search.success, "{}", search.content);
+    let output: Value = serde_json::from_str(&search.content).unwrap();
+    let result = &output["observation"];
+    let hits = result["data"].as_array().unwrap();
+    assert_eq!(hits[0]["source"]["id"], "calc.py");
+    assert!(hits[0]["excerpt"].as_str().unwrap().contains("def choose"));
+    assert!(hits[0]["start_line"].as_u64().unwrap() > 350);
+    assert!(hits.iter().any(|hit| {
+        hit["source"]["id"] == "tests/test_calc.py"
+            && hit["signals"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("related_test"))
+    }));
+    let len = serde_json::to_vec(hits).unwrap().len();
+    assert!(len <= 3000);
+    assert_eq!(result["budget"]["data_bytes"], len);
+    assert!(!search.content.contains("hidden_fixture"));
+    let cached = f
+        .call(&mut context, "context_search", query, "phase-c-cached")
+        .await;
+    assert!(cached.success, "{}", cached.content);
+    let output: Value = serde_json::from_str(&cached.content).unwrap();
+    assert_eq!(output["observation"]["cached"], true);
+    assert_eq!(output["observation"]["data"], result["data"]);
+}
 impl Fixture {
     fn new(profile: &str) -> Self {
         let temp = tempfile::tempdir().unwrap();
@@ -40,13 +201,29 @@ impl Fixture {
         fs::write(source.join("protected.txt"), b"user-owned\r\n").unwrap();
         App::init(&home).unwrap();
         let app = App::open(&home).unwrap();
-        let repo = Repository::open(&source, Limits::default(), vec![]).unwrap();
+        let (store, task) = Self::task(&app, &source, profile, "a", vec![]);
+        Self {
+            _temp: temp,
+            app,
+            source,
+            store,
+            task,
+        }
+    }
+    fn task(
+        app: &App,
+        source: &std::path::Path,
+        profile: &str,
+        id: &str,
+        excludes: Vec<String>,
+    ) -> (LocalStore, TaskContractV1) {
+        let repo = Repository::open(source, Limits::default(), excludes.clone()).unwrap();
         let snapshot = repo.snapshot(&AtomicBool::new(false)).unwrap();
         let mut task: TaskContractV1 = serde_json::from_slice(include_bytes!(
             "../../../tests/fixtures/code01/wire/task-contract-v1.json"
         ))
         .unwrap();
-        task.task_id = format!("task_{}", "a".repeat(32));
+        task.task_id = format!("task_{}", id.repeat(32));
         task.selected_profile_ids = vec![profile.into()];
         task.input_snapshot_digest = snapshot.digest.clone();
         task.allowed_effects = vec![
@@ -65,7 +242,7 @@ impl Fixture {
         task.limits.max_wall_time_ms = 86400000;
         task.limits.max_disk_bytes = 1024 * 1024 * 1024;
         task.limits.max_output_bytes = 64 * 1024 * 1024;
-        let dir = home.join("tasks").join(&task.task_id);
+        let dir = app.home.join("tasks").join(&task.task_id);
         fs::create_dir(&dir).unwrap();
         let mut store =
             LocalStore::open(&dir.join("store"), app.key.clone(), Default::default()).unwrap();
@@ -85,7 +262,7 @@ impl Fixture {
             schema_version: "melissa.cli-workspace/v1".into(),
             root: source.to_str().unwrap().into(),
             limits: Limits::default(),
-            explicit_excludes: vec![],
+            explicit_excludes: excludes,
             snapshot,
             files: BTreeMap::new(),
         };
@@ -97,13 +274,7 @@ impl Fixture {
             &bytes(&workspace).unwrap(),
         )
         .unwrap();
-        Self {
-            _temp: temp,
-            app,
-            source,
-            store,
-            task,
-        }
+        (store, task)
     }
     fn tools(&self) -> BTreeSet<String> {
         resources::catalog().unwrap().profiles[&self.task.selected_profile_ids[0]]
@@ -301,6 +472,7 @@ async fn html_only_edits_do_not_invent_a_python_check_and_strict_git_rejects_ext
     .with_portable_patch_wire()
     .unwrap();
     let mut d = crate::development::CheckedEdits {
+        context: None,
         inner: Box::new(repo_tool),
         repo: Arc::new(f.repo()),
         store: f.store.connect().unwrap(),
@@ -364,6 +536,7 @@ async fn post_edit_check_or_receipt_failure_preserves_the_applied_mutation() {
         .unwrap()
         .code;
         let mut d = crate::development::CheckedEdits {
+            context: None,
             inner: Box::new(repo_tool),
             repo: Arc::new(f.repo()),
             store: f.store.connect().unwrap(),
@@ -688,6 +861,7 @@ async fn native_cli_after_edit_reports_invalid_regex_without_replaying_or_undoin
     .with_portable_patch_wire()
     .unwrap();
     let mut d = crate::development::CheckedEdits {
+        context: None,
         inner: Box::new(repo_tool),
         repo: Arc::new(f.repo()),
         store: f.store.connect().unwrap(),
@@ -767,7 +941,22 @@ async fn native_cli_git_is_fresh_read_only_and_worktree_is_private() {
     .unwrap();
     let before = f.repo().snapshot(&AtomicBool::new(false)).unwrap().digest;
     let index = fs::read(f.source.join(".git/index")).unwrap();
-    let mut d = f.development();
+    let context = f.context();
+    let host = context.inner.host();
+    let router = melissa_repository::tools::ToolRouter::new(vec![
+        Box::new(context),
+        Box::new(f.development()),
+    ])
+    .unwrap();
+    let mut d = crate::development::CheckedEdits {
+        inner: Box::new(router),
+        repo: Arc::new(f.repo()),
+        store: f.store.connect().unwrap(),
+        task: f.task.task_id.clone(),
+        checker: None,
+        language: melissa_build_test::full::Language::Python,
+        context: Some(host),
+    };
     let status = f
         .call(
             &mut d,
@@ -797,6 +986,29 @@ async fn native_cli_git_is_fresh_read_only_and_worktree_is_private() {
         )
         .await;
     assert!(log.success && log.content.contains(&commit));
+    let history = f
+        .call(
+            &mut d,
+            "code_git",
+            json!({"operation":"log_paths","max_entries":5}),
+            "git-log-paths",
+        )
+        .await;
+    assert!(history.success, "{}", history.content);
+    let query = json!({"operation":"search","query":"main.py","symbols":[],"limit":1});
+    let ranking = f
+        .call(&mut d, "context_search", query.clone(), "git-ranking")
+        .await;
+    assert!(ranking.success, "{}", ranking.content);
+    let value: Value = serde_json::from_str(&ranking.content).unwrap();
+    let signals = value["observation"]["data"][0]["signals"]
+        .as_array()
+        .unwrap();
+    assert!(
+        signals.contains(&json!("git_diff")) && signals.contains(&json!("git_history")),
+        "{value}"
+    );
+
     let tree = f
         .call(
             &mut d,
@@ -811,6 +1023,43 @@ async fn native_cli_git_is_fresh_read_only_and_worktree_is_private() {
     assert_eq!(
         before,
         f.repo().snapshot(&AtomicBool::new(false)).unwrap().digest
+    );
+
+    fs::write(
+        f.source.join("main.py"),
+        b"def double(x):\n    return (x * 3\n",
+    )
+    .unwrap();
+    let operation = melissa_build_test::tools::CodeOperation::Procedure {
+        language: melissa_build_test::full::Language::Python,
+        operation: melissa_build_test::full::Operation::Check {},
+        harness: None,
+    };
+    let checked = f
+        .call(
+            &mut d,
+            "code_project_check",
+            serde_json::to_value(operation).unwrap(),
+            "rank-diagnostics",
+        )
+        .await;
+    assert!(
+        !checked.success && !checked.requires_reconciliation && !checked.cancelled,
+        "{}",
+        checked.content
+    );
+    let ranking = f
+        .call(&mut d, "context_search", query, "diagnostic-ranking")
+        .await;
+    assert!(ranking.success, "{}", ranking.content);
+    let value: Value = serde_json::from_str(&ranking.content).unwrap();
+    let signals = value["observation"]["data"][0]["signals"]
+        .as_array()
+        .unwrap();
+    assert!(signals.contains(&json!("diagnostics")), "{value}");
+    assert!(
+        !signals.contains(&json!("git_diff")) && !signals.contains(&json!("git_history")),
+        "{value}"
     );
 }
 

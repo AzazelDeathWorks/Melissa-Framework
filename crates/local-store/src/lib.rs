@@ -5,6 +5,7 @@ use std::fmt;
 mod artifacts;
 mod backup;
 pub mod cas;
+mod derived_index;
 #[cfg(windows)]
 mod pinned_inventory;
 #[cfg(windows)]
@@ -16,6 +17,7 @@ mod service;
 pub use artifacts::{ArtifactMetadata, ArtifactRequest, GarbageCollection};
 pub use backup::{BackupBlob, BackupManifest};
 pub use crypto::StoreKey;
+pub use derived_index::{MAX_INDEX_BYTES, RepositoryIndexCache};
 pub use service::{LocalStore, StoreConfig};
 
 pub type StoreResult<T = ()> = Result<T, StoreError>;

@@ -224,6 +224,7 @@ fn wire(op: &GitOperation) -> &'static str {
         GitOperation::Status => "git_status",
         GitOperation::Diff { .. } => "git_diff",
         GitOperation::Log { .. } => "git_log",
+        GitOperation::LogPaths { .. } => "git_log_paths",
         GitOperation::WorktreeList => "git_worktree_list",
         GitOperation::WorktreeCreate { .. } => "git_worktree_create",
     }

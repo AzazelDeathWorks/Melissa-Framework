@@ -228,8 +228,10 @@ fn policy() -> GatewayPolicy {
         max_requests: 5,
         max_turns: 4,
         max_tools: 4,
-        max_wall_time_ms: 5000,
-        expires_at_unix_ms: melissa_execution_broker::unix_ms().unwrap() + 30_000,
+        // Leave time for durable fixture I/O on shared Windows runners.
+        // Tests that assert deadlines set their own explicit short policy.
+        max_wall_time_ms: 30_000,
+        expires_at_unix_ms: melissa_execution_broker::unix_ms().unwrap() + 90_000,
         allow_fallback: false,
         max_backoff_ms: 0,
         decoder_limits: DecoderLimits::default(),

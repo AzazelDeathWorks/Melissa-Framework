@@ -113,7 +113,7 @@ pub fn runtime(
     {
         names.insert("memory_propose".into());
     }
-    let host = melissa_skill_context::runtime::ContextRuntime::open(
+    let mut host = melissa_skill_context::runtime::ContextRuntime::open(
         repo.clone(),
         store.connect()?,
         catalog,
@@ -134,6 +134,17 @@ pub fn runtime(
         &[],
     )
     .map_err(|_| Error::Store)?;
+    if enabled.contains("fs.search") {
+        let project = namespace(&repo).project;
+        let id = project.strip_prefix("blake3:").ok_or(Error::Store)?;
+        let path = app.home.join("projects").join(id).join("repository-index");
+        if crate::app::safe_path(&path).is_ok()
+            && let Ok(cache) =
+                melissa_local_store::RepositoryIndexCache::open(&path, app.key.clone())
+        {
+            host = host.with_repository_index_cache(cache);
+        }
+    }
     let native_repo = melissa_repository::tools::RepositoryDispatcher::new(
         app.source(&app.workspace(store, &t.task_id)?)?,
         store.connect()?,

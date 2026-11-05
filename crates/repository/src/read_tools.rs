@@ -58,6 +58,7 @@ fn route(op: &RepositoryRead) -> (&'static str, &'static str) {
             GitOperation::Status => ("git_status", "git.status"),
             GitOperation::Diff { .. } => ("git_diff", "git.diff"),
             GitOperation::Log { .. } => ("git_log", "git.log"),
+            GitOperation::LogPaths { .. } => ("git_log_paths", "git.log"),
             GitOperation::WorktreeList => ("git_worktree_list", "git.worktree"),
             GitOperation::WorktreeCreate { .. } => ("git_worktree_create", "git.worktree"),
         },

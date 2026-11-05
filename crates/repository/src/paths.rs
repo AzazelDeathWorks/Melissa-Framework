@@ -167,6 +167,44 @@ pub(crate) fn pin(path: &Path, dir: bool, write: bool) -> Result<Pinned> {
     pin_mode(path, dir, write, false, false)
 }
 
+/// A tree walk already retains its ancestor handles. Keep the parent alive
+/// during the callback and admit this child with the same target checks as pin.
+pub(crate) fn with_read_child<T>(
+    parent: &Pinned,
+    name: &str,
+    dir: bool,
+    visit: impl FnOnce(&mut Pinned) -> Result<T>,
+) -> Result<T> {
+    relative(name)?;
+    if name.contains('/') {
+        return Err(Error::Invalid("one directory component required"));
+    }
+    #[cfg(windows)]
+    {
+        let (file, identity, canonical) = open_mode(
+            &parent.canonical.join(name),
+            dir,
+            false,
+            false,
+            false,
+            false,
+        )?;
+        visit(&mut Pinned {
+            file,
+            identity,
+            canonical,
+            _ancestors: vec![],
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (parent, dir, visit);
+        Err(Error::Unsupported(
+            "Windows handle-pinned filesystem required",
+        ))
+    }
+}
+
 /// Only the trusted host establishes a root. Normalize its spelling from held
 /// handles (e.g. a Windows runner's short TEMP path), with every ancestor pinned
 /// and reparse points still denied. All subsequent model paths use strict pin().

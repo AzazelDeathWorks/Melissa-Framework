@@ -1223,6 +1223,7 @@ impl App {
                     .iter()
                     .any(|d| d.definition.name == "code_project_check")
             });
+            let context_host = context.inner.host();
             let router = ToolRouter::new(vec![
                 Box::new(repo_tool),
                 Box::new(task_tools),
@@ -1237,6 +1238,7 @@ impl App {
                 task: t.task_id.clone(),
                 checker,
                 language: crate::development::language(repo)?,
+                context: Some(context_host),
             };
             let dispatcher =
                 NodeDispatcher::new(scheduler.clone(), packet.clone(), Box::new(checked))

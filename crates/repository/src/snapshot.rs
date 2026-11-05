@@ -4,10 +4,10 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{Read, Seek, SeekFrom},
-    path::{Path, PathBuf},
+    path::Path,
     sync::atomic::AtomicBool,
 };
 
@@ -72,6 +72,21 @@ pub struct RepositorySnapshot {
     pub total_bytes: u64,
     pub atomic_tree_snapshot: bool,
     pub excluded_prefixes: Vec<String>,
+}
+
+/// A source digest paired with an optional host-observed NTFS journal receipt.
+/// Only authenticated, workspace-bound index state may supply a previous value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexedFileVersion {
+    pub version: FileVersion,
+    journal_stamp: Option<(u64, i64)>,
+}
+
+pub struct IndexScan {
+    pub snapshot: RepositorySnapshot,
+    pub files: BTreeMap<String, IndexedFileVersion>,
+    pub changed_bytes: BTreeMap<String, Vec<u8>>,
+    pub bytes_read: u64,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchHit {
@@ -194,23 +209,45 @@ impl Repository {
         pin: &mut Pinned,
         path: &str,
     ) -> Result<(FileVersion, Vec<u8>)> {
+        self.read_locked_with_cancel(pin, path, None)
+    }
+
+    fn read_locked_with_cancel(
+        &self,
+        pin: &mut Pinned,
+        path: &str,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(FileVersion, Vec<u8>)> {
         self.check_path(path)?;
         if pin.file.metadata()?.len() > self.limits.max_file_bytes {
             return Err(Error::Quota("file bytes"));
         }
         pin.file.seek(SeekFrom::Start(0))?;
         let mut bytes = Vec::new();
-        pin.file
-            .by_ref()
-            .take(self.limits.max_file_bytes + 1)
-            .read_to_end(&mut bytes)?;
+        let mut bounded = pin.file.by_ref().take(self.limits.max_file_bytes + 1);
+        let content_digest = if let Some(cancel) = cancel {
+            let mut hash = blake3::Hasher::new();
+            loop {
+                check_cancel(cancel)?;
+                let start = bytes.len();
+                let count = bounded.by_ref().take(64 * 1024).read_to_end(&mut bytes)?;
+                if count == 0 {
+                    break;
+                }
+                hash.update(&bytes[start..]);
+            }
+            format!("blake3:{}", hash.finalize().to_hex())
+        } else {
+            bounded.read_to_end(&mut bytes)?;
+            digest(&bytes)
+        };
         if bytes.len() as u64 > self.limits.max_file_bytes {
             return Err(Error::Quota("file bytes"));
         }
         let version = FileVersion {
             path: path.into(),
             identity: pin.identity.clone(),
-            digest: digest(&bytes),
+            digest: content_digest,
             bytes: bytes.len() as u64,
         };
         Ok((version, bytes))
@@ -219,12 +256,152 @@ impl Repository {
         let mut file = self.lock(path, false)?;
         self.read_locked(&mut file, path)
     }
+
+    pub fn read_cancellable(
+        &self,
+        path: &str,
+        cancel: &AtomicBool,
+    ) -> Result<(FileVersion, Vec<u8>)> {
+        check_cancel(cancel)?;
+        self.read_locked_with_cancel(&mut self.lock(path, false)?, path, Some(cancel))
+    }
     pub fn snapshot(&self, cancel: &AtomicBool) -> Result<RepositorySnapshot> {
+        self.capture(cancel, |path, pin| {
+            self.read_locked_with_cancel(pin, path, Some(cancel))
+                .map(|(version, _)| version)
+        })
+    }
+
+    /// Recheck the visible tree using the same pinned path admission as a
+    /// snapshot. Read bytes whenever the OS cannot prove the cached version
+    /// unchanged. Index receipts are for retrieval, never write admission.
+    pub fn scan_index(
+        &self,
+        previous: &BTreeMap<String, IndexedFileVersion>,
+        cancel: &AtomicBool,
+    ) -> Result<IndexScan> {
+        #[cfg(windows)]
+        let journal = crate::file_journal::FileJournal::open(&self.root.file);
+        let stamp = |pin: &Pinned| {
+            #[cfg(windows)]
+            {
+                journal.as_ref().and_then(|j| j.stamp(&pin.file))
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = pin;
+                None
+            }
+        };
+        let mut files = BTreeMap::new();
+        let mut changed_bytes = BTreeMap::new();
+        let mut bytes_read = 0u64;
+        let snapshot = self.capture(cancel, |path, pin| {
+            let old = previous.get(path);
+            let (file, content) = self.observe_index_file(path, pin, stamp(pin), old, cancel)?;
+            if let Some(content) = content {
+                bytes_read += file.version.bytes;
+                if old.is_none_or(|old| old.version.digest != file.version.digest) {
+                    changed_bytes.insert(path.to_owned(), content);
+                }
+            }
+            let version = file.version.clone();
+            files.insert(path.to_owned(), file);
+            Ok(version)
+        })?;
+        #[cfg(windows)]
+        let stable = journal
+            .as_ref()
+            .map(|j| j.verify())
+            .transpose()?
+            .unwrap_or(false);
+        #[cfg(not(windows))]
+        let stable = false;
+        if !stable {
+            // A changed volume cursor could be unrelated activity. Confirm the
+            // observed tree, reusing the fresh file receipts where possible.
+            let confirmed = self.capture(cancel, |path, pin| {
+                let (file, content) =
+                    self.observe_index_file(path, pin, stamp(pin), files.get(path), cancel)?;
+                if content.is_some() {
+                    bytes_read += file.version.bytes;
+                }
+                Ok(file.version)
+            })?;
+            #[cfg(windows)]
+            if let Some(journal) = &journal {
+                journal.verify()?;
+            }
+            if confirmed != snapshot {
+                return Err(Error::Stale("repository changed during index scan"));
+            }
+        }
+        Ok(IndexScan {
+            snapshot,
+            files,
+            changed_bytes,
+            bytes_read,
+        })
+    }
+
+    fn observe_index_file(
+        &self,
+        path: &str,
+        pin: &mut Pinned,
+        journal_stamp: Option<(u64, i64)>,
+        old: Option<&IndexedFileVersion>,
+        cancel: &AtomicBool,
+    ) -> Result<(IndexedFileVersion, Option<Vec<u8>>)> {
+        let bytes = pin.file.metadata()?.len();
+        if bytes > self.limits.max_file_bytes {
+            return Err(Error::Quota("file bytes"));
+        }
+        if let Some(old) = old
+            && journal_stamp.is_some()
+            && journal_stamp == old.journal_stamp
+            && old.version.path == path
+            && old.version.identity == pin.identity
+            && old.version.bytes == bytes
+        {
+            return Ok((old.clone(), None));
+        }
+        let (version, content) = self.read_locked_with_cancel(pin, path, Some(cancel))?;
+        Ok((
+            IndexedFileVersion {
+                version,
+                journal_stamp,
+            },
+            Some(content),
+        ))
+    }
+
+    fn capture(
+        &self,
+        cancel: &AtomicBool,
+        mut read_version: impl FnMut(&str, &mut Pinned) -> Result<FileVersion>,
+    ) -> Result<RepositorySnapshot> {
         let mut files = Vec::new();
-        let mut total = 0;
+        let mut total = 0u64;
         let mut seen = BTreeSet::new();
         let mut entries = 0;
-        self.visit("", &mut files, &mut total, &mut seen, &mut entries, cancel)?;
+        self.visit(
+            &self.root,
+            "",
+            &mut seen,
+            &mut entries,
+            cancel,
+            &mut |path, pin| {
+                let version = read_version(path, pin)?;
+                total = total
+                    .checked_add(version.bytes)
+                    .ok_or(Error::Quota("byte overflow"))?;
+                if total > self.limits.max_total_bytes {
+                    return Err(Error::Quota("snapshot bytes"));
+                }
+                files.push(version);
+                Ok(())
+            },
+        )?;
         files.sort_by(|a, b| a.path.cmp(&b.path));
         let seal = digest(&serde_json::to_vec(&(
             self.root_identity(),
@@ -243,21 +420,15 @@ impl Repository {
     }
     fn visit(
         &self,
+        parent: &Pinned,
         relative: &str,
-        files: &mut Vec<FileVersion>,
-        total: &mut u64,
         seen: &mut BTreeSet<String>,
         entries: &mut usize,
         cancel: &AtomicBool,
+        file: &mut impl FnMut(&str, &mut Pinned) -> Result,
     ) -> Result {
         check_cancel(cancel)?;
-        let path: PathBuf = if relative.is_empty() {
-            self.root.canonical.clone()
-        } else {
-            self.root.canonical.join(relative.replace('/', "\\"))
-        };
-        let _guard = paths::pin(&path, true, false)?;
-        for entry in fs::read_dir(path)? {
+        for entry in fs::read_dir(&parent.canonical)? {
             check_cancel(cancel)?;
             *entries += 1;
             if *entries > self.limits.max_files {
@@ -269,7 +440,7 @@ impl Repository {
                 .into_string()
                 .map_err(|_| Error::Invalid("non-Unicode entry"))?;
             let child = if relative.is_empty() {
-                name
+                name.clone()
             } else {
                 format!("{relative}/{name}")
             };
@@ -287,18 +458,13 @@ impl Repository {
                 return Err(Error::Denied("case-colliding paths"));
             }
             let kind = entry.file_type()?;
-            if kind.is_dir() {
-                self.visit(&child, files, total, seen, entries, cancel)?;
-            } else {
-                let (version, _) = self.read(&child)?;
-                *total = total
-                    .checked_add(version.bytes)
-                    .ok_or(Error::Quota("byte overflow"))?;
-                if *total > self.limits.max_total_bytes {
-                    return Err(Error::Quota("snapshot bytes"));
+            paths::with_read_child(parent, &name, kind.is_dir(), |pin| {
+                if kind.is_dir() {
+                    self.visit(pin, &child, seen, entries, cancel, file)
+                } else {
+                    file(&child, pin)
                 }
-                files.push(version);
-            }
+            })?;
         }
         Ok(())
     }
@@ -355,17 +521,24 @@ impl Repository {
         // Linear-time substring search; comparing every window cost
         // file size x needle length (up to 64 KiB) with no cancel point.
         let finder = memchr::memmem::Finder::new(needle);
+        let prefix = overlap_table(needle);
+        let periodic = needle.len() >= 64 && prefix[needle.len() - 1] >= needle.len() / 2;
         let match_lines = memchr::memchr_iter(b'\n', needle).count();
         for observed in &snapshot.files {
             check_cancel(cancel)?;
-            let (version, bytes) = self.read(&observed.path)?;
+            let (version, bytes) = self.read_cancellable(&observed.path, cancel)?;
             if version != *observed {
                 return Err(Error::Stale("search file changed"));
             }
             let text = std::str::from_utf8(&bytes).ok();
             let (mut start, mut line, mut counted) = (0, 1, 0);
+            let mut overlap = OverlapCursor::default();
             // Restart one byte past each hit so overlapping matches are kept.
-            while let Some(pos) = find_chunked(&bytes, start, &finder, needle.len(), cancel)? {
+            while let Some(pos) = if periodic {
+                overlap.find(&bytes, needle, &prefix, cancel)?
+            } else {
+                find_chunked(&bytes, start, &finder, needle.len(), cancel)?
+            } {
                 check_cancel(cancel)?;
                 if hits.len() == self.limits.max_search_hits {
                     truncated = true;
@@ -408,6 +581,53 @@ impl Repository {
     }
 }
 
+fn overlap_table(needle: &[u8]) -> Vec<usize> {
+    let mut table = vec![0; needle.len()];
+    let mut count = 0;
+    for i in 1..needle.len() {
+        count = overlap_step(needle, &table, count, needle[i]);
+        table[i] = count;
+    }
+    table
+}
+
+fn overlap_step(needle: &[u8], table: &[usize], mut count: usize, byte: u8) -> usize {
+    while count > 0 && needle[count] != byte {
+        count = table[count - 1];
+    }
+    count + usize::from(needle[count] == byte)
+}
+
+#[derive(Default)]
+struct OverlapCursor {
+    next: usize,
+    matched: usize,
+}
+
+impl OverlapCursor {
+    fn find(
+        &mut self,
+        bytes: &[u8],
+        needle: &[u8],
+        table: &[usize],
+        cancel: &AtomicBool,
+    ) -> Result<Option<usize>> {
+        check_cancel(cancel)?;
+        while let Some(&byte) = bytes.get(self.next) {
+            if self.next.is_multiple_of(16 * 1024) {
+                check_cancel(cancel)?;
+            }
+            self.matched = overlap_step(needle, table, self.matched, byte);
+            self.next += 1;
+            if self.matched == needle.len() {
+                self.matched = table[self.matched - 1];
+                return Ok(Some(self.next - needle.len()));
+            }
+        }
+        Ok(None)
+    }
+}
+
 fn find_chunked(
     bytes: &[u8],
     start: usize,
@@ -435,6 +655,32 @@ fn find_chunked(
 #[cfg(test)]
 mod search_tests {
     use super::*;
+    #[test]
+    fn periodic_overlap_cursor_matches_literal_positions_without_losing_cancellation() {
+        let needle = b"ab".repeat(100);
+        let bytes = b"x"
+            .iter()
+            .copied()
+            .chain(b"ab".repeat(4000))
+            .collect::<Vec<_>>();
+        let expected: Vec<_> = bytes
+            .windows(needle.len())
+            .enumerate()
+            .filter_map(|(i, chunk)| (chunk == needle).then_some(i))
+            .collect();
+        let cancel = AtomicBool::new(false);
+        let prefix = overlap_table(&needle);
+        let mut cursor = OverlapCursor::default();
+        let mut actual = Vec::new();
+        while let Some(pos) = cursor.find(&bytes, &needle, &prefix, &cancel).unwrap() {
+            actual.push(pos);
+        }
+        assert_eq!(actual, expected);
+        assert!(matches!(
+            cursor.find(&bytes, &needle, &prefix, &AtomicBool::new(true)),
+            Err(Error::Cancelled)
+        ));
+    }
     #[test]
     fn chunk_boundaries_overlaps_and_cancellation_preserve_literal_search() {
         let cancel = AtomicBool::new(false);

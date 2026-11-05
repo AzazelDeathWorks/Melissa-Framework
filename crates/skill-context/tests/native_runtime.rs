@@ -844,6 +844,8 @@ async fn native_gateway_context_memory_templates_and_worker_use_actual_admission
     let host = h.lock().unwrap();
     assert!(host.telemetry()["parse.hit"] >= 1);
     assert!(host.telemetry()["retrieval.hit"] >= 1);
+    assert_eq!(host.telemetry()["index.documents_updated"], 2);
+    assert_eq!(host.telemetry()["index.files_parsed"], 2);
     assert!(host.telemetry()["prompt.hit"] >= 1);
     let mut proposal = None;
     for id in &r.artifact_refs {

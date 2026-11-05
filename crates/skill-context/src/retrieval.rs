@@ -134,9 +134,81 @@ pub struct Hit {
     pub start_byte: usize,
     pub end_byte: usize,
     pub start_line: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<usize>,
     pub lexical_rank: Option<usize>,
     pub graph_match: bool,
     pub authority: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signals: Vec<String>,
+}
+
+pub(crate) fn query_terms(query: &str) -> Vec<&str> {
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+pub(crate) fn ranked_rows(db: &Connection, terms: &[&str]) -> Result<Vec<i64>> {
+    if terms.is_empty() {
+        return Ok(vec![]);
+    }
+    // Literal terms never become column names, operators or SQL.
+    let escaped = terms
+        .iter()
+        .map(|t| format!("\"{t}\""))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let mut stmt = db
+        .prepare("SELECT rowid FROM corpus WHERE corpus MATCH ?1 ORDER BY bm25(corpus),rowid")
+        .map_err(sql)?;
+    stmt.query_map([escaped], |row| row.get::<_, i64>(0))
+        .map_err(sql)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(sql)
+}
+
+pub(crate) fn make_hit(
+    source: SourceRef,
+    content: &str,
+    terms: &[&str],
+    limit: usize,
+    lexical_rank: Option<usize>,
+    graph_match: bool,
+) -> Hit {
+    let excerpt_bytes = (128 * 1024 / limit).min(4096);
+    let at = terms
+        .iter()
+        .filter_map(|term| content.find(term))
+        .min()
+        .unwrap_or(0);
+    let mut start = at.saturating_sub(256);
+    while !content.is_char_boundary(start) {
+        start += 1;
+    }
+    let mut end = (start + excerpt_bytes).min(content.len());
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    let excerpt = content[start..end].to_owned();
+    Hit {
+        source,
+        excerpt_digest: digest(excerpt.as_bytes()),
+        excerpt,
+        start_byte: start,
+        end_byte: end,
+        start_line: content.as_bytes()[..start]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count()
+            + 1,
+        end_line: None,
+        lexical_rank,
+        graph_match,
+        authority: "untrusted_data".into(),
+        signals: vec![],
+    }
 }
 
 pub fn search(
@@ -224,31 +296,11 @@ impl SearchIndex {
         tx.commit().map_err(sql)?;
         self.indexed = next;
         self.updated_documents += updates;
-        // Model punctuation never becomes FTS syntax, SQL, a column selector or NEAR.
-        let terms: Vec<_> = query
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let terms = query_terms(query);
         let mut lexical = BTreeMap::new();
-        if !terms.is_empty() {
-            let escaped = terms
-                .iter()
-                .map(|t| format!("\"{t}\""))
-                .collect::<Vec<_>>()
-                .join(" OR ");
-            let mut stmt = self
-                .db
-                .prepare(
-                    "SELECT rowid FROM corpus WHERE corpus MATCH ?1 ORDER BY bm25(corpus),rowid",
-                )
-                .map_err(sql)?;
-            let rows = stmt
-                .query_map([escaped], |r| r.get::<_, i64>(0))
-                .map_err(sql)?;
-            for (rank, row) in rows.enumerate() {
-                if let Some(i) = row_to_index.get(&row.map_err(sql)?) {
-                    lexical.insert(*i, rank);
-                }
+        for (rank, row) in ranked_rows(&self.db, &terms)?.into_iter().enumerate() {
+            if let Some(i) = row_to_index.get(&row) {
+                lexical.insert(*i, rank);
             }
         }
         let seed_ids: BTreeSet<_> = eligible
@@ -272,41 +324,19 @@ impl SearchIndex {
         let mut seen = BTreeSet::new();
         hits.retain(|h| seen.insert(&eligible[h.0].digest));
         // Rank and deduplicate references before allocating bounded excerpts.
-        let excerpt_bytes = (128 * 1024 / limit).min(4096);
         let bounded = hits
             .into_iter()
             .take(limit)
             .map(|(i, graph_match, lexical_rank)| {
                 let s = eligible[i];
-                let at = terms
-                    .iter()
-                    .filter_map(|term| s.content.find(term))
-                    .min()
-                    .unwrap_or(0);
-                let mut start = at.saturating_sub(256);
-                while !s.content.is_char_boundary(start) {
-                    start += 1;
-                }
-                let mut end = (start + excerpt_bytes).min(s.content.len());
-                while !s.content.is_char_boundary(end) {
-                    end -= 1;
-                }
-                let excerpt = s.content[start..end].to_owned();
-                Hit {
-                    source: s.reference(),
-                    excerpt_digest: digest(excerpt.as_bytes()),
-                    excerpt,
-                    start_byte: start,
-                    end_byte: end,
-                    start_line: s.content.as_bytes()[..start]
-                        .iter()
-                        .filter(|&&b| b == b'\n')
-                        .count()
-                        + 1,
+                make_hit(
+                    s.reference(),
+                    &s.content,
+                    &terms,
+                    limit,
                     lexical_rank,
                     graph_match,
-                    authority: "untrusted_data".into(),
-                }
+                )
             });
         let mut output = Vec::new();
         let mut bytes = 2usize;
@@ -321,6 +351,6 @@ impl SearchIndex {
         Ok(output)
     }
 }
-fn sql(_: rusqlite::Error) -> Error {
+pub(crate) fn sql(_: rusqlite::Error) -> Error {
     Error("CODE-07 SQLite FTS operation failed".into())
 }

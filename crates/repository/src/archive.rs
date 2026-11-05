@@ -1,8 +1,8 @@
 //! A quarantined tar reader, NEVER an archive extractor. Files returned here
 //! are still untrusted proposals; they require normal expected-version patches.
-use crate::{Error, Limits, Result, paths};
+use crate::{Error, Limits, Result, check_cancel, paths};
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::atomic::AtomicBool};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ImportedFile {
@@ -27,6 +27,14 @@ fn octal(b: &[u8]) -> Result<u64> {
     u64::from_str_radix(s, 8).map_err(|_| Error::Invalid("tar octal overflow"))
 }
 pub fn inspect_ustar(bytes: &[u8], limits: &Limits) -> Result<Vec<ImportedFile>> {
+    inspect_ustar_cancellable(bytes, limits, &AtomicBool::new(false))
+}
+
+pub fn inspect_ustar_cancellable(
+    bytes: &[u8],
+    limits: &Limits,
+    cancel: &AtomicBool,
+) -> Result<Vec<ImportedFile>> {
     limits.validate()?;
     let ceiling = limits
         .max_total_bytes
@@ -42,11 +50,18 @@ pub fn inspect_ustar(bytes: &[u8], limits: &Limits) -> Result<Vec<ImportedFile>>
     let mut regular = BTreeSet::new();
     let mut entries = 0;
     while pos + 512 <= bytes.len() {
+        check_cancel(cancel)?;
         let h = &bytes[pos..pos + 512];
         pos += 512;
         if h.iter().all(|b| *b == 0) {
-            if pos + 512 > bytes.len() || bytes[pos..].iter().any(|b| *b != 0) {
+            if pos + 512 > bytes.len() {
                 return Err(Error::Invalid("tar terminal blocks"));
+            }
+            for tail in bytes[pos..].chunks(256 * 1024) {
+                check_cancel(cancel)?;
+                if tail.iter().any(|b| *b != 0) {
+                    return Err(Error::Invalid("tar terminal blocks"));
+                }
             }
             return Ok(result);
         }
@@ -106,12 +121,13 @@ pub fn inspect_ustar(bytes: &[u8], limits: &Limits) -> Result<Vec<ImportedFile>>
         if name.split('/').any(|s| s.eq_ignore_ascii_case(".git")) {
             return Err(Error::Denied("Git metadata in archive"));
         }
-        if !seen.insert(paths::key(&name)) {
+        let key = paths::key(&name);
+        if !seen.insert(key.clone()) {
             return Err(Error::Denied("duplicate or case-alias tar entry"));
         }
-        let mut parent = name.as_str();
+        let mut parent = key.as_str();
         while let Some((head, _)) = parent.rsplit_once('/') {
-            if regular.contains(&paths::key(head)) {
+            if regular.contains(head) {
                 return Err(Error::Denied("tar file-directory collision"));
             }
             parent = head;
@@ -130,7 +146,7 @@ pub fn inspect_ustar(bytes: &[u8], limits: &Limits) -> Result<Vec<ImportedFile>>
         }
         // `seen` is ordered, so any entry beneath `name/` sorts first at or
         // after that prefix: one range lookup instead of a scan per file.
-        let below = format!("{}/", paths::key(&name));
+        let below = format!("{key}/");
         if seen
             .range(below.clone()..)
             .next()
@@ -138,7 +154,7 @@ pub fn inspect_ustar(bytes: &[u8], limits: &Limits) -> Result<Vec<ImportedFile>>
         {
             return Err(Error::Denied("tar ancestor collision"));
         }
-        regular.insert(paths::key(&name));
+        regular.insert(key);
         total = total
             .checked_add(len)
             .ok_or(Error::Quota("tar length overflow"))?;
@@ -159,9 +175,14 @@ pub fn inspect_ustar(bytes: &[u8], limits: &Limits) -> Result<Vec<ImportedFile>>
         if bytes[end..padded].iter().any(|b| *b != 0) {
             return Err(Error::Invalid("nonzero tar padding"));
         }
+        let mut payload = Vec::with_capacity(len);
+        for chunk in bytes[pos..end].chunks(256 * 1024) {
+            check_cancel(cancel)?;
+            payload.extend_from_slice(chunk);
+        }
         result.push(ImportedFile {
             path: name,
-            bytes: bytes[pos..end].to_vec(),
+            bytes: payload,
             trusted: false,
         });
         pos = padded;
