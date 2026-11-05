@@ -38,6 +38,7 @@ pub struct Runtime {
     profile: String,
     contract: Contract,
     expires: u64,
+    private_input: bool,
     workers: Vec<(String, Arc<AtomicBool>, thread::JoinHandle<()>)>,
 }
 impl Runtime {
@@ -55,8 +56,13 @@ impl Runtime {
             profile: profile.into(),
             contract,
             expires,
+            private_input: false,
             workers: vec![],
         })
+    }
+    pub(crate) fn with_private_input(mut self) -> Self {
+        self.private_input = true;
+        self
     }
     #[allow(clippy::too_many_arguments)] // One source/task/permit/IO binding at the trusted host boundary.
     pub fn start(
@@ -70,6 +76,31 @@ impl Runtime {
         preflight_only: bool,
         sync_only: bool,
     ) -> Result<String> {
+        self.start_with_files(
+            app,
+            store,
+            repo,
+            command,
+            ctx_invocation,
+            cancel,
+            preflight_only,
+            sync_only,
+            BTreeMap::new(),
+        )
+    }
+    #[allow(clippy::too_many_arguments)] // Exact approved snapshot supplement, never a host mount.
+    pub fn start_with_files(
+        &mut self,
+        app: &App,
+        store: &LocalStore,
+        repo: &Repository,
+        command: Command,
+        ctx_invocation: &str,
+        cancel: Arc<AtomicBool>,
+        preflight_only: bool,
+        sync_only: bool,
+        extra: BTreeMap<String, Vec<u8>>,
+    ) -> Result<String> {
         command.validate()?;
         self.contract.validate()?;
         if now()? >= self.expires || cancel.load(Ordering::Acquire) {
@@ -78,6 +109,17 @@ impl Runtime {
             ));
         }
         let source = repo.snapshot(&AtomicBool::new(false))?;
+        if !extra.is_empty()
+            && (source.files.iter().any(|f| {
+                f.path == ".melissa-extension" || f.path.starts_with(".melissa-extension/")
+            }) || extra
+                .keys()
+                .any(|p| !p.starts_with(".melissa-extension/") || !melissa_workflow::plan::path(p)))
+        {
+            return Err(Error::Denied(
+                "Eklenti snapshot alanı çakışıyor veya geçersiz.",
+            ));
+        }
         if source
             .files
             .iter()
@@ -103,6 +145,7 @@ impl Runtime {
                 .files
                 .iter()
                 .map(|f| (f.path.as_str(), f.bytes))
+                .chain(extra.iter().map(|(p, v)| (p.as_str(), v.len() as u64)))
                 .chain([
                     (".melissa-project/program.json", encoded.len() as u64),
                     (
@@ -122,6 +165,7 @@ impl Runtime {
             .iter()
             .map(|f| repo.read(&f.path).map(|(_, v)| (f.path.clone(), v)))
             .collect::<std::result::Result<BTreeMap<_, _>, _>>()?;
+        files.extend(extra);
         files.insert(".melissa-project/program.json".into(), encoded);
         files.insert(
             ".melissa-project/worker.py".into(),
@@ -245,6 +289,7 @@ impl Runtime {
             idempotency_key: None,
         };
         let state = State {
+            private_input: self.private_input,
             expires_at_ms: self.expires,
             task_id: self.task.clone(),
             session_id: sid.clone(),

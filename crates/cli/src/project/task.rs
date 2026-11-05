@@ -75,7 +75,7 @@ impl App {
         goal: &str,
         mode: Mode,
         plan: Value,
-        contract: Contract,
+        mut contract: Contract,
         budget: u64,
         wall_time_ms: u64,
     ) -> Result<Value> {
@@ -84,6 +84,10 @@ impl App {
             return self.create_conversation(workspace, goal, mode, plan);
         }
         let repo = Repository::open(workspace, Default::default(), vec![])?;
+        if contract.extensions.is_none() {
+            contract.extensions = self.freeze_extensions(&repo, goal)?;
+        }
+        contract.validate()?;
         let source = repo.snapshot(&std::sync::atomic::AtomicBool::new(false))?;
         if plan["source_digest"].as_str() != Some(source.digest.as_str()) {
             return Err(Error::Conflict(

@@ -10,6 +10,7 @@ Windows x64 önizlemesi için [kurulum ve ilk görev rehberi](docs/QUICKSTART_WI
 Paketin yanındaki `install.ps1` tek komutla kullanıcı hesabına kurar. Ardından proje klasöründe `melissa` terminal oturumunu açar.
 Oturumda proje paneli, okunabilir görev kartları, Unicode metin düzenleme, ok tuşlarıyla geçmiş ve Tab ile komut tamamlama bulunur. `/details` kayda bağlı tam kapsamı gösterir.
 Plan/inceleme/geliştirme kipleri, kapsam farkları ve çalışan görevi yönlendirme için [konuşmalı oturum rehberi](docs/CONVERSATION_TR.md).
+Kullanıcı/proje skill'leri, onaylı MCP araçları, sürümlü dokümanlar ve hook'lar için [eklenti rehberi](docs/EXTENSIONS_TR.md).
 Güvenlik bildirimleri için [gizli bildirim yolu](SECURITY.md).
 
 Aktif ürün kapsamı 6 Core ve 12 Code profilidir. Diğer alanların genel tanımları

@@ -4,7 +4,7 @@ mod disk;
 pub mod runtime;
 pub mod task;
 #[cfg(all(test, windows))]
-mod tests;
+pub(crate) mod tests;
 pub mod tools;
 use crate::{Error, Result};
 use melissa_container_executor::ContainerLimits;
@@ -123,14 +123,26 @@ impl Environment {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Contract {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<crate::extensions::Bundle>,
     pub environment: Environment,
     pub checks: BTreeMap<String, Command>,
     #[serde(default)]
     pub sync: Vec<Command>,
 }
 impl Contract {
+    pub fn public_summary(&self) -> Result<serde_json::Value> {
+        let mut value = serde_json::to_value(self).map_err(|_| Error::Store)?;
+        if let Some(bundle) = &self.extensions {
+            value["extensions"] = bundle.context();
+        }
+        Ok(value)
+    }
     pub fn validate(&self) -> Result {
         self.environment.validate()?;
+        if let Some(extensions) = &self.extensions {
+            extensions.validate()?;
+        }
         if self.checks.is_empty() {
             return Err(Error::Usage(
                 "En az bir açık proje kabul komutu gerekli; /check ile ekle.",

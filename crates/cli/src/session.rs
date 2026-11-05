@@ -146,6 +146,13 @@ impl Session {
         let argument = argument.trim();
         let result = match (command, argument) {
             ("/help", "") => return self.ui.help(HELP, output),
+            ("/skills", "") | ("/extensions", "") => self.app.extension_catalog(&self.workspace)?,
+            ("/extensions", path) => self
+                .app
+                .configure_extensions(&self.workspace, &path_argument(path)?)?,
+            ("/skill-import", path) if !path.is_empty() => {
+                self.app.import_skill(&path_argument(path)?, None)?
+            }
             ("/doctor", "") => crate::views::doctor()?,
             ("/project-doctor", "") => self
                 .app

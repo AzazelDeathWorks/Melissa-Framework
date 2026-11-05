@@ -39,6 +39,33 @@ async fn run(options: &args::Options) -> Result<Value> {
         Command::ProjectDoctor { workspace } => {
             app.project_doctor(workspace, app.project_environment(workspace)?)
         }
+        Command::Extension {
+            action,
+            workspace,
+            path,
+            digest,
+            id,
+            source,
+            query,
+        } => match action.as_str() {
+            "list" => app.extension_catalog(workspace.as_ref().ok_or(melissa_cli::Error::Io)?),
+            "configure" => app.configure_extensions(
+                workspace.as_ref().ok_or(melissa_cli::Error::Io)?,
+                path.as_ref().ok_or(melissa_cli::Error::Io)?,
+            ),
+            "import-skill" => app.import_skill(
+                path.as_ref().ok_or(melissa_cli::Error::Io)?,
+                digest.as_deref(),
+            ),
+            _ => {
+                app.resolve_docs(
+                    id.as_deref().ok_or(melissa_cli::Error::Io)?,
+                    source.as_deref().ok_or(melissa_cli::Error::Io)?,
+                    query.as_deref().ok_or(melissa_cli::Error::Io)?,
+                )
+                .await
+            }
+        },
         Command::ProjectOperation {
             id,
             operation,
@@ -159,6 +186,7 @@ async fn main() {
         println!("{}", args::HELP);
         println!("{}", args::SESSION_HELP);
         println!("{}", args::PROJECT_HELP);
+        println!("{}", args::EXTENSION_HELP);
         println!("{}", args::EXECUTION_HELP);
         println!("{}", args::DOMAIN_HELP);
         println!("{}", args::CAPABILITIES_HELP);

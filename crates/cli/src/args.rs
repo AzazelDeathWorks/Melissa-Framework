@@ -1,4 +1,5 @@
 use crate::{Error, Result};
+pub const EXTENSION_HELP: &str = "\nSkill/MCP/doküman/hook:\n  Oturum: /skills, /skill-import KLASOR, /extensions [JSON_DOSYASI]\n  melissa --json extension list --workspace PATH\n  melissa --json extension import-skill --path DIR [--digest BLAKE3]\n  melissa --json extension configure --workspace PATH --path JSON\n  melissa --json extension resolve --task TASK --source SOURCE --query TEXT\n  İçerik/ayarlar yeni görev onayına sabitlenir; eski göreve izin eklenmez. Belgeler: docs/EXTENSIONS_TR.md\n";
 pub const METRICS_HELP: &str =
     "\nGörev ölçümleri:\n  melissa [--home PATH] --json task metrics ID\n";
 pub const SESSION_HELP: &str = "\nTerminal oturumu:\n  melissa\n  melissa [--home PATH] session [--workspace PATH]\n\nGörevini yaz veya oturum komutları için /help yaz.";
@@ -20,6 +21,15 @@ pub struct Options {
 pub const DOMAIN_HELP: &str = "\nWeb/API/veritabanı (v2 özel tarif):\n  melissa task preview ID [--out NEW_DIRECTORY]\n  melissa task evidence ID [--artifact ARTIFACT_ID --out NEW_FILE]\n\nYerel tarayıcı/API/SQLite/PostgreSQL akışları sabit image üzerinde çalışır. Public development ve private final testleri ayrıdır. Preview kaynağa bağlı PNG ihracıdır; kalıcı web sunucusu açmaz.\n";
 #[derive(Debug)]
 pub enum Command {
+    Extension {
+        action: String,
+        workspace: Option<PathBuf>,
+        path: Option<PathBuf>,
+        digest: Option<String>,
+        id: Option<String>,
+        source: Option<String>,
+        query: Option<String>,
+    },
     ProjectDoctor {
         workspace: PathBuf,
     },
@@ -175,6 +185,75 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options> {
         "init" => Command::Init,
         "profiles" => Command::Profiles,
         "doctor" => Command::Doctor,
+        "extension" => {
+            let action = text(a.next().ok_or(Error::Usage(
+                "extension list|configure|import-skill|resolve gerekli.",
+            ))?)?;
+            if !["list", "configure", "import-skill", "resolve"].contains(&action.as_str()) {
+                return Err(Error::Usage("Bilinmeyen extension işlemi."));
+            }
+            let mut f = flags(
+                &mut a,
+                &[
+                    "--workspace",
+                    "--path",
+                    "--digest",
+                    "--task",
+                    "--source",
+                    "--query",
+                ],
+            )?;
+            let workspace = f.remove("--workspace").map(PathBuf::from);
+            let path = f.remove("--path").map(PathBuf::from);
+            let digest = f.remove("--digest").map(text).transpose()?;
+            let id = f.remove("--task").map(text).transpose()?;
+            let source = f.remove("--source").map(text).transpose()?;
+            let query = f.remove("--query").map(text).transpose()?;
+            if match action.as_str() {
+                "list" => {
+                    workspace.is_none()
+                        || path.is_some()
+                        || digest.is_some()
+                        || id.is_some()
+                        || source.is_some()
+                        || query.is_some()
+                }
+                "configure" => {
+                    workspace.is_none()
+                        || path.is_none()
+                        || digest.is_some()
+                        || id.is_some()
+                        || source.is_some()
+                        || query.is_some()
+                }
+                "import-skill" => {
+                    workspace.is_some()
+                        || path.is_none()
+                        || id.is_some()
+                        || source.is_some()
+                        || query.is_some()
+                }
+                _ => {
+                    id.is_none()
+                        || source.is_none()
+                        || query.is_none()
+                        || workspace.is_some()
+                        || path.is_some()
+                        || digest.is_some()
+                }
+            } {
+                return Err(Error::Usage("Extension seçenekleri işlemle uyuşmuyor."));
+            }
+            Command::Extension {
+                action,
+                workspace,
+                path,
+                digest,
+                id,
+                source,
+                query,
+            }
+        }
         "project" => {
             let action = text(a.next().ok_or(Error::Usage(
                 "project doctor|preflight|sync|exec|poll|stdin|eof|cancel gerekli.",

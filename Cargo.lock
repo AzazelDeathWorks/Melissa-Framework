@@ -1157,9 +1157,12 @@ dependencies = [
 name = "melissa-cli"
 version = "0.3.0-alpha.3"
 dependencies = [
+ "base64 0.22.1",
  "blake3",
  "crossterm",
+ "futures-util",
  "getrandom 0.4.3",
+ "jsonschema",
  "melissa-build-test",
  "melissa-code-quality",
  "melissa-container-executor",
@@ -1172,6 +1175,7 @@ dependencies = [
  "melissa-skill-context",
  "melissa-web-development",
  "melissa-workflow",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

@@ -309,7 +309,7 @@ impl Recipe {
     }
     pub fn public_plan(&self) -> Value {
         if let Some(project) = &self.project {
-            return json!({"agents":self.agents,"writable_paths":self.writable_paths,"protected_paths":self.protected_paths,"project":project,"scope_amendments":"operator-approved paths at safe pause/resume; same task, budget and deadline","acceptance_kind":"host_source_bound_project_checks","private_oracle":false,"max_cost_micro_usd":self.max_cost_micro_usd,"wall_time_ms":self.wall_time_ms,"source_access":"visible_snapshot_only_no_host_writeback"});
+            return json!({"agents":self.agents,"writable_paths":self.writable_paths,"protected_paths":self.protected_paths,"project":project.public_summary().unwrap_or(serde_json::Value::Null),"scope_amendments":"operator-approved paths at safe pause/resume; same task, budget and deadline","acceptance_kind":"host_source_bound_project_checks","private_oracle":false,"max_cost_micro_usd":self.max_cost_micro_usd,"wall_time_ms":self.wall_time_ms,"source_access":"visible_snapshot_only_no_host_writeback"});
         }
         if let Some(domain) = &self.domain {
             return json!({"agents":self.agents,"writable_paths":self.writable_paths,"protected_paths":self.protected_paths,"workload":domain.public_plan(),"expected_answers_sent_to_model":false,"max_cost_micro_usd":self.max_cost_micro_usd,"wall_time_ms":self.wall_time_ms});

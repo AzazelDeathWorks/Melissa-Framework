@@ -928,6 +928,13 @@ pub(crate) fn plan(task: &TaskContractV1, e: &Execution) -> Result<Plan> {
         if e.recipe.project.is_some() && s.write && p.tool_ids.iter().any(|t| t == "process.exec") {
             tools.insert("process.exec".into());
         }
+        if e.recipe
+            .project
+            .as_ref()
+            .is_some_and(|p| p.extensions.is_some())
+        {
+            tools.insert("extensions.use".into());
+        }
         let id = format!("step-{i}");
         let (pins, _, _) = resources::skills(
             &s.profile,
@@ -946,7 +953,7 @@ pub(crate) fn plan(task: &TaskContractV1, e: &Execution) -> Result<Plan> {
         });
         if let Some(project) = &e.recipe.project {
             let input = &mut nodes.last_mut().ok_or(Error::Store)?.literal_input;
-            input["project"] = serde_json::to_value(project).map_err(|_| Error::Store)?;
+            input["project"] = project.public_summary()?;
             input["project_onboarding"] = json!(include_str!(
                 "../../../skills/code/repo-onboarding/SKILL.md"
             ));
@@ -1530,11 +1537,33 @@ impl App {
         }
         let b = store.journal().model_budget(id)?;
         if let Err(error) = result {
-            let error = if deadline_elapsed && !matches!(error, Error::Reconciliation(_)) {
+            let mut error = if deadline_elapsed && !matches!(error, Error::Reconciliation(_)) {
                 Error::Conflict("Approved total task deadline elapsed.")
             } else {
                 error
             };
+            if let Some(project) = &e.recipe.project
+                && project
+                    .extensions
+                    .as_ref()
+                    .is_some_and(|b| !b.config.hooks.is_empty())
+            {
+                let hook=crate::extensions::hooks::Runner{home:self.home.clone(),task:id.into(),contract:project.clone(),expires:e.expires_at_ms,store:store.connect()?}.event(crate::extensions::hooks::Event::TaskEnd,"task_end",&format!("{}:task-end",control.session),json!({"status":if cancel.load(Ordering::Acquire){"cancelled"}else{"failed"},"original_error":error.to_string()}),cancel.clone()).await;
+                if let Err(hook_error) = hook {
+                    put(
+                        &mut store,
+                        id,
+                        &format!("cli:task-end-hook-error:{}", control.session),
+                        "extension.hook.failure",
+                        &bytes(
+                            &json!({"original_error":error.to_string(),"hook_error":hook_error.to_string()}),
+                        )?,
+                    )?;
+                    if matches!(hook_error, Error::Reconciliation(_)) {
+                        error = hook_error;
+                    }
+                }
+            }
             let t = store.journal().task(id)?;
             let workers_stopped = native_stop_proven(&store, id)?;
             let uncertain = !workers_stopped
@@ -1906,6 +1935,25 @@ impl App {
                 None
             };
             let project_lifecycle = project_tools.as_ref().map(|p| p.runtime.clone());
+            let extensions = if let Some(project) = &e.recipe.project {
+                if project.extensions.is_some() {
+                    Some(crate::extensions::tools::Shared::new(
+                        crate::extensions::tools::Tools::new(
+                            self,
+                            store,
+                            &t.task_id,
+                            project.clone(),
+                            e.expires_at_ms,
+                            node.effects.contains("workspace.apply_patch_scoped"),
+                        )?,
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let extension_lifecycle = extensions.as_ref().map(|v| v.inner.clone());
             let development: Box<dyn ToolDispatcher> = if e.recipe.project.is_some() {
                 Box::new(crate::project::tools::NavigationOnly(Box::new(development)))
             } else {
@@ -1920,6 +1968,9 @@ impl App {
             if let Some(project) = project_tools {
                 dispatchers.push(Box::new(project));
             }
+            if let Some(extensions) = extensions {
+                dispatchers.push(Box::new(extensions));
+            }
             let router = ToolRouter::new(dispatchers).map_err(|error| {
                 setup_failure(store, &packet, "Specialist tool routing failed.", error)
             })?;
@@ -1932,15 +1983,37 @@ impl App {
                 language: crate::development::language(repo)?,
                 context: Some(context_host),
             };
+            let checked: Box<dyn ToolDispatcher> = if let Some(project) = &e.recipe.project {
+                if project
+                    .extensions
+                    .as_ref()
+                    .is_some_and(|b| !b.config.hooks.is_empty())
+                {
+                    Box::new(crate::extensions::hooks::Dispatcher {
+                        inner: Box::new(checked),
+                        runner: crate::extensions::hooks::Runner {
+                            home: self.home.clone(),
+                            task: t.task_id.clone(),
+                            contract: project.clone(),
+                            expires: e.expires_at_ms,
+                            store: store.connect()?,
+                        },
+                    })
+                } else {
+                    Box::new(checked)
+                }
+            } else {
+                Box::new(checked)
+            };
             let checked: Box<dyn ToolDispatcher> = if state.adaptive.is_some() {
                 Box::new(AdaptiveChecks {
-                    inner: Box::new(checked),
+                    inner: checked,
                     scheduler: scheduler.clone(),
                     lease: packet.lease.clone(),
                     repo: Arc::new(self.source(&self.workspace(store, &t.task_id)?)?),
                 })
             } else {
-                Box::new(checked)
+                checked
             };
             let catalog = resources::catalog()?;
             let profile = &catalog.profiles[&node.profile];
@@ -2167,6 +2240,9 @@ impl App {
             if let Some(lifecycle) = project_lifecycle {
                 lifecycle.lock().map_err(|_| Error::Store)?.close()?;
             }
+            if let Some(lifecycle) = extension_lifecycle {
+                lifecycle.lock().await.close().await?;
+            }
             if paused.load(Ordering::Acquire) {
                 return Ok(json!({"paused":true}));
             }
@@ -2315,6 +2391,27 @@ impl App {
                 ));
             }
             let (package, package_digest) = crate::project::task::manifest(&final_source)?;
+            if project
+                .extensions
+                .as_ref()
+                .is_some_and(|b| !b.config.hooks.is_empty())
+            {
+                crate::extensions::hooks::Runner {
+                    home: self.home.clone(),
+                    task: t.task_id.clone(),
+                    contract: project.clone(),
+                    expires: e.expires_at_ms,
+                    store: store.connect()?,
+                }
+                .event(
+                    crate::extensions::hooks::Event::TaskEnd,
+                    "task_end",
+                    &format!("{}:task-end", control.session),
+                    json!({"status":"verified","source_digest":final_source.snapshot().digest}),
+                    control.cancel.clone(),
+                )
+                .await?;
+            }
             layers["project_checks"] = json!("PASS");
             layers["private_oracle"] = json!("NOT_RUN");
             return complete_delivery(

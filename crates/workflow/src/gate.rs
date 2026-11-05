@@ -45,6 +45,7 @@ fn effects(canonical: &str) -> Option<&'static [&'static str]> {
         }
         "artifact.read" => &["artifact.read"],
         "evidence.attach" => &["evidence.append"],
+        "extensions.use" => &["extensions.use_scoped"],
         "memory.search" => &["workspace.read"],
         "memory.propose" => &["memory.propose"],
         _ => return None,

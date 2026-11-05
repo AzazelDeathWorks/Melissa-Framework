@@ -251,7 +251,8 @@ fn runtime_bundle_contains_valid_profiles_and_skills_without_history_or_user_set
     let c = melissa_cli::resources::catalog().unwrap();
     assert_eq!(c.profiles.len(), 18);
     assert_eq!(c.workers.len(), 3);
-    assert_eq!(c.tools.tools.len(), 57);
+    assert_eq!(c.tools.tools.len(), 58);
+    assert!(c.tools.tools.iter().any(|t| t.id == "extensions.use"));
     assert_eq!(c.modules.modules.len(), 2);
     for p in c.profiles.values() {
         assert!(matches!(

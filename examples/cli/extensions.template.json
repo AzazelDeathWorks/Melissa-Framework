@@ -1,0 +1,21 @@
+{
+  "mcp": {},
+  "docs": {
+    "python-docs": {
+      "package": "python",
+      "ecosystem": "runtime",
+      "endpoint": {
+        "url": "https://docs.python.org",
+        "auth_env": null,
+        "loopback": false,
+        "timeout_ms": 30000,
+        "max_bytes": 2097152
+      },
+      "versions": { "3.13.5": "https://docs.python.org/3.13/library/typing.html" },
+      "context7": false,
+      "search_path": null
+    }
+  },
+  "hooks": [],
+  "helpers": {}
+}

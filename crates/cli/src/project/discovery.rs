@@ -367,6 +367,7 @@ impl Discovery {
                 .collect()
         });
         let c = Contract {
+            extensions: None,
             environment,
             checks,
             sync: self.sync.clone(),

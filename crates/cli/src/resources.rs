@@ -62,10 +62,10 @@ pub fn catalog() -> Result<Catalog> {
         .find(|t| t.id == "fs.read")
         .ok_or(Error::Store)?
         .clone();
-    for id in ["memory.search", "memory.propose"] {
+    for id in ["memory.search", "memory.propose", "extensions.use"] {
         let mut tool = prototype.clone();
         tool.id = id.into();
-        tool.family = "memory".into();
+        tool.family = id.split('.').next().ok_or(Error::Store)?.into();
         tool.worker_candidates.clear();
         tool.referenced_by = profiles
             .values()
@@ -77,8 +77,14 @@ pub fn catalog() -> Result<Catalog> {
             .filter(|p| p.module == melissa_core_contracts::Module::Code)
         {
             p.tool_ids.push(id.into());
-            if id == "memory.propose" {
-                p.authority.capability_ceiling.push(id.into());
+            if id == "memory.propose" || id == "extensions.use" {
+                p.authority
+                    .capability_ceiling
+                    .push(if id == "extensions.use" {
+                        "extensions.use_scoped".into()
+                    } else {
+                        id.into()
+                    });
             }
         }
         tools.tools.push(tool);

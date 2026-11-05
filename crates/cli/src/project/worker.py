@@ -120,7 +120,7 @@ def preflight():
             actual = versions.get("python") or probe("python")
             py = resolve("python")
             code = "from packaging.specifiers import SpecifierSet; import sys; sys.exit(0 if sys.argv[1] in SpecifierSet(sys.argv[2]) else 1)"
-            if subprocess.run(wrap([py, "-c", code, actual, spec]), cwd=ROOT, env=ENV,
+            if subprocess.run(wrap([py, "-I", "-c", code, actual, spec]), cwd=ROOT, env=ENV,
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
                 raise RuntimeError("Python constraint not satisfied or packaging unavailable: " + spec)
         elif tool in ["node", "npm"]:

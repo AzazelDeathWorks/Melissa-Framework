@@ -13,6 +13,8 @@ use std::{fs, io::Write, path::PathBuf};
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct State {
+    #[serde(default)]
+    pub private_input: bool,
     #[serde(default = "no_deadline")]
     pub expires_at_ms: u64,
     pub task_id: String,
@@ -205,6 +207,28 @@ impl App {
         operation: &str,
         hex: &str,
     ) -> Result<Value> {
+        self.project_input_impl(task, session, request_id, operation, hex, false)
+    }
+    pub(crate) fn project_private_input(
+        &self,
+        task: &str,
+        session: &str,
+        request_id: &str,
+        operation: &str,
+        hex: &str,
+    ) -> Result<Value> {
+        self.project_input_impl(task, session, request_id, operation, hex, true)
+    }
+    #[allow(clippy::too_many_arguments)] // Explicit private protocol input cannot be selected by model JSON.
+    fn project_input_impl(
+        &self,
+        task: &str,
+        session: &str,
+        request_id: &str,
+        operation: &str,
+        hex: &str,
+        private: bool,
+    ) -> Result<Value> {
         if !matches!(operation, "stdin" | "eof" | "cancel")
             || hex.len() > 60000
             || !hex.len().is_multiple_of(2)
@@ -219,6 +243,11 @@ impl App {
         }
         let d = Disk::open(self, task, session, true)?;
         let mut s = d.state()?;
+        if s.private_input && !private && operation != "cancel" {
+            return Err(Error::Denied(
+                "Bu oturumun stdin/EOF kanalı MCP adapter'ına ait; onaylı MCP aracı kullanılmalı.",
+            ));
+        }
         if operation == "cancel"
             && !matches!(s.phase.as_str(), "preparing" | "running")
             && s.result

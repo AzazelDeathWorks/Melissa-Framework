@@ -538,6 +538,9 @@ impl App {
             task.acceptance_criteria=vec!["Independent source-bound protected suite with rejected negative control; no unknown effects; exact final artifact and recorded candidate".into()];
             task.acceptance_contract_digest = e.recipe.acceptance_digest()?;
             if let Some(project) = &e.recipe.project {
+                if project.extensions.is_some() {
+                    task.allowed_effects.push("extensions.use_scoped".into());
+                }
                 task.acceptance_criteria=vec!["Host executes the approved project checks on exact final source in the approved environment; native receipts, stopped workers and no unknown effects required. Public project checks are not a private oracle or release acceptance.".into()];
                 task.limits.max_disk_bytes = project.environment.limits.disk_bytes;
             }

@@ -12,14 +12,14 @@ use std::{
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
 };
-struct Fixture {
+pub(crate) struct Fixture {
     _temp: Option<tempfile::TempDir>,
-    root: PathBuf,
-    app: App,
-    source: PathBuf,
+    pub(crate) root: PathBuf,
+    pub(crate) app: App,
+    pub(crate) source: PathBuf,
 }
 impl Fixture {
-    fn new(native: bool) -> Self {
+    pub(crate) fn new(native: bool) -> Self {
         let (temp, root) = if native && let Some(e) = std::env::var_os("MELISSA_PHASE03_EVIDENCE") {
             let p = PathBuf::from(e).join(format!("native-{}", nonce().unwrap()));
             fs::create_dir_all(&p).unwrap();
@@ -50,12 +50,13 @@ impl Fixture {
             environment.image_id = image;
         }
         self.contract_task(Contract {
+            extensions: None,
             environment,
             checks: BTreeMap::from([("test".into(), command)]),
             sync: vec![],
         })
     }
-    fn contract_task(&self, contract: Contract) -> Value {
+    pub(crate) fn contract_task(&self, contract: Contract) -> Value {
         let path = self.root.join(format!("draft-{}.json", nonce().unwrap()));
         let preparation = self
             .app
@@ -80,7 +81,7 @@ impl Fixture {
     ) -> (Value, melissa_local_store::LocalStore) {
         self.running_value(self.task(command, environment))
     }
-    fn running_value(&self, value: Value) -> (Value, melissa_local_store::LocalStore) {
+    pub(crate) fn running_value(&self, value: Value) -> (Value, melissa_local_store::LocalStore) {
         let id = value["task_id"].as_str().unwrap();
         self.app
             .approve(
@@ -317,6 +318,7 @@ pathlib.Path('requirements.txt').write_text('./'+p.name+' --hash=sha256:'+hashli
             );
         }
         let contract = Contract {
+            extensions: None,
             environment,
             checks: BTreeMap::from([("test".into(), command.clone())]),
             sync,
@@ -376,6 +378,7 @@ fn mailbox_reopen_rejects_corruption_and_never_accepts_lost_or_expired_owners() 
     let sid = nonce().unwrap();
     let d = disk::Disk::open(&f.app, id, &sid, true).unwrap();
     let mut state = disk::State {
+        private_input: false,
         expires_at_ms: now().unwrap() + 60_000,
         task_id: id.into(),
         session_id: sid.clone(),
@@ -490,6 +493,7 @@ fn empty_new_project_has_zero_initial_paths_and_keeps_reviewable_scope_on_same_t
             Mode::Develop,
             draft["preparation"]["adaptive_plan"].clone(),
             Contract {
+                extensions: None,
                 environment: Environment::default(),
                 checks: BTreeMap::from([("test".into(), python("pass"))]),
                 sync: vec![],

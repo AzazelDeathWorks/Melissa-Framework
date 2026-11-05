@@ -11,6 +11,7 @@ pub mod development;
 pub mod display;
 pub mod domain;
 pub mod engine;
+pub mod extensions;
 pub mod instructions;
 pub mod preparation;
 pub mod project;
