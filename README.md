@@ -9,6 +9,7 @@ Genel ajan/worker tanımları, skill paketleri, tipli sözleşmeler, kalıcılı
 Windows x64 önizlemesi için [kurulum ve ilk görev rehberi](docs/QUICKSTART_WINDOWS.md).
 Paketin yanındaki `install.ps1` tek komutla kullanıcı hesabına kurar. Ardından proje klasöründe `melissa` terminal oturumunu açar.
 Oturumda proje paneli, okunabilir görev kartları, Unicode metin düzenleme, ok tuşlarıyla geçmiş ve Tab ile komut tamamlama bulunur. `/details` kayda bağlı tam kapsamı gösterir.
+Plan/inceleme/geliştirme kipleri, kapsam farkları ve çalışan görevi yönlendirme için [konuşmalı oturum rehberi](docs/CONVERSATION_TR.md).
 Güvenlik bildirimleri için [gizli bildirim yolu](SECURITY.md).
 
 Aktif ürün kapsamı 6 Core ve 12 Code profilidir. Diğer alanların genel tanımları
@@ -24,7 +25,9 @@ korunur; derlenen CLI'ya dahil edilmez. Masaüstü arayüzü bu kapsamda yoktur.
 
 Desteklenen diller, çalışma sınırları ve komutlar:
 [CLI kullanım rehberi](docs/CLI_CAPABILITIES_TR.md).
-Görev taslağı yerel kurallarla hazırlanır ve kabul tarifi kullanıcı incelemesi
+Görev taslağı yerel kurallarla hazırlanır. Özel tarif olmadan proje hazırlık
+görevi kaydedilebilir; genel proje yürütmesi ve ortam bağlantısı henüz etkin
+değildir. Mevcut özel kabul tarifli yürütme ayrıca kullanıcı incelemesi
 gerektirir. Yeni bağlantılar için yerel testler çalıştırılmıştır; canlı model
 başarısı veya tamamlanmış üretim sürümü iddiası yoktur.
 

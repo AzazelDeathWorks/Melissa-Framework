@@ -18,7 +18,9 @@ Open PowerShell in your project directory and run `melissa`. Type your task to p
 
 The interactive session shows a project panel and compact task cards. Use the left and right arrows to edit, the up and down arrows for this session's history, and Tab to complete an unambiguous slash command. Esc clears the input. Ctrl+C clears a nonempty input or exits from an empty prompt. History stays in memory. Terminal resizing keeps the input cursor visible. Set `NO_COLOR` to disable colors. Redirected input and output retain the plain session format. Use `/details` to see the complete recorded task scope.
 
-For a model-backed task, use `/config PATH` for private model settings and `/acceptance PATH` for an operator-authored recipe outside the project. Then type the task, review the draft, and use `/create` to see the exact scope and budget. `/approve` records approval and `/run` starts model-backed execution. Use `/status` and `/diff` to inspect the result. Use `/open TASK_ID` in the same project to reopen a saved task.
+Type a goal and use `/plan`, then `/create` to record a project preparation task without model credentials or a private recipe. `/mode plan|review|develop` selects the workflow. General project execution/environment binding is pending; `/run` on a preparation task makes no API call. See the [conversation guide](CONVERSATION_TR.md) for scoped AGENTS.md, steering, questions and scope changes.
+
+For the existing protected-recipe execution path, use `/config PATH` for private model settings and `/acceptance PATH` for an operator-authored recipe outside the project before creating the task. Then review the draft and use `/create`, `/approve`, and `/run`. Approval alone never starts execution. `/status`, `/diff`, and `/open TASK_ID` retain their separate roles. Use `/new GOAL` before selecting another recipe; a new message on a selected task steers that same task.
 
 ## Verify and unpack for the offline example
 

@@ -1219,11 +1219,23 @@ impl App {
         }
     }
     pub async fn run_task(&self, id: &str, resume: bool) -> Result<Value> {
+        if self.conversation(id)?.is_none() {
+            self.attach_conversation(id, crate::conversation::Mode::Develop, json!({}))?;
+        }
         let mut store = self.store(id)?;
         let task = store.journal().task(id)?;
         let e = self.execution(&store, id)?.ok_or(Error::Denied(
-            "Bu görev yalnız inceleme kaydı; yürütme tarifiyle yeni görev oluşturun.",
+            "Bu görev proje hazırlık kaydı. Genel proje yürütmesi ve ortam bağlantısı henüz hazır değil; özel kabul tarifi zorunlu değildir.",
         ))?;
+        if let Some(brief) = self.conversation(id)?
+            && (brief.mode == crate::conversation::Mode::Plan
+                || (brief.mode == crate::conversation::Mode::Review
+                    && e.recipe.agents.iter().any(|s| s.write)))
+        {
+            return Err(Error::Denied(
+                "Seçili plan/inceleme kipi bu yazmalı yürütmeyle uyuşmuyor; kapsamı incele.",
+            ));
+        }
         let settings = self.settings()?;
         if e.runtime_digest.as_deref() != Some(crate::app::runtime_digest()?.as_str()) {
             return Err(Error::Conflict(
@@ -1907,6 +1919,11 @@ impl App {
                     "runtime_digest":e.runtime_digest,
                     "basis":"reviewed_configuration_not_runtime_health_attestation"
                 }))?),
+                conversation: Some(crate::tool_adapter::ConversationHost {
+                    home: self.home.clone(),
+                    task: t.task_id.clone(),
+                    pause: control.pause.clone(),
+                }),
             };
             let spec = RunSpec {
                 run_id: packet.lease.run.clone(),

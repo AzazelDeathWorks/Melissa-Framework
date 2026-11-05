@@ -1,6 +1,7 @@
 use crate::{
     Error, Result,
     app::{App, absolute, nonce, safe_path},
+    conversation::Mode,
     display,
     recipe::Recipe,
     session_ui::Ui,
@@ -13,6 +14,16 @@ use std::{
 };
 
 const HELP: &str = "Bir görev yaz veya aşağıdaki komutları kullan.\n\
+  /mode plan|review|develop  Çalışma kipini seç\n\
+  /new AMAÇ               Kayıtları koruyarak ayrı görev hazırla\n\
+  /instructions           Geçerli kullanıcı/proje talimatlarını göster\n\
+  /steer MESAJ            Görevi sıfırlamadan yönlendir\n\
+  /questions              Yanıt bekleyen sorular\n\
+  /answer KİMLİK YANIT     Hedefli soruyu yanıtla\n\
+  /scope DOSYA            Ek dosya için kapsam farkı hazırla\n\
+  /service AD             Ek servis gereksinimini kaydet\n\
+  /scope-approve ÖZET      Gösterilen hazırlık kapsamını kabul et\n\
+  /pause  /cancel         Güvenli duraklatma veya iptal iste\n\
   /doctor                 Windows ve Docker hazırlığını kontrol et\n\
   /config DOSYA           Özel model ayarlarını içe aktar\n\
   /acceptance DOSYA       Proje dışındaki kabul tarifini seç\n\
@@ -36,6 +47,7 @@ struct Draft {
 struct Task {
     id: String,
     approval: Option<(String, String)>,
+    executable: bool,
 }
 
 struct Session {
@@ -45,6 +57,7 @@ struct Session {
     acceptance: Option<PathBuf>,
     draft: Option<Draft>,
     task: Option<Task>,
+    mode: Mode,
     ui: Ui,
 }
 
@@ -66,6 +79,7 @@ pub async fn run(
         acceptance: None,
         draft: None,
         task: None,
+        mode: Mode::Develop,
         ui: Ui::new(),
     };
     session.ui.welcome(
@@ -99,8 +113,10 @@ impl Session {
             .is_some_and(|task| task.approval.is_some())
         {
             "ONAY BEKLİYOR  ·  /approve onayla  ·  /details tam kapsam"
-        } else if self.task.is_some() {
+        } else if self.task.as_ref().is_some_and(|t| t.executable) {
             "GÖREV  ·  /run çalıştır  ·  /status durum  ·  /diff değişiklikler"
+        } else if self.task.is_some() {
+            "PROJE HAZIRLIĞI · mesajla yönlendir · /scope ek kapsam · /status durum"
         } else if self.draft.as_ref().is_some_and(|draft| draft.ready) {
             "TARİF HAZIR  ·  /create görev oluştur  ·  /plan incele"
         } else {
@@ -110,6 +126,10 @@ impl Session {
 
     async fn handle(&mut self, line: &str, output: &mut impl Write) -> Result {
         if !line.starts_with('/') {
+            if let Some(task) = &self.task {
+                let value = self.app.steer(&task.id, line)?;
+                return self.ui.notice(&format!("Yönlendirme kaydedildi · revizyon {}. Görev ve harcama geçmişi korundu; etkin yürütme varsa sonraki güvenli model turunda okunur.",value["revision"]),output);
+            }
             return self.prepare(line, output);
         }
         let (command, argument) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
@@ -117,8 +137,67 @@ impl Session {
         let result = match (command, argument) {
             ("/help", "") => return self.ui.help(HELP, output),
             ("/doctor", "") => crate::views::doctor()?,
+            ("/new", goal) if !goal.is_empty() => {
+                if self
+                    .task
+                    .as_ref()
+                    .is_some_and(|t| self.app.live(&t.id).is_ok_and(|s| s.active()))
+                {
+                    return Err(Error::Conflict(
+                        "Önce etkin görevi duraklat veya bitmesini bekle.",
+                    ));
+                }
+                self.task = None;
+                self.draft = None;
+                return self.prepare(goal, output);
+            }
+            ("/mode", mode) => {
+                let mode = Mode::parse(mode)?;
+                if let Some(task) = &self.task {
+                    self.app.conversation_mode(&task.id, mode)?;
+                }
+                self.mode = mode;
+                if let Some(draft) = &self.draft {
+                    let goal = draft.goal.clone();
+                    return self.prepare(&goal, output);
+                }
+                return self.ui.notice(
+                    &format!("Kip: {mode:?}. Çalışma yetkisi bu komutla genişlemez."),
+                    output,
+                );
+            }
+            ("/instructions", "") => self.app.project_guidance(&self.workspace)?,
+            ("/steer", message) => self.app.steer(&self.task()?.id, message)?,
+            ("/scope", path) if !path.is_empty() => self.app.propose_scope(
+                &self.task()?.id,
+                std::collections::BTreeSet::from([path.to_owned()]),
+                Default::default(),
+            )?,
+            ("/service", name) if !name.is_empty() => self.app.propose_scope(
+                &self.task()?.id,
+                Default::default(),
+                std::collections::BTreeSet::from([name.to_owned()]),
+            )?,
+            ("/scope-approve", hash) if !hash.is_empty() => {
+                self.app.approve_scope(&self.task()?.id, hash)?
+            }
+            ("/questions", "") => self.app.conversation_view(&self.task()?.id)?,
+            ("/answer", answer) => {
+                let (id, answer) = answer
+                    .split_once(char::is_whitespace)
+                    .ok_or(Error::Usage("/answer SORU_KİMLİĞİ YANIT"))?;
+                self.app
+                    .answer_question(&self.task()?.id, id, answer.trim())?
+            }
+            ("/pause", "") => self.app.request_control(&self.task()?.id, "pause")?,
+            ("/cancel", "") => self.app.cancel(&self.task()?.id)?,
             ("/config", path) => self.app.configure(&path_argument(path)?)?,
             ("/acceptance", path) => {
+                if self.task.is_some() {
+                    return Err(Error::Conflict(
+                        "Seçili görev korunur. Yeni kabul tarifi için /new ile ayrı görev hazırla.",
+                    ));
+                }
                 let path = path_argument(path)?;
                 Recipe::read(&path)?;
                 self.acceptance = Some(path);
@@ -129,7 +208,13 @@ impl Session {
                     .notice("Kabul tarifi seçildi. Görevin amacını yaz.", output);
             }
             ("/plan", "") if self.task.is_none() => return self.show_draft(output),
-            ("/plan" | "/status", "") => self.app.progress(&self.task()?.id)?,
+            ("/plan", "") => self.app.conversation_view(&self.task()?.id)?,
+            ("/status", "") => {
+                let id = &self.task()?.id;
+                let mut result = self.app.progress(id)?;
+                result["conversation"] = self.app.conversation_view(id)?;
+                result
+            }
             ("/details", "") if self.task.is_none() => {
                 let draft = self
                     .draft
@@ -142,7 +227,7 @@ impl Session {
             }
             ("/details", "") => {
                 let value = self.app.progress(&self.task()?.id)?;
-                return Ok(writeln!(output, "{}", display::human(&value)?)?);
+                return Ok(writeln!(output, "{}", display::json(&value)?)?);
             }
             ("/create", "") => return self.create(output),
             ("/open", id) if !id.is_empty() => {
@@ -155,16 +240,24 @@ impl Session {
                 ))?;
                 self.app.approve(&task.id, request, digest)?;
                 self.task.as_mut().ok_or(Error::Store)?.approval = None;
-                return self
-                    .ui
-                    .notice("Onay kaydedildi. Başlatmak için /run yaz.", output);
+                return self.ui.notice(if self.task()?.executable {"Onay kaydedildi. Başlatmak için /run yaz."}else{"Plan onayı kaydedildi. Bu kayıt proje hazırlığıdır; genel proje yürütmesi henüz bağlı değil."},output);
             }
             ("/run" | "/resume", "") => {
+                if !self.task()?.executable {
+                    return Err(Error::Unavailable(
+                        "Bu kayıt proje hazırlığıdır. Genel proje yürütmesi ve ortam bağlantısı henüz hazır değil; API çağrısı yapılmadı.",
+                    ));
+                }
                 let id = &self.task()?.id;
                 writeln!(output, "Yürütme isteği: {}", display::safe(id))?;
                 output.flush()?;
                 let run = Box::pin(self.app.run_task(id, command == "/resume"));
-                self.ui.working(run, output).await?
+                let mut previous = String::new();
+                self.ui
+                    .working(run, output, |line| {
+                        running_control(&self.app, id, line, &mut previous)
+                    })
+                    .await?
             }
             ("/diff", "") => self.app.diff(&self.task()?.id)?,
             ("/delivery", "") => self.app.delivery(&self.task()?.id, None)?,
@@ -180,17 +273,29 @@ impl Session {
     }
 
     fn prepare(&mut self, goal: &str, output: &mut impl Write) -> Result {
-        self.task = None;
-        self.draft = None;
         safe_path(&self.plan_dir)?;
         fs::create_dir_all(&self.plan_dir)?;
         let path = self.plan_dir.join(format!("{}.json", nonce()?));
-        let result = self
-            .app
-            .prepare(&self.workspace, goal, &path, self.acceptance.as_deref())?;
+        let goal = if let Some(draft) = &self.draft {
+            if draft.goal != goal {
+                format!("{}\nEk yönlendirme: {goal}", draft.goal)
+            } else {
+                goal.into()
+            }
+        } else {
+            goal.into()
+        };
+        let result = self.app.prepare_mode(
+            &self.workspace,
+            &goal,
+            &path,
+            self.acceptance.as_deref(),
+            self.mode,
+        )?;
         let preparation = &result["preparation"];
+        self.task = None;
         self.draft = Some(Draft {
-            goal: goal.into(),
+            goal,
             path,
             plan: preparation["adaptive_plan"].clone(),
             ready: preparation["ready_to_create"] == true,
@@ -213,45 +318,179 @@ impl Session {
         let draft = self
             .draft
             .as_ref()
-            .filter(|draft| draft.ready)
-            .ok_or(Error::Usage(
-                "Önce kabul tarifini seç ve görev amacını yaz.",
-            ))?;
-        let task = self.app.create_execution(
-            &self.workspace,
-            &draft.goal,
-            vec![],
-            Recipe::read(&draft.path)?,
-        )?;
+            .ok_or(Error::Usage("Önce görev amacını yaz."))?;
+        let task = if draft.ready && self.mode != Mode::Plan {
+            let mut recipe = Recipe::read(&draft.path)?;
+            if self.mode == Mode::Review {
+                for step in &mut recipe.agents {
+                    step.write = false;
+                }
+                recipe.writable_paths.clear();
+            }
+            let task = self
+                .app
+                .create_execution(&self.workspace, &draft.goal, vec![], recipe)?;
+            self.app.attach_conversation(
+                task["task_id"].as_str().ok_or(Error::Store)?,
+                self.mode,
+                draft.plan.clone(),
+            )?;
+            task
+        } else {
+            self.app.create_conversation(
+                &self.workspace,
+                &draft.goal,
+                self.mode,
+                draft.plan.clone(),
+            )?
+        };
         self.select_task(&task, output)
     }
 
     fn select_task(&mut self, value: &Value, output: &mut impl Write) -> Result {
-        let workspace = value["workspace"].as_str().ok_or(Error::Conflict(
-            "Görev projesi doğrulanamadı. Etkin çalıştırıcı kapandıktan sonra tekrar aç.",
-        ))?;
+        let stored_brief = value["task_id"]
+            .as_str()
+            .map(|id| self.app.conversation(id))
+            .transpose()?
+            .flatten();
+        let workspace = value["workspace"]
+            .as_str()
+            .or_else(|| stored_brief.as_ref().map(|b| b.workspace.as_str()))
+            .ok_or(Error::Conflict(
+                "Görev projesi doğrulanamadı. Etkin çalıştırıcı kapandıktan sonra tekrar aç.",
+            ))?;
         if !workspace.eq_ignore_ascii_case(&self.workspace.to_string_lossy()) {
             return Err(Error::Denied("Bu görev başka bir proje klasörüne bağlı."));
         }
         let id = value["task_id"].as_str().ok_or(Error::Store)?.to_owned();
-        let approval =
-            if value["approval"]["pending"] == true && value["execution_plan"].is_object() {
-                let request = value["approval"]["request_id"]
-                    .as_str()
-                    .ok_or(Error::Store)?;
-                let digest = value["approval"]["digest"].as_str().ok_or(Error::Store)?;
-                Some((request.to_owned(), digest.to_owned()))
-            } else {
-                None
-            };
+        if self.app.conversation(&id)?.is_none() {
+            self.app
+                .attach_conversation(&id, Mode::Develop, value["execution_plan"].clone())?;
+        }
+        if let Some(brief) = self.app.conversation(&id)? {
+            self.mode = brief.mode;
+        }
+        let approval = if value["approval"]["pending"] == true {
+            let request = value["approval"]["request_id"]
+                .as_str()
+                .ok_or(Error::Store)?;
+            let digest = value["approval"]["digest"].as_str().ok_or(Error::Store)?;
+            Some((request.to_owned(), digest.to_owned()))
+        } else {
+            None
+        };
         self.ui.result(value, output)?;
+        self.ui.result(&self.app.conversation_view(&id)?, output)?;
         if approval.is_some() {
             self.ui
                 .notice("Bu kapsamı onaylamak için /approve yaz.", output)?;
         }
-        self.task = Some(Task { id, approval });
+        let executable =
+            value["execution_plan"].is_object() || self.app.live(&id).is_ok_and(|s| s.active());
+        self.task = Some(Task {
+            id,
+            approval,
+            executable,
+        });
+        self.draft = None;
         Ok(())
     }
+}
+
+fn running_control(
+    app: &App,
+    id: &str,
+    line: Option<&str>,
+    previous: &mut String,
+) -> Result<Option<String>> {
+    if let Some(line) = line {
+        let (command, arg) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+        let arg = arg.trim();
+        let value=match command {
+            "/pause"|"/cancel"=>app.request_control(id,&command[1..])?,
+            "/exit"=>{app.request_control(id,"pause")?;return Ok(Some("Güvenli duraklatma istendi. Görev durduktan sonra /exit ile çıkabilirsin.".into()));}
+            "/answer"=>{let (q,a)=arg.split_once(char::is_whitespace).ok_or(Error::Usage("/answer SORU_KİMLİĞİ YANIT"))?;app.answer_question(id,q,a.trim())?}
+            "/scope"=>app.propose_scope(id,std::collections::BTreeSet::from([arg.to_owned()]),Default::default())?,
+            "/service"=>app.propose_scope(id,Default::default(),std::collections::BTreeSet::from([arg.to_owned()]))?,
+            "/scope-approve"=>app.approve_scope(id,arg)?,
+            "/status"=>{previous.clear();return running_control(app,id,None,previous);}
+            "/questions"=>app.conversation_view(id)?,
+            "/steer"=>app.steer(id,arg)?,
+            ""=>return Ok(None),
+            _ if line.starts_with('/')=>return Ok(Some("Çalışırken: mesaj, /answer, /scope, /service, /scope-approve, /status, /pause veya /cancel.".into())),
+            _=>app.steer(id,line)?,
+        };
+        let message = if let Some(delta) = value["brief"]["pending_scope"].as_object() {
+            format!(
+                "Ek dosyalar: {}\nEk servisler: {}\nİnceledikten sonra /scope-approve {}\nBu fark hazırlık kapsamıdır; çalışan tarife yetki eklemez.",
+                delta["add_writes"],
+                delta["add_services"],
+                delta["digest"].as_str().ok_or(Error::Store)?
+            )
+        } else if matches!(command, "/status" | "/questions") {
+            let questions = value["brief"]["questions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|q| q["answer"].is_null())
+                .map(|q| {
+                    format!(
+                        "Soru {}: {}\n/answer {} YANIT",
+                        q["id"].as_str().unwrap_or("?"),
+                        q["text"].as_str().unwrap_or("?"),
+                        q["id"].as_str().unwrap_or("?")
+                    )
+                })
+                .collect::<Vec<_>>();
+            if questions.is_empty() {
+                format!("Görev {id} · bekleyen soru yok. Aşama ve olaylar canlı akışta gösterilir.")
+            } else {
+                questions.join("\n")
+            }
+        } else if matches!(command, "/pause" | "/cancel") {
+            format!(
+                "{} isteği kaydedildi; yürütücünün duruş onayı bekleniyor.",
+                &command[1..]
+            )
+        } else {
+            format!(
+                "Kaydedildi · revizyon {}. Görev ve harcama geçmişi korundu.",
+                value["revision"]
+            )
+        };
+        return Ok(Some(message));
+    }
+    let live = match app.live(id) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let brief = app.conversation(id)?;
+    let questions = brief
+        .as_ref()
+        .map(|b| {
+            b.questions
+                .iter()
+                .filter(|q| q.answer.is_none())
+                .map(|q| format!("Soru {}: {}\n/answer {} YANIT", q.id, q.text, q.id))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let message = format!(
+        "{} · olay {} · kayıtlı maliyet {} mikro USD{}",
+        live.phase,
+        live.events["total"],
+        live.model_budget["known_cost_micro_usd"],
+        if questions.is_empty() {
+            String::new()
+        } else {
+            format!("\n{}", questions.join("\n"))
+        }
+    );
+    if &message == previous {
+        return Ok(None);
+    }
+    *previous = message.clone();
+    Ok(Some(message))
 }
 
 fn path_argument(path: &str) -> Result<PathBuf> {
@@ -263,4 +502,109 @@ fn path_argument(path: &str) -> Result<PathBuf> {
         return Err(Error::Usage("Dosya yolu gerekli."));
     }
     absolute(Path::new(path))
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn session_records_recipe_free_project_and_steers_same_task_then_opens_separate_work_explicitly()
+     {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        let workspace = t.path().join("project");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(workspace.join("main.py"), "pass\n").unwrap();
+        App::init(&home).unwrap();
+        let mut s = Session {
+            app: App::open(&home).unwrap(),
+            workspace: workspace.clone(),
+            plan_dir: home.join("session-plans"),
+            acceptance: None,
+            draft: None,
+            task: None,
+            mode: Mode::Develop,
+            ui: Ui::new(),
+        };
+        let mut out = vec![];
+        s.handle("main.py hatasını düzelt", &mut out).await.unwrap();
+        s.handle("Mevcut API'yi koru", &mut out).await.unwrap();
+        assert!(
+            s.draft
+                .as_ref()
+                .unwrap()
+                .goal
+                .contains("main.py hatasını düzelt")
+        );
+        s.handle("/create", &mut out).await.unwrap();
+        let first = s.task().unwrap().id.clone();
+        let before = s.app.show(&first).unwrap();
+        s.handle("Önce kök nedeni anlat", &mut out).await.unwrap();
+        assert_eq!(s.task().unwrap().id, first);
+        s.handle("/scope extra.py", &mut out).await.unwrap();
+        let b = s.app.conversation(&first).unwrap().unwrap();
+        let hash = b.pending_scope.unwrap()["digest"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        s.handle(&format!("/scope-approve {hash}"), &mut out)
+            .await
+            .unwrap();
+        s.handle("/mode review", &mut out).await.unwrap();
+        assert_eq!(s.task().unwrap().id, first);
+        s.handle("/status", &mut out).await.unwrap();
+        let after = s.app.show(&first).unwrap();
+        assert_eq!(before["model_budget"], after["model_budget"]);
+        assert_eq!(before["approval"], after["approval"]);
+        assert!(
+            s.handle("/acceptance missing.json", &mut out)
+                .await
+                .is_err()
+        );
+        assert_eq!(s.task().unwrap().id, first);
+        s.handle("/new main.py incele", &mut out).await.unwrap();
+        s.handle("/create", &mut out).await.unwrap();
+        assert_ne!(s.task().unwrap().id, first);
+        assert_eq!(
+            s.app.conversation(&first).unwrap().unwrap().messages.len(),
+            1
+        );
+        assert!(
+            s.app
+                .conversation(&s.task().unwrap().id)
+                .unwrap()
+                .unwrap()
+                .scope
+                .writes
+                .is_empty()
+        );
+        let shown = String::from_utf8(out).unwrap();
+        assert!(shown.contains(&hash));
+    }
+    #[tokio::test]
+    async fn pipe_session_can_prepare_and_record_without_model_config_or_private_acceptance() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        let repo = t.path().join("project");
+        fs::create_dir(&repo).unwrap();
+        fs::write(repo.join("main.py"), "pass\n").unwrap();
+        let mut input =
+            std::io::Cursor::new(b"/mode plan\nmain.py incele\n/create\n/status\n/exit\n");
+        let mut output = vec![];
+        run(&home, &repo, &mut input, &mut output).await.unwrap();
+        let app = App::open(&home).unwrap();
+        let tasks = app.list().unwrap();
+        assert_eq!(tasks["tasks"].as_array().unwrap().len(), 1);
+        let id = tasks["tasks"][0]["task_id"].as_str().unwrap();
+        assert_eq!(app.conversation(id).unwrap().unwrap().mode, Mode::Plan);
+        assert!(!app.show(id).unwrap()["execution_plan"].is_object());
+        assert!(
+            app.store(id)
+                .unwrap()
+                .journal()
+                .model_requests(id)
+                .unwrap()
+                .is_empty()
+        );
+    }
 }

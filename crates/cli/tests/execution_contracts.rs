@@ -156,7 +156,7 @@ fn terminal_prepares_current_project_and_keeps_execution_separate_from_approval(
         .unwrap();
     writeln!(
         child.stdin.take().unwrap(),
-        "Fix main.py\n/create\n/acceptance \"{}\"\nFix main.py\n/create\n/run\n/approve\n/exit",
+        "Fix main.py\n/create\n/run\n/approve\n/new Inspect main.py\n/acceptance \"{}\"\nFix main.py\n/create\n/run\n/approve\n/exit",
         recipe.display()
     )
     .unwrap();
@@ -165,20 +165,27 @@ fn terminal_prepares_current_project_and_keeps_execution_separate_from_approval(
     let transcript = String::from_utf8(output.stdout).unwrap();
     assert!(transcript.contains("Melissa terminal oturumu"));
     assert!(transcript.contains(f.source.to_str().unwrap()));
-    assert!(transcript.contains("Önce kabul tarifini seç"));
+    assert!(transcript.contains("Bu kayıt proje hazırlığıdır"));
     assert!(transcript.contains("Yürütme için kaynak bağlı onay"));
     assert!(transcript.contains("Onay kaydedildi"));
     assert!(!transcript.contains("\"expected\":"));
     let list = f.app().list().unwrap();
     let tasks = list["tasks"].as_array().unwrap();
-    assert_eq!(tasks.len(), 1);
-    assert_eq!(tasks[0]["state"], "queued");
-    let id = tasks[0]["task_id"].as_str().unwrap();
-    assert_eq!(
-        f.app().metrics(id).unwrap()["metrics"]["model_dispatch_attempts"],
-        0
-    );
-    assert!(!f.home.join("tasks").join(id).join("control").exists());
+    assert_eq!(tasks.len(), 2);
+    let mut executable = 0;
+    for task in tasks {
+        assert_eq!(task["state"], "queued");
+        let id = task["task_id"].as_str().unwrap();
+        if f.app().show(id).unwrap()["execution_plan"].is_object() {
+            executable += 1;
+        }
+        assert_eq!(
+            f.app().metrics(id).unwrap()["metrics"]["model_dispatch_attempts"],
+            0
+        );
+        assert!(!f.home.join("tasks").join(id).join("control").exists());
+    }
+    assert_eq!(executable, 1);
 }
 #[test]
 fn changed_settings_or_source_invalidates_execution_approval() {

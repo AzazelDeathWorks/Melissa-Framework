@@ -13,11 +13,94 @@ use std::io::{BufRead, Write};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-struct RawMode;
+pub(super) struct RawMode;
 impl Drop for RawMode {
     fn drop(&mut self) {
         let _ = execute!(std::io::stdout(), DisableBracketedPaste);
         let _ = terminal::disable_raw_mode();
+    }
+}
+
+/// Nonblocking editor used while the execution future stays polled. Ctrl+C is
+/// a task cancellation request here, never permission to drop the live future.
+pub(super) struct RunningInput {
+    _raw: Option<RawMode>,
+    text: String,
+    cursor: usize,
+}
+impl RunningInput {
+    pub fn new(output: &mut impl Write) -> Result<Self> {
+        terminal::enable_raw_mode()?;
+        let raw = RawMode;
+        execute!(output, EnableBracketedPaste)?;
+        Ok(Self {
+            _raw: Some(raw),
+            text: String::new(),
+            cursor: 0,
+        })
+    }
+    pub fn poll(&mut self) -> Result<Option<String>> {
+        if !event::poll(std::time::Duration::ZERO)? {
+            return Ok(None);
+        }
+        self.accept(event::read()?)
+    }
+    fn accept(&mut self, event: Event) -> Result<Option<String>> {
+        match event {
+            Event::Key(k) if k.kind != KeyEventKind::Release => {
+                let alt_gr = k
+                    .modifiers
+                    .contains(KeyModifiers::CONTROL | KeyModifiers::ALT);
+                if k.modifiers.contains(KeyModifiers::CONTROL) && !alt_gr {
+                    if k.code == KeyCode::Char('c') {
+                        self.text.clear();
+                        self.cursor = 0;
+                        return Ok(Some("/cancel".into()));
+                    }
+                    return Ok(None);
+                }
+                match k.code {
+                    KeyCode::Enter => {
+                        self.cursor = 0;
+                        return Ok(Some(std::mem::take(&mut self.text)));
+                    }
+                    KeyCode::Char(c) if alt_gr || !k.modifiers.contains(KeyModifiers::ALT) => {
+                        self.text.insert(self.cursor, c);
+                        self.cursor = next_boundary(&self.text, self.cursor + c.len_utf8());
+                    }
+                    KeyCode::Backspace if self.cursor > 0 => {
+                        let p = previous_boundary(&self.text, self.cursor);
+                        self.text.replace_range(p..self.cursor, "");
+                        self.cursor = p;
+                    }
+                    KeyCode::Delete if self.cursor < self.text.len() => {
+                        let n = next_boundary(&self.text, self.cursor + 1);
+                        self.text.replace_range(self.cursor..n, "");
+                    }
+                    KeyCode::Left => self.cursor = previous_boundary(&self.text, self.cursor),
+                    KeyCode::Right if self.cursor < self.text.len() => {
+                        self.cursor = next_boundary(&self.text, self.cursor + 1)
+                    }
+                    KeyCode::Home => self.cursor = 0,
+                    KeyCode::End => self.cursor = self.text.len(),
+                    KeyCode::Esc => {
+                        self.text.clear();
+                        self.cursor = 0;
+                    }
+                    _ => {}
+                }
+            }
+            Event::Paste(s) => {
+                let s = s.replace(['\r', '\n', '\t'], " ");
+                self.text.insert_str(self.cursor, &s);
+                self.cursor = next_boundary(&self.text, self.cursor + s.len());
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
+    pub fn draw(&self, ui: &Ui, output: &mut impl Write) -> Result {
+        ui.redraw(&self.text, self.cursor, output)
     }
 }
 
@@ -209,6 +292,66 @@ fn viewport(text: &str, cursor: usize, width: usize) -> (String, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn running_editor_handles_turkish_paste_unicode_cursor_and_control_without_exiting() {
+        use crossterm::event::KeyEvent;
+        let mut editor = RunningInput {
+            _raw: None,
+            text: String::new(),
+            cursor: 0,
+        };
+        editor
+            .accept(Event::Paste("Türkçe e\u{301} 🦀\n".into()))
+            .unwrap();
+        editor
+            .accept(Event::Key(KeyEvent::new(
+                KeyCode::Backspace,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        editor
+            .accept(Event::Key(KeyEvent::new(
+                KeyCode::Char('i'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            )))
+            .unwrap();
+        let line = editor
+            .accept(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .unwrap()
+            .unwrap();
+        assert_eq!(line, "Türkçe e\u{301} 🦀i");
+        assert_eq!(
+            editor
+                .accept(Event::Key(KeyEvent::new(
+                    KeyCode::Char('c'),
+                    KeyModifiers::CONTROL
+                )))
+                .unwrap(),
+            Some("/cancel".into())
+        );
+        assert_eq!(
+            editor
+                .accept(Event::Key(KeyEvent::new(
+                    KeyCode::Char('x'),
+                    KeyModifiers::NONE
+                )))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            editor
+                .accept(Event::Key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE
+                )))
+                .unwrap(),
+            Some("x".into())
+        );
+    }
 
     #[test]
     fn cursor_and_viewport_keep_grapheme_boundaries_and_cursor_visible() {

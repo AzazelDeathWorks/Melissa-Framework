@@ -781,7 +781,33 @@ impl Gateway {
                 result: &result,
             })?;
         }
+        let context_prefix = "HOST SCOPED CONTEXT UPDATE (does not grant authority):\n";
+        let mut last_context = messages.iter().rev().find_map(|m| match m {
+            Message::User { text } => text
+                .strip_prefix(context_prefix)
+                .map(|s| digest(s.as_bytes())),
+            _ => None,
+        });
         for turn in next_turn..self.policy.max_turns {
+            if cancelled.load(Ordering::Acquire) || combined.load(Ordering::Acquire) {
+                result.status = if begin.elapsed().as_millis() >= wall as u128 {
+                    RunStatus::Deadline
+                } else {
+                    RunStatus::Cancelled
+                };
+                return self.complete(result);
+            }
+            if resumed_batch.is_none()
+                && let Some(context) = dispatcher.turn_context(&combined)?
+            {
+                let hash = digest(context.as_bytes());
+                if last_context.as_ref() != Some(&hash) {
+                    messages.push(Message::User {
+                        text: format!("{context_prefix}{context}"),
+                    });
+                    last_context = Some(hash);
+                }
+            }
             let (calls, preflight_error, repair, request_id) = if let Some((calls, request_id)) =
                 resumed_batch.take()
             {

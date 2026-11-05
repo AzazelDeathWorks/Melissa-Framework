@@ -69,6 +69,11 @@ pub trait ToolDispatcher: Send {
     fn adapter_metadata(&self, _cancelled: &AtomicBool) -> Result<crate::adapter::AdapterMetadata> {
         Ok(crate::adapter::AdapterMetadata::default())
     }
+    /// Fresh host-owned guidance or operator steering, sampled only between
+    /// settled tool batches. Content is context, never an authorization grant.
+    fn turn_context(&self, _cancelled: &AtomicBool) -> Result<Option<String>> {
+        Ok(None)
+    }
     fn execute<'a>(
         &'a mut self,
         call: ToolCall,

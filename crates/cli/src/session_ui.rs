@@ -12,7 +12,7 @@ use std::{
     future::Future,
     io::{IsTerminal, Write},
     path::Path,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -48,6 +48,20 @@ pub(super) const COMMANDS: &[(&str, &str)] = &[
     ("/diff", "Dosya değişiklikleri"),
     ("/resume", "Güvenli checkpoint'ten devam et"),
     ("/delivery", "Doğrulanmış teslim"),
+    ("/mode", "plan | review | develop · çalışma kipi"),
+    ("/new", "Yeni amaç · önceki görev kayıtları korunur"),
+    ("/instructions", "Kullanıcı ve proje AGENTS.md talimatları"),
+    ("/steer", "MESAJ · seçili görevi yönlendir"),
+    ("/questions", "Yanıt bekleyen hedefli sorular"),
+    ("/answer", "SORU_KİMLİĞİ YANIT"),
+    ("/scope", "DOSYA · ek yazma kapsamı öner"),
+    ("/service", "AD · ek servis gereksinimi öner"),
+    (
+        "/scope-approve",
+        "ÖZET · gösterilen hazırlık kapsamını kabul et",
+    ),
+    ("/pause", "Güvenli checkpoint'te duraklat"),
+    ("/cancel", "Görev iptali iste"),
     ("/exit", "Oturumu kapat"),
 ];
 
@@ -239,7 +253,7 @@ impl Ui {
                 if ready {
                     "Operatör tarifi bağlı"
                 } else {
-                    "Operatör tarifi bekleniyor"
+                    "Proje hazırlığı · özel test tarifi gerekmiyor"
                 }
             ));
             lines.push("Tam plan ve kayıt yolu /details".into());
@@ -248,11 +262,52 @@ impl Ui {
         self.notice(if ready {
             "Tarifi incele, model ayarlarını /config ile yükle ve /create yaz."
         } else {
-            "Yürütme için proje dışındaki kabul tarifini /acceptance DOSYA ile seç ve amacı tekrar yaz."
+            "Planı incele ve /create ile kaydet. Bu kayıt proje hazırlığıdır; genel yürütme bağlantısı henüz etkin değil. Özel test tarifi zorunlu değil."
         }, output)
     }
 
     pub fn result(&self, value: &Value, output: &mut impl Write) -> Result {
+        if value["command"] == "task conversation" {
+            if !self.interactive {
+                return Ok(writeln!(output, "{}", display::json(value)?)?);
+            }
+            let brief = &value["brief"];
+            let mut lines = vec![
+                format!(
+                    "GÖREV {} · revizyon {} · kip {}",
+                    text(&value["task_id"]),
+                    brief["revision"],
+                    text(&brief["mode"])
+                ),
+                text(&brief["goal"]).into(),
+                "Gereksinim → alt işler → /diff → test kayıtları → bağımsız kabul".into(),
+            ];
+            if let Some(steps) = brief["plan"]["milestones"].as_array() {
+                for step in steps {
+                    lines.push(format!(
+                        "  {} · {}",
+                        text(&step["id"]),
+                        role(text(&step["profile"]))
+                    ));
+                }
+            }
+            if let Some(delta) = brief["pending_scope"].as_object() {
+                lines.push(format!("EK DOSYALAR {}", delta["add_writes"]));
+                lines.push(format!("EK SERVİSLER {}", delta["add_services"]));
+                lines.push(format!(
+                    "İnceledikten sonra: /scope-approve {}",
+                    text(&delta["digest"])
+                ));
+            }
+            if let Some(questions) = brief["questions"].as_array() {
+                for q in questions.iter().filter(|q| q["answer"].is_null()) {
+                    lines.push(format!("SORU {} · {}", text(&q["id"]), text(&q["text"])));
+                    lines.push(format!("/answer {} YANIT", text(&q["id"])));
+                }
+            }
+            lines.push("Görev/harcama geçmişi korunur. Hazırlık kapsamı, çalışan tarife yeni yetki vermez.".into());
+            return self.card("KONUŞMA VE KAPSAM", &lines, output);
+        }
         if !self.interactive {
             return Ok(writeln!(output, "{}", display::human(value)?)?);
         }
@@ -356,29 +411,58 @@ impl Ui {
         self.card(title, &lines, output)
     }
 
-    pub async fn working<F>(&self, future: F, output: &mut impl Write) -> Result<Value>
+    pub async fn working<F, C>(
+        &self,
+        future: F,
+        output: &mut impl Write,
+        mut control: C,
+    ) -> Result<Value>
     where
         F: Future<Output = Result<Value>>,
+        C: FnMut(Option<&str>) -> Result<Option<String>>,
     {
         if !self.interactive {
             return future.await;
         }
-        let start = Instant::now();
+        let editor = input::RunningInput::new(output)?;
+        let mut editor = Some(editor);
+        let mut io_error = None;
         let mut interval = tokio::time::interval(Duration::from_millis(120));
         let mut future = std::pin::pin!(future);
-        let frames = ['◐', '◓', '◑', '◒'];
         let mut index = 0;
         loop {
             tokio::select! {
                 result = &mut future => {
+                    drop(editor.take());
+                    if let Some(error)=io_error {return Err(error);}
                     queue!(output, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-                    output.flush()?;
+                    writeln!(output)?;
                     return result;
                 }
                 _ = interval.tick() => {
-                    queue!(output, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-                    write!(output, "  {} Görev çalışıyor  ·  {} sn", self.paint(&frames[index % frames.len()].to_string(), ACCENT), start.elapsed().as_secs())?;
-                    output.flush()?;
+                    if let Some(editor)=editor.as_mut() {
+                        let draw=(||->Result {
+                            if let Some(line)=editor.poll()? {
+                                let message=match control(Some(line.trim())) {Ok(v)=>v,Err(e)=>Some(e.to_string())};
+                                if let Some(message)=message {
+                                    queue!(output,MoveToColumn(0),Clear(ClearType::CurrentLine))?;
+                                    write!(output,"{}\r\n",message.lines().map(display::safe).collect::<Vec<_>>().join("\r\n"))?;
+                                }
+                            }
+                            if index%8==0 && let Some(message)=control(None)? {
+                                queue!(output,MoveToColumn(0),Clear(ClearType::CurrentLine))?;
+                                write!(output,"{}\r\n",message.lines().map(display::safe).collect::<Vec<_>>().join("\r\n"))?;
+                            }
+                            editor.draw(self,output)
+                        })();
+                        if let Err(error)=draw {
+                            // Preserve the run future until its effects settle.
+                            // A terminal failure requests cancellation, it does
+                            // not detach a worker by returning from this loop.
+                            let _=control(Some("/cancel"));io_error=Some(error);
+                        }
+                    }
+                    if io_error.is_some() {drop(editor.take());}
                     index += 1;
                 }
             }

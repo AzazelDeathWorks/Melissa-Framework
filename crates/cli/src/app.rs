@@ -624,6 +624,12 @@ impl App {
                 value["phase"] = json!(control.phase);
             }
         }
+        if self.conversation(id)?.is_some() {
+            value["conversation"] = self.conversation_view(id)?;
+            if !value["execution_plan"].is_object() {
+                value["execution_backend"] = json!("project_preparation_only");
+            }
+        }
         Ok(value)
     }
     pub fn show(&self, id: &str) -> Result<Value> {

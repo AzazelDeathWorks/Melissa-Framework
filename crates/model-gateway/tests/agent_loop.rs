@@ -520,6 +520,8 @@ async fn opted_in_transient_retry_only_retries_proven_not_sent_and_keeps_zero_us
 
 #[derive(Default)]
 struct FakeTools {
+    context_updates: Vec<String>,
+    context_failure: bool,
     executed: Arc<AtomicUsize>,
     contexts: Arc<Mutex<Vec<ToolContext>>>,
     cancel_preflight: Option<Arc<AtomicBool>>,
@@ -575,6 +577,22 @@ async fn rejected_local_wire_keeps_safe_checkpoint_and_never_reserves_or_dispatc
     assert_eq!(http.requests.load(Ordering::SeqCst), 0);
 }
 impl ToolDispatcher for FakeTools {
+    fn turn_context(&self, _: &AtomicBool) -> Result<Option<String>> {
+        if self.context_failure {
+            return Err(GatewayError::new(
+                ErrorKind::Store,
+                "unverified host guidance",
+            ));
+        }
+        Ok(self
+            .context_updates
+            .get(
+                self.executed
+                    .load(Ordering::SeqCst)
+                    .min(self.context_updates.len().saturating_sub(1)),
+            )
+            .cloned())
+    }
     fn adapter_metadata(
         &self,
         _: &AtomicBool,
@@ -640,6 +658,78 @@ impl ToolDispatcher for FakeTools {
             })
         })
     }
+}
+
+#[tokio::test]
+async fn fresh_host_guidance_and_operator_steering_reach_next_turn_without_reset_or_duplicate_context()
+ {
+    let dir = tempfile::tempdir().unwrap();
+    let http = http_fixture(vec![
+        HttpPlan::sse(tool_response(&[(
+            "a",
+            "process_exec",
+            r#"{"value":"one"}"#,
+        )])),
+        HttpPlan::sse(tool_response(&[(
+            "b",
+            "process_exec",
+            r#"{"value":"two"}"#,
+        )])),
+        HttpPlan::sse(text_response("observed", false, true)),
+    ])
+    .await;
+    let mut g = gateway(store(&dir.path().join("store"), 100_000), &http, policy());
+    let mut tools = FakeTools {
+        context_updates: vec![
+            "root instruction v1".into(),
+            "root instruction v2; user steering: inspect before editing".into(),
+        ],
+        ..Default::default()
+    };
+    let result = g
+        .run(
+            &spec("host-context-refresh"),
+            &mut tools,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.status, RunStatus::FinalCandidate);
+    assert_eq!(result.request_ids.len(), 3);
+    assert_eq!(tools.executed.load(Ordering::SeqCst), 2);
+    let bodies = http.bodies.lock().unwrap();
+    for (i, count) in [(0, 1), (1, 2), (2, 2)] {
+        let input = bodies[i]["input"].to_string();
+        assert_eq!(input.matches("HOST SCOPED CONTEXT UPDATE").count(), count);
+        assert_eq!(input.contains("root instruction v2"), i > 0);
+    }
+    assert_eq!(g.store().journal().model_requests(TASK).unwrap().len(), 3);
+    let budget = g.store().journal().model_budget(TASK).unwrap();
+    assert_eq!(budget.known_input_tokens, 36);
+    assert_eq!(budget.known_output_tokens, 12);
+    assert!(!result.task_accepted);
+}
+
+#[tokio::test]
+async fn unavailable_host_guidance_is_not_silently_ignored_and_spends_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let http = http_fixture(vec![]).await;
+    let mut g = gateway(store(&dir.path().join("store"), 100_000), &http, policy());
+    let mut tools = FakeTools {
+        context_failure: true,
+        ..Default::default()
+    };
+    let error = g
+        .run(
+            &spec("host-context-failure"),
+            &mut tools,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Store);
+    assert_eq!(http.requests.load(Ordering::SeqCst), 0);
+    assert!(g.store().journal().model_requests(TASK).unwrap().is_empty());
 }
 
 #[tokio::test]
