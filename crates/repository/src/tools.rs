@@ -54,6 +54,21 @@ pub use read_bindings::{RepositoryRead, RepositoryReadDispatcher, RepositoryRead
 
 const ROUTES: &[(&str, &str, &str)] = &[
     (
+        "code_impact_map",
+        "code.references",
+        "Map source-bound transitive import/package/test candidates. Unresolved aliases and syntax gaps are explicit; this is not a complete build dependency graph.",
+    ),
+    (
+        "code_structural_search",
+        "code.symbols",
+        "Search selected visible Rust/Python/JS/TS/TSX files with ast-grep patterns. Exact source hashes, all matches or an explicit capacity error; structural candidates are not LSP references.",
+    ),
+    (
+        "code_structural_propose",
+        "code.patch_propose",
+        "Generate a multi-file ast-grep rewrite proposal over explicitly selected current files. No writes. Apply only through fs_patch and its existing reviewed path scope; stale preimages and overlapping edits are rejected.",
+    ),
+    (
         "fs_read_page",
         "fs.read",
         "Read a byte page from an exact current file version. Continue with next_offset until complete; no silent truncation.",
@@ -231,6 +246,8 @@ struct PortablePatchArg {
     proposal_json: String,
 }
 enum Parsed {
+    Impact(crate::impact::Query),
+    Structural(crate::structural::Query),
     ReadPage(ReadPageArg),
     ArtifactPage(ArtifactPageArg),
     Discover(crate::discovery::DiscoveryOptions),
@@ -262,6 +279,18 @@ fn parse(call: &ToolCall) -> melissa_model_gateway::Result<Parsed> {
     }
     let v = melissa_model_gateway::strict_json(&call.arguments)?;
     let p = match call.name.as_str() {
+        "code_impact_map" => Parsed::Impact(decode(v)?),
+        "code_structural_search" | "code_structural_propose" => {
+            let q: crate::structural::Query = decode(v)?;
+            if (call.name == "code_structural_search" && q.rewrite.is_some())
+                || (call.name == "code_structural_propose" && q.rewrite.is_none())
+            {
+                return Err(GatewayError::invalid(
+                    "structural search/proposal rewrite mode",
+                ));
+            }
+            Parsed::Structural(q)
+        }
         "fs_read_page" => Parsed::ReadPage(decode(v)?),
         "fs_artifact_page" => Parsed::ArtifactPage(decode(v)?),
         "fs_discover" => Parsed::Discover(decode(v)?),
@@ -414,6 +443,8 @@ impl Host {
         self.put(&binding_id,"repository_tool_binding",&serde_json::to_vec(&json!({"task":c.task_id,"profile":c.profile_id,"run":c.run_id,"request":c.request_id,"invocation":c.invocation_id,"attempt":c.attempt_id,"generation":c.generation,"wire_call_id":call.id,"wire_name":call.name,"canonical_tool":canonical,"arguments_digest":digest(call.arguments.as_bytes()),"root_identity":self.repo.root_identity()}))?)?;
         let mut artifacts = vec![binding_id];
         let value = match parsed {
+            Parsed::Impact(q) => serde_json::to_value(self.repo.impact_map(&q, cancel)?)?,
+            Parsed::Structural(q) => serde_json::to_value(self.repo.structural(&q, cancel)?)?,
             Parsed::ReadPage(p) => {
                 let (v, bytes) = self.repo.read(&p.before.path)?;
                 if v != p.before {
@@ -444,11 +475,20 @@ impl Host {
                 if digest(&bytes) != p.digest {
                     return Err(Error::Stale("artifact page digest"));
                 }
+                let observed = envelope
+                    .pointer("/result/source_digest")
+                    .or_else(|| envelope.pointer("/result/snapshot_digest"))
+                    .and_then(Value::as_str);
+                let freshness = match observed {
+                    Some(d) if self.repo.snapshot(cancel)?.digest == d => "CURRENT",
+                    Some(_) => "STALE",
+                    None => "UNKNOWN",
+                };
                 page(
                     &bytes,
                     p.offset,
                     p.max_bytes,
-                    json!({"artifact_id":p.artifact_id,"digest":p.digest}),
+                    json!({"artifact_id":p.artifact_id,"digest":p.digest,"source_freshness":freshness,"historical_evidence":true}),
                 )?
             }
             Parsed::Discover(p) => serde_json::to_value(self.repo.discover(&p, cancel)?)?,
@@ -843,6 +883,20 @@ fn schema(id: &str) -> Value {
             )
         }
         "fs_search" => object(json!({"bytes":bytes}), &["bytes"]),
+        "code_impact_map" => object(
+            json!({"paths":{"type":"array","minItems":1,"items":path}}),
+            &["paths"],
+        ),
+        "code_structural_search" | "code_structural_propose" => {
+            let props = json!({"language":{"type":"string","enum":["rust","python","javascript","typescript","tsx"]},"paths":{"type":"array","minItems":1,"items":path},"pattern":{"type":"string","minLength":1,"maxLength":65536},"rewrite":{"type":"string","maxLength":65536}});
+            if id == "code_structural_propose" {
+                object(props, &["language", "paths", "pattern", "rewrite"])
+            } else {
+                let mut props = props;
+                props.as_object_mut().unwrap().remove("rewrite");
+                object(props, &["language", "paths", "pattern"])
+            }
+        }
         "code_references" => object(
             json!({"name":{"type":"string","minLength":1,"maxLength":1024}}),
             &["name"],
@@ -902,11 +956,14 @@ impl ToolRouter {
 }
 impl ToolDispatcher for ToolRouter {
     fn definitions(&self) -> Vec<BoundTool> {
-        self.children
+        let mut definitions: Vec<_> = self
+            .children
             .iter()
             .flat_map(|c| c.definitions())
             .filter(|t| self.routes.contains_key(&t.definition.name))
-            .collect()
+            .collect();
+        definitions.sort_by(|a, b| a.definition.name.cmp(&b.definition.name));
+        definitions
     }
     fn validate_call(&self, c: &ToolCall) -> melissa_model_gateway::Result<()> {
         self.children[*self

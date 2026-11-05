@@ -2610,6 +2610,9 @@ fn complete_delivery(
 }
 fn repo_wires(tools: &BTreeSet<String>) -> BTreeSet<String> {
     [
+        ("code_impact_map", "code.references"),
+        ("code_structural_search", "code.symbols"),
+        ("code_structural_propose", "code.patch_propose"),
         ("fs_read", "fs.read"),
         ("fs_read_page", "fs.read"),
         ("fs_hash", "fs.hash"),

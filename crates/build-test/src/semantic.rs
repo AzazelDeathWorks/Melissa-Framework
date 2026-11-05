@@ -1,7 +1,7 @@
 //! Real Cargo-aware rust-analyzer / TypeScript / Pyright semantic procedures.
 use crate::{
     Error, Result,
-    full::{Language, compiler_contract, put, validate_source},
+    full::{Language, put},
     hex, toolchain,
 };
 use melissa_container_executor::{
@@ -17,6 +17,19 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, sync::atomic::AtomicBool};
 const DRIVER: &str = include_str!("semantic_worker.py");
+fn validate_source(snapshot: &Snapshot) -> Result {
+    if snapshot.files.keys().any(|p| {
+        p.split('/').any(|c| {
+            c.starts_with(".melissa-code06")
+                || matches!(c, ".cargo" | "rust-toolchain" | "rust-toolchain.toml")
+        })
+    }) {
+        return Err(Error::Invalid(
+            "semantic source cannot override immutable SDK or adapter",
+        ));
+    }
+    Ok(())
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticMethod {
@@ -25,6 +38,8 @@ pub enum SemanticMethod {
     Symbols,
     Diagnostics,
     Hover,
+    TypeDefinition,
+    Implementation,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -100,7 +115,9 @@ impl SemanticPlan {
             .get(&query.path)
             .ok_or(Error::Invalid("semantic source outside snapshot"))?;
         byte_position(bytes, query.line, query.character)?;
-        let options = compiler_contract(&snapshot, language)?;
+        // Real LSP servers read the captured monorepo project configuration.
+        // Build procedure compiler-option restrictions are a separate contract.
+        let options = json!({});
         let sdk = json!({"image":toolchain::COMPLETE_IMAGE,"rust_analyzer":"1.98.1","typescript":toolchain::TYPESCRIPT,"typescript_language_server":toolchain::TS_LSP,"pyright":toolchain::PYRIGHT});
         let payload = json!({"schema_version":"melissa.semantic-program/v1","language":language.wire(),"query":query,"source_digest":source.digest,"source_manifest_version":melissa_container_executor::source_manifest::VERSION,"sources":melissa_container_executor::source_manifest::seal(&snapshot),"compiler_options":options,"build_scripts":build_scripts,"trace_limit":limits.output_bytes,"sdk":sdk});
         snapshot.files.insert(

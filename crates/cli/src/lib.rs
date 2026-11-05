@@ -107,3 +107,5 @@ pub mod model_tools;
 mod telemetry;
 
 mod verification;
+
+pub mod repository_inspect;

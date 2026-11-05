@@ -37,7 +37,7 @@ impl SourceVisibilityPolicy {
     }
     pub fn policy_digest_material(&self) -> (&'static str, bool, &[String], &[String]) {
         (
-            "melissa.source-visibility/v2",
+            "melissa.source-visibility/v3",
             self.sensitive_defaults,
             &self.excluded_prefixes,
             &self.sensitive_exceptions,

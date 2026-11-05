@@ -33,7 +33,7 @@ fn octal(dest: &mut [u8], value: u64) {
     dest[..value.len()].copy_from_slice(value.as_bytes());
 }
 pub(crate) fn pack(snapshot: &Snapshot) -> ExecutorResult<Vec<u8>> {
-    snapshot.validate(MAX_CAPTURE)?;
+    snapshot.validate(MAX_SNAPSHOT_BYTES)?;
     let size = 1024
         + snapshot
             .files

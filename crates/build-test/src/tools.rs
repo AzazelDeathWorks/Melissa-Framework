@@ -73,7 +73,10 @@ impl CodeOperation {
                 Operation::Test { .. } => "code.tests",
             },
             Self::Semantic { query, .. } => match query.method {
-                SemanticMethod::Definition | SemanticMethod::References => "code.references",
+                SemanticMethod::Definition
+                | SemanticMethod::References
+                | SemanticMethod::TypeDefinition
+                | SemanticMethod::Implementation => "code.references",
                 SemanticMethod::Symbols => "code.symbols",
                 _ => "code.diagnostics",
             },

@@ -946,3 +946,77 @@ fn native_final_checks_bind_source_and_environment_and_keep_binary_output_pages(
         .is_err()
     );
 }
+
+#[test]
+#[ignore = "real owned Docker session and large source transfer; no AI"]
+fn native_phase05_large_project_reuses_one_source_transfer_during_stdio_session() {
+    let f = Fixture::new(true);
+    for i in 0..1400 {
+        fs::write(
+            f.source.join(format!("module_{i}.py")),
+            "# visible source\n",
+        )
+        .unwrap();
+    }
+    let command = python(
+        "import sys,pathlib; print('ready',flush=True); sys.stdin.buffer.read(); print(len(list(pathlib.Path('.').glob('module_*.py'))),flush=True)",
+    );
+    let (v, store) = f.running(command.clone(), Environment::default());
+    let id = v["task_id"].as_str().unwrap();
+    let contract = f
+        .app
+        .execution(&store, id)
+        .unwrap()
+        .unwrap()
+        .recipe
+        .project
+        .unwrap();
+    let repo = Repository::open(&f.source, Default::default(), vec![]).unwrap();
+    let mut runtime = runtime::Runtime::new(
+        &f.app,
+        id,
+        "melissa.code.implementer",
+        contract,
+        now().unwrap() + 120_000,
+    )
+    .unwrap();
+    let sid = runtime
+        .start(
+            &f.app,
+            &store,
+            &repo,
+            command,
+            "phase05-session",
+            Arc::new(AtomicBool::new(false)),
+            false,
+            false,
+        )
+        .unwrap();
+    for _ in 0..3 {
+        f.app.project_poll(id, &sid, 0, 32 * 1024).unwrap();
+    }
+    f.app
+        .project_input(id, &sid, "phase05-eof", "eof", "")
+        .unwrap();
+    let result = runtime::Runtime::wait(&f.app, id, &sid, &AtomicBool::new(false)).unwrap();
+    runtime.close().unwrap();
+    assert_eq!(result["status"], "PASS", "{result}");
+    let events = f.app.project_poll(id, &sid, 0, 256 * 1024).unwrap();
+    let prepared: Vec<_> = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["value"]["event"] == "prepared")
+        .collect();
+    assert_eq!(prepared.len(), 1);
+    assert_eq!(prepared[0]["value"]["materialization"]["files"], 1401);
+    assert!(events.to_string().contains("313430300a")); // Actual worker stdout: 1400 newline.
+    assert!(store.journal().model_requests(id).unwrap().is_empty());
+    let evidence = json!({"status":result["status"],"source_transfers":prepared.len(),"polls_without_retransfer":3,"materialization":prepared[0]["value"]["materialization"],"paid_calls":0});
+    fs::write(
+        f.root.join("phase05-session-result.json"),
+        bytes(&evidence).unwrap(),
+    )
+    .unwrap();
+    println!("NATIVE_SESSION_REUSE {evidence}");
+}

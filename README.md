@@ -59,3 +59,5 @@ Issue açabilir veya fork üzerinden PR gönderebilirsiniz. PR açıklamasında 
 Gizli anahtar, erişim bilgisi, kişisel yapılandırma, yerel veri tabanı, çalışma kaydı veya özel dosyaları commit etmeyin. Güvenlik açığı bildirirken çalışır erişim bilgilerini issue veya PR içine koymayın.
 
 MIT lisansı: [LICENSE](LICENSE).
+
+Büyük depolarda kaynak aktarımı, semantik gezinti ve yapısal değişiklik için [depo araçları kılavuzuna](docs/REPOSITORY_SCALE_TR.md) bakın.

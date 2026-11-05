@@ -70,6 +70,11 @@ pub struct Settings {
     pub json_object: bool,
     pub native_json_schema: bool,
     pub single_attempt: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "melissa_model_gateway::transport::PromptCache::is_disabled"
+    )]
+    pub prompt_cache: melissa_model_gateway::transport::PromptCache,
     pub rate_card: RateCard,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_pool: Vec<PoolModel>,
@@ -216,6 +221,9 @@ impl Settings {
             key,
         )
         .map_err(|_| Error::Usage("Endpoint yapılandırması geçersiz."))?;
+        endpoint = endpoint
+            .with_prompt_cache(self.prompt_cache)
+            .map_err(|_| Error::Usage("Sağlayıcı cache ayarı protokolle uyuşmuyor."))?;
         if self.protocol == Protocol::OpenAiResponses && self.capabilities.vision {
             endpoint = endpoint
                 .with_openai_image_detail(melissa_model_gateway::openai::ImageDetail::High)

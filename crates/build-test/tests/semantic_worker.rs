@@ -113,6 +113,171 @@ fn actual_python_and_typescript_semantic_definitions_resolve_same_named_modules(
         );
     }
 }
+
+#[test]
+fn actual_monorepo_alias_definition_references_and_type_definition_use_lsp() {
+    let files = [
+        (
+            "package.json",
+            r#"{"private":true,"workspaces":["packages/*"]}"#,
+        ),
+        (
+            "tsconfig.json",
+            r#"{"files":[],"references":[{"path":"packages/shared"},{"path":"packages/app"}]}"#,
+        ),
+        (
+            "tsconfig.base.json",
+            r#"{"compilerOptions":{"target":"ES2022","module":"ESNext","moduleResolution":"Bundler","baseUrl":".","paths":{"@shared/*":["packages/shared/src/*"]},"strict":true,"composite":true}}"#,
+        ),
+        (
+            "packages/shared/tsconfig.json",
+            r#"{"extends":"../../tsconfig.base.json","include":["src/**/*.ts"]}"#,
+        ),
+        (
+            "packages/app/tsconfig.json",
+            r#"{"extends":"../../tsconfig.base.json","include":["*.ts"],"references":[{"path":"../shared"}]}"#,
+        ),
+        (
+            "packages/shared/package.json",
+            r#"{"name":"shared","version":"1.0.0"}"#,
+        ),
+        (
+            "packages/shared/src/calc.ts",
+            "export interface Item { value: number }\nexport function create(): Item { return {value:1}; }\nexport class Counter implements Item { value=1; }\n",
+        ),
+        (
+            "packages/app/package.json",
+            r#"{"name":"app","version":"1.0.0"}"#,
+        ),
+        (
+            "packages/app/main.ts",
+            "import { create } from '@shared/calc';\nconst item = create();\nconsole.log(item.value);\n",
+        ),
+        (
+            "packages/app/other.ts",
+            "import { create } from '@shared/calc';\nexport const other = create();\n",
+        ),
+    ];
+    let query = |method, path: &str, line, character| SemanticQuery {
+        method,
+        path: path.into(),
+        line,
+        character,
+    };
+    let definition = run(
+        Language::TypeScript,
+        query(SemanticMethod::Definition, "packages/app/main.ts", 1, 15),
+        &files,
+        false,
+    );
+    assert!(
+        definition
+            .result
+            .unwrap()
+            .locations
+            .iter()
+            .any(|l| l.uri.ends_with("/packages/shared/src/calc.ts"))
+    );
+    let references = run(
+        Language::TypeScript,
+        query(
+            SemanticMethod::References,
+            "packages/shared/src/calc.ts",
+            1,
+            18,
+        ),
+        &files,
+        false,
+    );
+    let locations = references.result.unwrap().locations;
+    for p in ["/packages/app/main.ts", "/packages/app/other.ts"] {
+        assert!(
+            locations.iter().any(|l| l.uri.ends_with(p)),
+            "missing true caller {p}"
+        );
+    }
+    let types = run(
+        Language::TypeScript,
+        query(
+            SemanticMethod::TypeDefinition,
+            "packages/app/main.ts",
+            2,
+            14,
+        ),
+        &files,
+        false,
+    );
+    assert!(
+        types
+            .result
+            .unwrap()
+            .locations
+            .iter()
+            .any(|l| l.uri.ends_with("/packages/shared/src/calc.ts"))
+    );
+    let implementations = run(
+        Language::TypeScript,
+        query(
+            SemanticMethod::Implementation,
+            "packages/shared/src/calc.ts",
+            0,
+            18,
+        ),
+        &files,
+        false,
+    );
+    let data = implementations.result.unwrap();
+    assert!(
+        data.locations
+            .iter()
+            .any(|l| l.uri.ends_with("/packages/shared/src/calc.ts"))
+    );
+    eprintln!("NATIVE_IMPLEMENTATION {}", data.result);
+    assert!(
+        data.result
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|location| location["range"]["start"]["line"] == 2)
+    );
+}
+
+#[test]
+fn actual_existing_pyright_project_configuration_is_preserved_and_resolves_package() {
+    let files = [
+        (
+            "pyrightconfig.json",
+            r#"{"include":["packages"],"extraPaths":["packages/lib"]}"#,
+        ),
+        (
+            "packages/lib/calc.py",
+            "def answer() -> int:\n    return 42\n",
+        ),
+        (
+            "packages/app/main.py",
+            "from calc import answer\nvalue = answer()\n",
+        ),
+    ];
+    let report = run(
+        Language::Python,
+        SemanticQuery {
+            method: SemanticMethod::Definition,
+            path: "packages/app/main.py".into(),
+            line: 1,
+            character: 10,
+        },
+        &files,
+        false,
+    );
+    assert!(
+        report
+            .result
+            .unwrap()
+            .locations
+            .iter()
+            .any(|l| l.uri.ends_with("/packages/lib/calc.py"))
+    );
+}
 #[test]
 fn actual_cargo_rust_semantics_resolve_local_dependencies_and_sysroot_sources() {
     let files = [

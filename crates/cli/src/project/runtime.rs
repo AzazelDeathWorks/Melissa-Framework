@@ -160,11 +160,13 @@ impl Runtime {
                 "Proje aktarımı worker dosya/byte/disk kapasitesini aşıyor; süreç başlatılmadı.",
             )
         })?;
-        let mut files = source
-            .files
-            .iter()
-            .map(|f| repo.read(&f.path).map(|(_, v)| (f.path.clone(), v)))
-            .collect::<std::result::Result<BTreeMap<_, _>, _>>()?;
+        let input = repo.worker_input_with_budget(
+            &source,
+            &cancel,
+            self.contract.environment.limits.disk_bytes,
+        )?;
+        let materialization = input.materialization;
+        let mut files = input.snapshot.files;
         files.extend(extra);
         files.insert(".melissa-project/program.json".into(), encoded);
         files.insert(
@@ -308,7 +310,7 @@ impl Runtime {
         };
         let disk = Disk::open(app, &self.task, &sid, true)?;
         disk.write("state.enc", &state, false)?;
-        disk.event(json!({"event":"prepared","command":command,"environment":self.contract.environment,"source_digest":state.source_digest,"snapshot_digest":snapshot.digest().map_err(|_|Error::Store)?,"authority":"snapshot_only_no_host_writeback"}))?;
+        disk.event(json!({"event":"prepared","command":command,"environment":self.contract.environment,"source_digest":state.source_digest,"snapshot_digest":snapshot.digest().map_err(|_|Error::Store)?,"authority":"snapshot_only_no_host_writeback","materialization":materialization}))?;
         drop(disk);
         let local_cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = local_cancel.clone();

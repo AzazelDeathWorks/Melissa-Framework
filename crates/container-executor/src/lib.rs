@@ -10,8 +10,10 @@ mod runtime;
 
 pub const EXECUTION_CONTRACT: &str = "linux.docker.readonly-tmpfs/v1";
 const MAX_CAPTURE: u64 = 64 * 1024 * 1024;
-pub const MAX_SNAPSHOT_BYTES: u64 = MAX_CAPTURE;
-pub const MAX_SNAPSHOT_FILES: usize = 1024;
+// Input admission is independent of captured output. Worker disk limits remain
+// authoritative; these are physical transport ceilings, never truncation.
+pub const MAX_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024;
+pub const MAX_SNAPSHOT_FILES: usize = 100_000;
 pub type ExecutorResult<T = ()> = Result<T, ExecutorError>;
 
 #[derive(Debug)]
@@ -231,7 +233,7 @@ impl Snapshot {
         )
     }
     pub fn digest(&self) -> ExecutorResult<String> {
-        self.validate(MAX_CAPTURE)?;
+        self.validate(MAX_SNAPSHOT_BYTES)?;
         let mut hash = blake3::Hasher::new();
         hash.update(b"melissa.container-snapshot/v1\0");
         for (name, data) in &self.files {

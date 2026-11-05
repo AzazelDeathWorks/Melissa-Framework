@@ -21,6 +21,11 @@ pub struct Options {
 pub const DOMAIN_HELP: &str = "\nWeb/API/veritabanı (v2 özel tarif):\n  melissa task preview ID [--out NEW_DIRECTORY]\n  melissa task evidence ID [--artifact ARTIFACT_ID --out NEW_FILE]\n\nYerel tarayıcı/API/SQLite/PostgreSQL akışları sabit image üzerinde çalışır. Public development ve private final testleri ayrıdır. Preview kaynağa bağlı PNG ihracıdır; kalıcı web sunucusu açmaz.\n";
 #[derive(Debug)]
 pub enum Command {
+    RepositoryInspect {
+        action: String,
+        workspace: PathBuf,
+        query: PathBuf,
+    },
     Extension {
         action: String,
         workspace: Option<PathBuf>,
@@ -185,6 +190,26 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options> {
         "init" => Command::Init,
         "profiles" => Command::Profiles,
         "doctor" => Command::Doctor,
+        "repository" => {
+            let action = text(a.next().ok_or(Error::Usage(
+                "repository impact-map|structural-patch --workspace PATH --query JSON gerekli.",
+            ))?)?;
+            if !["impact-map", "structural-patch"].contains(&action.as_str()) {
+                return Err(Error::Usage("Bilinmeyen repository işlemi."));
+            }
+            let mut f = flags(&mut a, &["--workspace", "--query"])?;
+            Command::RepositoryInspect {
+                action,
+                workspace: PathBuf::from(
+                    f.remove("--workspace")
+                        .ok_or(Error::Usage("--workspace gerekli."))?,
+                ),
+                query: PathBuf::from(
+                    f.remove("--query")
+                        .ok_or(Error::Usage("--query gerekli."))?,
+                ),
+            }
+        }
         "extension" => {
             let action = text(a.next().ok_or(Error::Usage(
                 "extension list|configure|import-skill|resolve gerekli.",
@@ -511,3 +536,5 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options> {
         command,
     })
 }
+
+pub const REPOSITORY_HELP: &str = "\nDepo analizi (model/API çağırmaz):\n  melissa --json repository impact-map|structural-patch --workspace PATH --query JSON_FILE\n  Belgeler: docs/REPOSITORY_SCALE_TR.md\n";

@@ -52,9 +52,10 @@ if language == "rust":
                 "procMacro": {"enable": P["build_scripts"]}, "checkOnSave": False}
 elif language == "python":
     args = ["/opt/node/bin/node", "/opt/melissa-tools/node_modules/pyright/langserver.index.js", "--stdio"]
-    config = {"include": [p for p in P["sources"] if p.endswith(".py")],
+    config = {"include": [p for p in P["sources"] if p.endswith((".py", ".pyi"))],
               "exclude": [".melissa-code06-semantic"], "extraPaths": ["/work/src"], "typeCheckingMode": "strict"}
-    (ROOT / "pyrightconfig.json").write_text(json.dumps(config))
+    if "pyrightconfig.json" not in P["sources"] and "pyproject.toml" not in P["sources"]:
+        (ROOT / "pyrightconfig.json").write_text(json.dumps(config))
     settings = {"python": {"pythonPath": "/opt/melissa-python/bin/python", "analysis": config},
                 "python.analysis": config}
 else:
@@ -136,7 +137,7 @@ def pump(deadline):
                 values.append(settings if language == "rust" else settings.get(section, {}))
             send({"jsonrpc": "2.0", "id": message["id"], "result": values})
         elif method == "workspace/workspaceFolders":
-            send({"jsonrpc": "2.0", "id": message["id"], "result": [{"uri": ROOT.as_uri(), "name": "owned"}]})
+            send({"jsonrpc": "2.0", "id": message["id"], "result": folders})
         elif method in ("client/registerCapability", "window/workDoneProgress/create", "workspace/semanticTokens/refresh"):
             send({"jsonrpc": "2.0", "id": message["id"], "result": None})
         else:
@@ -168,9 +169,18 @@ def notification(method, params):
 try:
     if not same_source():
         raise ValueError("semantic source changed before initialize")
-    request("initialize", {"processId": None, "rootUri": ROOT.as_uri(),
-        "workspaceFolders": [{"uri": ROOT.as_uri(), "name": "owned"}],
-        "capabilities": {"workspace": {"configuration": True}, "experimental": {"serverStatusNotification": True},
+    folders = [{"uri": ROOT.as_uri(), "name": "owned"}]
+    for parent in sorted({str(Path(p).parent) for p in P["sources"]
+                          if Path(p).name in ("Cargo.toml", "package.json", "pyproject.toml", "tsconfig.json")}):
+        # A Cargo root already owns its workspace and path dependencies.
+        # Opening each dependency again creates competing analyzer projects.
+        if parent != "." and not (language == "rust" and "Cargo.toml" in P["sources"]):
+            folders.append({"uri": (ROOT / parent).as_uri(), "name": parent})
+    if len(folders) > 256:
+        raise ValueError("semantic workspace folder capacity; select a narrower project")
+    capabilities = request("initialize", {"processId": None, "rootUri": ROOT.as_uri(),
+        "workspaceFolders": folders,
+        "capabilities": {"workspace": {"configuration": True, "workspaceFolders": True}, "experimental": {"serverStatusNotification": True},
                          "textDocument": {"publishDiagnostics": {"versionSupport": True}}},
         "initializationOptions": settings if language == "rust" else {"tsserver": {
             "path": "/opt/melissa-tools/node_modules/typescript/lib/tsserver.js", "useSyntaxServer": "never"},
@@ -188,7 +198,7 @@ try:
             pump(deadline)
     method = P["query"]["method"]
     params = {"textDocument": {"uri": uri}}
-    if method in ("definition", "references", "hover"):
+    if method in ("definition", "references", "hover", "type_definition", "implementation"):
         params["position"] = {"line": P["query"]["line"], "character": P["query"]["character"]}
     if method == "references":
         params["context"] = {"includeDeclaration": True}
@@ -203,11 +213,12 @@ try:
             pump(deadline)
     else:
         native = {"definition": "textDocument/definition", "references": "textDocument/references",
-                  "symbols": "textDocument/documentSymbol", "hover": "textDocument/hover"}[method]
+                  "symbols": "textDocument/documentSymbol", "hover": "textDocument/hover",
+                  "type_definition": "textDocument/typeDefinition", "implementation": "textDocument/implementation"}[method]
         deadline = time.monotonic() + 30
         while True:
             value = request(native, params)
-            if value or method not in ("definition", "references") or time.monotonic() > deadline:
+            if value or method not in ("definition", "references", "type_definition", "implementation") or time.monotonic() > deadline:
                 result["result"] = value
                 break
             time.sleep(0.1)

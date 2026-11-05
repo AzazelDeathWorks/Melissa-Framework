@@ -36,6 +36,11 @@ async fn run(options: &args::Options) -> Result<Value> {
     }
     let app = App::open(&home)?;
     match &options.command {
+        Command::RepositoryInspect {
+            action,
+            workspace,
+            query,
+        } => melissa_cli::repository_inspect::run(&app, action, workspace, query),
         Command::ProjectDoctor { workspace } => {
             app.project_doctor(workspace, app.project_environment(workspace)?)
         }
@@ -191,6 +196,7 @@ async fn main() {
         println!("{}", args::DOMAIN_HELP);
         println!("{}", args::CAPABILITIES_HELP);
         println!("{}", args::METRICS_HELP);
+        println!("{}", args::REPOSITORY_HELP);
         return;
     }
     if matches!(options.command, Command::Version) {
