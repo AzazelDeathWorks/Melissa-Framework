@@ -108,7 +108,7 @@ fn recipe_plan_has_exact_write_scope_and_a_protected_oracle_without_model_answer
     let plan = f.app().progress(v["task_id"].as_str().unwrap()).unwrap();
     assert_eq!(
         plan["workflow"]["plan"]["nodes"].as_array().unwrap().len(),
-        2
+        3
     );
     assert!(
         !plan["workflow"]["plan"]
@@ -315,4 +315,18 @@ fn forward_slash_external_file_reference_does_not_read_a_key_during_task_creatio
     assert_eq!(task["state"], "awaiting_approval");
     assert_eq!(task["model_budget"]["known_cost_micro_usd"], 0);
     assert!(!private.exists());
+}
+
+#[test]
+fn new_executable_tasks_approve_serial_verification_even_from_a_single_step_recipe() {
+    let mut f = Fixture::new();
+    f.recipe.agents.truncate(1);
+    let v = f.task();
+    let profiles = v["profile"].as_array().unwrap();
+    assert!(profiles.iter().any(|p| p == "melissa.code.implementer"));
+    assert!(profiles.iter().any(|p| p == "melissa.code.test-engineer"));
+    assert!(profiles.iter().any(|p| p == "melissa.code.reviewer"));
+    assert_eq!(v["state"], "awaiting_approval");
+    assert_eq!(v["model_budget"]["active_requests"], 0);
+    assert_eq!(v["model_budget"]["known_cost_micro_usd"], 0);
 }

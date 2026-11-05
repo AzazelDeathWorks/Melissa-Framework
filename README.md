@@ -15,6 +15,7 @@ korunur; derlenen CLI'ya dahil edilmez. Masaüstü arayüzü bu kapsamda yoktur.
 - Kaynak envanterine dayalı, incelenebilir doğal dil görev taslakları.
 - Build/test/lint, sahip olunan hata ayıklama oturumu ve izole Git işlemleri.
 - Kalıcı oturum geçmişi, devam etme ve kalan adımları yeniden planlama.
+- Göreve göre sıralı uzman seçimi, kaynak sürümüne bağlı devir ve yürütücünün doğruladığı model plan önerileri.
 
 Desteklenen diller, çalışma sınırları ve komutlar:
 [CLI kullanım rehberi](docs/CLI_CAPABILITIES_TR.md).

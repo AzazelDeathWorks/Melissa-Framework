@@ -709,7 +709,7 @@ fn prepare_is_source_bound_and_never_invents_acceptance_or_overwrites() {
         json!(["main.py"])
     );
     assert_eq!(
-        v["preparation"]["recipe"]["agents"][1]["profile"],
+        v["preparation"]["recipe"]["agents"][0]["profile"],
         "melissa.code.debugger"
     );
     assert!(f.app.prepare(&f.source, "other task", &out, None).is_err());
@@ -1248,5 +1248,93 @@ async fn replan_preserves_active_step_then_changes_pending_steps_without_budget_
     assert_eq!(store.journal().model_budget(&task.task_id).unwrap(), budget);
     assert!(
         !crate::preparation::activate_pending(&mut store, &task.task_id, &mut scheduler).unwrap()
+    );
+}
+
+#[test]
+fn adaptive_preparation_inspects_imports_and_selects_readonly_verifiers() {
+    let f = Fixture::new("melissa.code.implementer");
+    fs::write(
+        f.source.join("consumer.py"),
+        "from main import double\nvalue=double(4)\n",
+    )
+    .unwrap();
+    let v = f
+        .app
+        .prepare(
+            &f.source,
+            "main.py security refactor",
+            &f._temp.path().join("adaptive.json"),
+            None,
+        )
+        .unwrap();
+    let a = &v["preparation"]["adaptive_plan"];
+    assert_eq!(a["complexity"], "high_risk");
+    assert_eq!(a["signals"]["cross_module_dependencies"], 1);
+    assert_eq!(a["dependency_evidence"]["semantic_resolution"], false);
+    assert_eq!(
+        a["dependency_evidence"]["source_digest"],
+        v["preparation"]["source_digest"]
+    );
+    let roles = a["required_specialists"].as_array().unwrap();
+    assert!(roles.iter().any(|p| p == "melissa.code.architect"));
+    assert!(roles.iter().any(|p| p == "melissa.code.security-reviewer"));
+    assert_eq!(roles.last().unwrap(), "melissa.code.reviewer");
+    let agents = v["preparation"]["recipe"]["agents"].as_array().unwrap();
+    for agent in agents {
+        if agent["profile"] == "melissa.code.test-engineer"
+            || agent["profile"] == "melissa.code.reviewer"
+        {
+            assert_eq!(agent["write"], false);
+        }
+    }
+    assert_eq!(v["preparation"]["model_calls"], 0);
+    assert_eq!(v["preparation"]["ready_to_create"], false);
+}
+#[test]
+fn adaptive_readonly_review_has_independent_source_analysis_without_writes() {
+    let f = Fixture::new("melissa.code.implementer");
+    let v = f
+        .app
+        .prepare(
+            &f.source,
+            "review main.py",
+            &f._temp.path().join("review.json"),
+            None,
+        )
+        .unwrap();
+    let agents = v["preparation"]["recipe"]["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 3);
+    assert_eq!(agents[0]["profile"], "melissa.code.repository-analyst");
+    assert!(agents.iter().all(|a| a["write"] == false));
+    assert_eq!(
+        v["preparation"]["adaptive_plan"]["scope"]["proposed_writes"],
+        json!([])
+    );
+}
+
+#[test]
+fn adaptive_test_authoring_keeps_a_writer_and_a_separate_readonly_verifier() {
+    let f = Fixture::new("melissa.code.implementer");
+    let v = f
+        .app
+        .prepare(
+            &f.source,
+            "main.py add a test helper",
+            &f._temp.path().join("tests-plan.json"),
+            None,
+        )
+        .unwrap();
+    let agents = v["preparation"]["recipe"]["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 3);
+    assert_eq!(agents[0]["profile"], "melissa.code.test-engineer");
+    assert_eq!(agents[0]["write"], true);
+    assert_eq!(agents[1]["profile"], "melissa.code.test-engineer");
+    assert_eq!(agents[1]["write"], false);
+    assert_eq!(agents[2]["profile"], "melissa.code.reviewer");
+    assert_eq!(agents[2]["write"], false);
+    assert_eq!(
+        v["preparation"]["recipe"]["writable_paths"],
+        json!(["main.py"])
     );
 }

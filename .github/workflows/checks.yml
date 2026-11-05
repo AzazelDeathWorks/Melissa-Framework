@@ -42,7 +42,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo +1.98.0 test --locked -p melissa-skill-context --test native_runtime full_skill_assembly_reaches_native_request_without_eval_answers_and_binds_same_prepared_message -- --exact
       - name: Shared workflow continuation and checkpoint ownership
-        run: cargo +1.98.0 test --locked -p melissa-workflow --test workflow --test complete_native_race
+        run: cargo +1.98.0 test --locked -p melissa-workflow --test workflow --test complete_native_race --test adaptive_serial
       - name: Memory envelopes and native checkpoint bounds
         run: |
           cargo +1.98.0 test --locked -p melissa-skill-context --lib --test context_state --test incremental_context
@@ -67,7 +67,7 @@ jobs:
       - name: Rust toolchain
         run: rustup toolchain install 1.98.0 --profile minimal
       - name: Workflow tests
-        run: cargo +1.98.0 test --locked -p melissa-workflow --test attenuation --test comparison --test coordinator --test serial_tools --test shared_ledger --test complete_native_race
+        run: cargo +1.98.0 test --locked -p melissa-workflow --test adaptive_serial --test attenuation --test comparison --test coordinator --test serial_tools --test shared_ledger --test complete_native_race
       - name: Skill context tests
         run: cargo +1.98.0 test --locked -p melissa-skill-context --test package_runtime --test context_state --test retrieval --test registry_versions --test incremental_context
       - name: Repository grammar and archive contracts

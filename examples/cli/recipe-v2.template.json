@@ -2,6 +2,11 @@
   "schema_version": "melissa.cli-recipe/v2",
   "agents": [
     {
+      "profile": "melissa.code.test-engineer",
+      "goal": "Run authorized public development checks on the final source, retain diagnostics and source-bound evidence, submit the exact source digest. Do not modify source or claim task acceptance.",
+      "write": false
+    },
+    {
       "profile": "melissa.code.implementer",
       "goal": "main.py receives a JSON array as argv[1]. Return the array reversed as JSON. Preserve dirty work. Run public code_tests then submit_candidate with actual source digest.",
       "write": true

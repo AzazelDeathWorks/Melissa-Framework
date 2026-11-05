@@ -74,6 +74,7 @@ impl App {
         }
         let repo = Repository::open(&root, Limits::default(), vec![])?;
         let snap = repo.snapshot(&AtomicBool::new(false))?;
+        let acceptance_template = acceptance.map(Recipe::read).transpose()?;
         let (role, write) = intent(goal);
         let mentioned = snap
             .files
@@ -100,34 +101,86 @@ impl App {
             .collect::<BTreeSet<_>>();
         let writable = if write {
             if mentioned.is_empty() {
-                candidates
+                candidates.clone()
             } else {
                 mentioned.difference(&tests).cloned().collect()
             }
         } else {
             BTreeSet::new()
         };
-        let agents = vec![
-            Step {
-                profile: "melissa.code.repository-analyst".into(),
-                goal: format!("Inspect current source and determine impact for: {goal}"),
-                write: false,
-            },
-            Step {
-                profile: format!("melissa.code.{role}"),
-                goal: goal.into(),
-                write,
-            },
-            Step {
-                profile: "melissa.code.reviewer".into(),
-                goal: "Independently review changes, source evidence and public test results"
-                    .into(),
-                write: false,
-            },
-        ];
+
+        let affected = if !mentioned.is_empty() {
+            mentioned.clone()
+        } else {
+            candidates.clone()
+        };
+        let dependency_evidence = dependency_hints(&repo, &snap, &affected)?;
+        let lower = goal.to_lowercase();
+        let signals = melissa_workflow::adaptive::Signals {
+            repository_files: snap.files.len(),
+            affected_files: affected.len(),
+            affected_modules: affected
+                .iter()
+                .filter_map(|p| p.rsplit_once('/').map(|(module, _)| module))
+                .collect::<BTreeSet<_>>()
+                .len(),
+            cross_module_dependencies: dependency_evidence["cross_file_edges"]
+                .as_u64()
+                .unwrap_or(0) as usize,
+            test_files: tests.len(),
+            high_risk: [
+                "security",
+                "auth",
+                "payment",
+                "migration",
+                "güvenlik",
+                "kimlik",
+            ]
+            .iter()
+            .any(|s| lower.contains(s)),
+            architecture_change: ["architecture", "mimari", "refactor"]
+                .iter()
+                .any(|s| lower.contains(s)),
+            compiler_failure: ["compile", "compiler", "derleme", "build failed"]
+                .iter()
+                .any(|s| lower.contains(s)),
+            estimated_cost_micro_usd: None,
+            authorized_cost_micro_usd: acceptance_template.as_ref().map(|r| r.max_cost_micro_usd),
+        };
+        let catalog = crate::resources::catalog()?;
+        let profiles = melissa_workflow::adaptive::specialists(&signals, role, &catalog)
+            .map_err(|_| Error::Denied("Göreve uygun çalıştırılabilir uzman bulunamadı."))?;
+        let last_test = profiles
+            .iter()
+            .rposition(|p| p == "melissa.code.test-engineer");
+        let agents = profiles.into_iter().enumerate().map(|(index,profile)| {
+            let can_write = write && !writable.is_empty()
+                && !matches!(profile.as_str(), "melissa.code.repository-analyst" | "melissa.code.reviewer" | "melissa.code.security-reviewer" | "melissa.code.architect")
+                && Some(index) != last_test;
+            let purpose = match profile.as_str() {
+                "melissa.code.repository-analyst" => "Identify affected source, dependencies and evidence",
+                "melissa.code.architect" => "Design a scoped change and explicit verification milestones",
+                "melissa.code.test-engineer" if can_write => "Design and implement tests within the approved writable scope, retaining baseline failure evidence",
+                "melissa.code.test-engineer" => "Execute authorized tests and retain diagnostics with source versions",
+                "melissa.code.reviewer" => "Independently review the final source, changes and recorded tests",
+                "melissa.code.security-reviewer" => "Review authorization boundaries and security consequences",
+                _ => "Diagnose and implement the authorized change, retaining failed attempts and evidence",
+            };
+            Step { profile, goal: format!("{purpose}. Task goal: {goal}"), write: can_write }
+        }).collect::<Vec<_>>();
+        let adaptive = json!({
+            "task_goal":goal, "complexity":melissa_workflow::adaptive::complexity(&signals),
+            "signals":signals, "dependency_evidence":dependency_evidence,
+            "scope":{"inspected_paths":affected,"proposed_writes":writable},
+            "acceptance_criteria":if acceptance_template.is_some(){"operator acceptance template; private expected values withheld"}else{"operator input required"},
+            "risk":{"high_risk":signals.high_risk,"authority_expansion_allowed":false},
+            "authorized_budget":acceptance_template.as_ref().map(|r|json!({"max_cost_micro_usd":r.max_cost_micro_usd,"wall_time_ms":r.wall_time_ms})), "constraints":["original task authority","one active specialist","operator-owned acceptance"],
+            "milestones":agents.iter().enumerate().map(|(i,s)| json!({"id":format!("step-{i}"),"goal":s.goal,"profile":s.profile,"write":s.write,"dependencies":if i==0{vec![]}else{vec![format!("step-{}",i-1)]}})).collect::<Vec<_>>(), "required_specialists":agents.iter().map(|s| &s.profile).collect::<Vec<_>>(),
+            "verification_strategy":"specialist tests, independent final review, then protected host QA",
+            "budget_estimate":"unknown until provider configuration and measured usage are available"
+        });
         let mut ready = false;
-        let recipe = if let Some(path) = acceptance {
-            let mut r = Recipe::read(path)?;
+        let recipe = if let Some(mut r) = acceptance_template {
             // The operator's acceptance template owns writes, oracle, runtime
             // and cost. Goal inference is never allowed to broaden that scope.
             if write && !writable.is_subset(&r.writable_paths) {
@@ -142,7 +195,10 @@ impl App {
         } else {
             json!({"agents":agents,"writable_paths":writable,"protected_paths":tests,"language_hint":crate::development::detected_language(&repo)?.map(|l|l.wire()),"development":"pinned SDK build/check/lint/native test discovery","required_operator_inputs":["entry/domain contract","private acceptance checks and separate negative workspace","task duration and cost authorization"]})
         };
-        let draft = json!({"schema_version":"melissa.cli-preparation/v1","goal":goal,"workspace":root,"source_digest":snap.digest,"source_files":snap.files.len(),"method":"offline source inspection and explicit intent rules; not an LLM plan","ready_to_create":ready,"recipe":recipe,"approval_required_before_execution":true,"model_calls":0,"missing_acceptance_invented":false});
+        if repo.snapshot(&AtomicBool::new(false))?.digest != snap.digest {
+            return Err(Error::Conflict("Source changed during task preparation."));
+        }
+        let draft = json!({"schema_version":"melissa.cli-preparation/v1","goal":goal,"workspace":root,"source_digest":snap.digest,"source_files":snap.files.len(),"adaptive_plan":adaptive,"method":"offline source inspection and explicit intent rules; not an LLM plan","ready_to_create":ready,"recipe":recipe,"approval_required_before_execution":true,"model_calls":0,"missing_acceptance_invented":false});
         let body = if ready {
             bytes(&draft["recipe"])?
         } else {
@@ -325,4 +381,81 @@ pub(crate) fn activate_pending(
         json!({"digest":digest(&raw),"budget_reset":false}),
     )?;
     Ok(true)
+}
+
+// Source-visible import candidates are complexity hints, not semantic proof.
+fn dependency_hints(
+    repo: &Repository,
+    snapshot: &melissa_repository::RepositorySnapshot,
+    affected: &BTreeSet<String>,
+) -> Result<Value> {
+    let cancel = AtomicBool::new(false);
+    let mut files = snapshot.files.iter().collect::<Vec<_>>();
+    files.sort_by_key(|f| (!affected.contains(&f.path), &f.path));
+    let mut facts = std::collections::BTreeMap::new();
+    let mut bytes_read = 0usize;
+    let mut nodes_left = melissa_repository::polyglot::MAX_SYNTAX_NODES;
+    let mut incomplete = false;
+    for file in files {
+        if melissa_repository::discovery::language(&file.path).is_none() {
+            continue;
+        }
+        if facts.len() >= 512 || nodes_left == 0 {
+            incomplete = true;
+            break;
+        }
+        let (version, bytes) = repo.read(&file.path)?;
+        if version.digest != file.digest {
+            return Err(Error::Conflict("Dependency source changed."));
+        }
+        bytes_read = bytes_read.saturating_add(bytes.len());
+        if bytes_read > 32 * 1024 * 1024 {
+            incomplete = true;
+            break;
+        }
+        let parsed = match melissa_repository::polyglot::parse_index_file(
+            &version, &bytes, &cancel, nodes_left,
+        ) {
+            Err(melissa_repository::Error::Quota(_)) => {
+                incomplete = true;
+                break;
+            }
+            result => result?,
+        };
+        match parsed {
+            Some(parsed) => {
+                nodes_left = nodes_left.saturating_sub(parsed.nodes);
+                if let Some(graph) = parsed.graph {
+                    incomplete |= graph.truncated || graph.syntax_error;
+                    facts.insert(file.path.clone(), graph);
+                } else {
+                    incomplete = true;
+                }
+            }
+            None => {
+                incomplete = true;
+            }
+        }
+    }
+    let graph =
+        melissa_repository::graph::Graph::new(facts.iter().map(|(p, f)| (p.as_str(), f)).collect());
+    let edges = graph
+        .imports
+        .values()
+        .flatten()
+        .filter(|edge| {
+            edge.dependency.is_some_and(|dep| {
+                dep != edge.path && (affected.contains(edge.path) || affected.contains(dep))
+            })
+        })
+        .count();
+    let unresolved = graph
+        .imports
+        .values()
+        .flatten()
+        .filter(|edge| affected.contains(edge.path) && edge.dependency.is_none())
+        .count();
+    Ok(
+        json!({"source_digest":snapshot.digest,"cross_file_edges":edges,"unresolved_imports":unresolved,"parsed_files":facts.len(),"incomplete":incomplete,"evidence_kind":"bounded_source_import_candidates","semantic_resolution":false}),
+    )
 }

@@ -313,7 +313,7 @@ impl App {
         excludes: Vec<String>,
         recipe: crate::recipe::Recipe,
     ) -> Result<Value> {
-        recipe.validate()?;
+        let recipe = recipe.with_serial_verification()?;
         let settings = self.settings()?;
         let source_root =
             Repository::open(&absolute(workspace)?, Limits::default(), excludes.clone())?;
