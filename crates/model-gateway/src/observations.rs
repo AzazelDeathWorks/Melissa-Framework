@@ -73,7 +73,6 @@ pub fn normalize(tool: &str, raw: &str) -> Option<Value> {
             "snapshot_digest":result["snapshot_digest"],"source_visibility_digest":value["source_visibility_digest"]})
     } else if schema == "melissa.sdk-result/v1"
         && value.get("details").is_some()
-        && value.get("raw_worker_artifact_id").is_some()
         && matches!(
             tool,
             "code_project_check"
@@ -104,7 +103,7 @@ pub fn normalize(tool: &str, raw: &str) -> Option<Value> {
             "source_digest":value["source_digest"],"host_source_current":value["host_source_current"],
             "source_truncated":details["truncated"],"worker_error":bounded(&details["error"]),
             "protocol_error":bounded(&value["protocol_error"]),"warnings":bounded(&value["warnings"]),
-            "raw_artifact_ids":bounded(&value["raw_artifact_ids"])})
+            "evidence_page":value.get("evidence_page")})
     } else if schema == "melissa.rust-build-test/v1"
         && value.get("raw_logs").is_some()
         && value.get("test_runs").is_some()
@@ -205,7 +204,6 @@ pub fn normalize(tool: &str, raw: &str) -> Option<Value> {
             "failed_tests",
             "diagnostics",
             "exit_status",
-            "raw_artifact_ids",
             "changed_files",
             "current_hunks",
             "warnings",

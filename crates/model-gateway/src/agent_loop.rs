@@ -1,7 +1,7 @@
 //! Single-agent vertical slice. The model proposes, trusted policy grants,
 //! CODE-03 executes, CODE-02 persists. A final answer is always a candidate.
 use crate::{
-    DecoderLimits, ErrorKind, GatewayError, Message, RequestLimits, Result, StopReason,
+    DecoderLimits, ErrorKind, GatewayError, Message, RequestLimits, Result, StopReason, ToolCall,
     TurnRequest,
     output_capabilities::{OutputCapabilityRegistration, OutputCapabilityRegistry, OutputMode},
     routing::{ModelRegistration, RouteRequirements, select_routes_for_output_mode},
@@ -138,6 +138,37 @@ fn store_error(_: melissa_local_store::StoreError) -> GatewayError {
         "durable model record/evidence failed; inspect before retry",
     )
 }
+// The batch is already authenticated and preflighted. Results must form
+// an exact prefix of the last assistant turn before any remainder can run.
+fn pending_tool_batch(messages: &[Message], seen: &BTreeSet<String>) -> Result<Vec<ToolCall>> {
+    let invalid = || GatewayError::new(ErrorKind::Store, "invalid settled tool batch checkpoint");
+    let index = messages
+        .iter()
+        .rposition(|message| matches!(message, Message::Assistant { .. }))
+        .ok_or_else(invalid)?;
+    let Message::Assistant { response } = &messages[index] else {
+        return Err(invalid());
+    };
+    let results = &messages[index + 1..];
+    if response.stop != StopReason::ToolCalls
+        || results.is_empty()
+        || results.len() >= response.calls.len()
+        || response.calls.iter().any(|call| !seen.contains(&call.id))
+    {
+        return Err(invalid());
+    }
+    for (result, call) in results.iter().zip(&response.calls) {
+        match result {
+            Message::ToolResult { call_id, .. } | Message::ToolImages { call_id, .. }
+                if call_id == &call.id => {}
+            _ => return Err(invalid()),
+        }
+    }
+    Ok(response.calls[results.len()..].to_vec())
+}
+
+const TOOL_CHECKPOINT_GROUP: usize = 8;
+
 fn now() -> Result<u64> {
     melissa_execution_broker::unix_ms()
         .map_err(|_| GatewayError::new(ErrorKind::Store, "host clock unavailable"))
@@ -632,13 +663,14 @@ impl Gateway {
                 &json!({"native_binding":binding,"context_policy":self.context_compiler.as_ref().map(|c|c.policy_id())}),
             )?);
         }
+        let mut resumed_batch = None;
         if let Some(hook) = self.continuation.as_mut()
             && let Some(saved) =
                 hook.begin(&mut self.store, &binding, &spec.task_id, &spec.run_id)?
         {
             if saved.schema_version != "melissa.gateway-turn-checkpoint/v1"
                 || saved.binding_digest != binding
-                || saved.phase != crate::continuation::Phase::Safe
+                || !saved.phase.is_safe()
                 || saved.result.task_id != spec.task_id
                 || saved.result.run_id != spec.run_id
                 || saved.selected_model.is_some_and(|i| i >= self.models.len())
@@ -649,6 +681,15 @@ impl Gateway {
                     "continuation mismatch or unresolved in-flight effect",
                 ));
             }
+            if saved.phase == crate::continuation::Phase::BatchReady {
+                let request_id = saved.result.request_ids.last().cloned().ok_or_else(|| {
+                    GatewayError::new(ErrorKind::Store, "tool batch has no owned model request")
+                })?;
+                resumed_batch = Some((
+                    pending_tool_batch(&saved.messages, &saved.seen_calls)?,
+                    request_id,
+                ));
+            }
             messages = saved.messages;
             seen_calls = saved.seen_calls;
             successful = saved.successful;
@@ -656,7 +697,7 @@ impl Gateway {
             result = saved.result;
             next_turn = saved.next_turn;
         }
-        if self.continuation.is_some() {
+        if self.continuation.is_some() && resumed_batch.is_none() {
             self.publish_turn(&crate::continuation::TurnCheckpointView {
                 schema_version: "melissa.gateway-turn-checkpoint/v1",
                 binding_digest: &binding,
@@ -670,102 +711,112 @@ impl Gateway {
             })?;
         }
         for turn in next_turn..self.policy.max_turns {
-            let mut accepted = None;
-            let mut tried = BTreeSet::new();
-            for attempt in 0..self.policy.max_requests {
-                if cancelled.load(Ordering::Acquire)
-                    || combined.load(Ordering::Acquire)
-                    || begin.elapsed().as_millis() >= wall as u128
-                {
-                    result.status = if begin.elapsed().as_millis() >= wall as u128 {
-                        RunStatus::Deadline
-                    } else {
-                        RunStatus::Cancelled
-                    };
-                    return self.complete(result);
+            let (calls, preflight_error, repair, request_id) = if let Some((calls, request_id)) =
+                resumed_batch.take()
+            {
+                for call in &calls {
+                    dispatcher.validate_call(call)?;
                 }
-                if result.request_ids.len() >= self.policy.max_requests as usize {
-                    result.status = RunStatus::RequestLimit;
-                    return self.complete(result);
-                }
-                let mut candidates = if let Some(i) = selected {
-                    vec![i]
-                } else {
-                    routes.clone()
-                };
-                candidates.sort_by_key(|i| tried.contains(i));
-                let mut choice = None;
-                let mut authorized = false;
-                for index in candidates {
-                    let m = &self.models[index];
-                    if !initial
-                        .contract
-                        .allowed_resource_ids
-                        .contains(&m.endpoint.resource_id)
-                        || !initial
-                            .contract
-                            .authorization_refs
-                            .contains(&m.endpoint.authorization_ref)
+                (calls, false, None, request_id)
+            } else {
+                let mut accepted = None;
+                let mut tried = BTreeSet::new();
+                for attempt in 0..self.policy.max_requests {
+                    if cancelled.load(Ordering::Acquire)
+                        || combined.load(Ordering::Acquire)
+                        || begin.elapsed().as_millis() >= wall as u128
                     {
-                        continue;
+                        result.status = if begin.elapsed().as_millis() >= wall as u128 {
+                            RunStatus::Deadline
+                        } else {
+                            RunStatus::Cancelled
+                        };
+                        return self.complete(result);
                     }
-                    authorized = true;
-                    if let Ok(permit) = Arc::clone(&m.slots).try_acquire_owned() {
-                        choice = Some((index, permit));
-                        break;
+                    if result.request_ids.len() >= self.policy.max_requests as usize {
+                        result.status = RunStatus::RequestLimit;
+                        return self.complete(result);
                     }
-                }
-                let Some((index, permit)) = choice else {
-                    result.status = if authorized {
-                        RunStatus::ProviderFailed
+                    let mut candidates = if let Some(i) = selected {
+                        vec![i]
                     } else {
-                        RunStatus::NeedsAuthorization
+                        routes.clone()
                     };
-                    return self.complete(result);
-                };
-                tried.insert(index);
-                let model = self.models[index].clone();
-                let (working_messages, archived) = self
-                    .context_compiler
-                    .as_ref()
-                    .map(|c| c.working_messages(&messages, &spec.task_id, &spec.run_id))
-                    .unwrap_or_else(|| (messages.clone(), vec![]));
-                let advertised = if self.live_tool_projection {
-                    let current = dispatcher.definitions();
-                    definitions
-                        .iter()
-                        .filter(|original| {
-                            current.iter().any(|live| {
-                                live.canonical_id == original.canonical_id
-                                    && live.definition.name == original.definition.name
-                                    && live.definition.parameters == original.definition.parameters
-                                    && live.definition.strict == original.definition.strict
+                    candidates.sort_by_key(|i| tried.contains(i));
+                    let mut choice = None;
+                    let mut authorized = false;
+                    for index in candidates {
+                        let m = &self.models[index];
+                        if !initial
+                            .contract
+                            .allowed_resource_ids
+                            .contains(&m.endpoint.resource_id)
+                            || !initial
+                                .contract
+                                .authorization_refs
+                                .contains(&m.endpoint.authorization_ref)
+                        {
+                            continue;
+                        }
+                        authorized = true;
+                        if let Ok(permit) = Arc::clone(&m.slots).try_acquire_owned() {
+                            choice = Some((index, permit));
+                            break;
+                        }
+                    }
+                    let Some((index, permit)) = choice else {
+                        result.status = if authorized {
+                            RunStatus::ProviderFailed
+                        } else {
+                            RunStatus::NeedsAuthorization
+                        };
+                        return self.complete(result);
+                    };
+                    tried.insert(index);
+                    let model = self.models[index].clone();
+                    let (working_messages, archived) = self
+                        .context_compiler
+                        .as_ref()
+                        .map(|c| c.working_messages(&messages, &spec.task_id, &spec.run_id))
+                        .unwrap_or_else(|| (messages.clone(), vec![]));
+                    let advertised = if self.live_tool_projection {
+                        let current = dispatcher.definitions();
+                        definitions
+                            .iter()
+                            .filter(|original| {
+                                current.iter().any(|live| {
+                                    live.canonical_id == original.canonical_id
+                                        && live.definition.name == original.definition.name
+                                        && live.definition.parameters
+                                            == original.definition.parameters
+                                        && live.definition.strict == original.definition.strict
+                                })
                             })
-                        })
-                        .collect::<Vec<_>>()
-                } else {
-                    definitions.iter().collect::<Vec<_>>()
-                };
-                let mut request = TurnRequest {
-                    model: model.model_id.clone(),
-                    system_prompt: system.clone(),
-                    messages: working_messages,
-                    tools: advertised.iter().map(|v| v.definition.clone()).collect(),
-                    max_output_tokens: spec.max_output_tokens.min(model.max_output_tokens),
-                    output_schema: if typed_schema {
-                        None
+                            .collect::<Vec<_>>()
                     } else {
-                        spec.output_schema.clone()
-                    },
-                };
-                let (wire, context_report) = if let Some(compiler) = &mut self.context_compiler {
-                    if intelligent_context {
-                        let current = self
-                            .store
-                            .journal()
-                            .task(&spec.task_id)
-                            .map_err(store_error)?;
-                        compiler.set_turn_state(crate::context_intelligence::TurnState {
+                        definitions.iter().collect::<Vec<_>>()
+                    };
+                    let mut request = TurnRequest {
+                        model: model.model_id.clone(),
+                        system_prompt: system.clone(),
+                        messages: working_messages,
+                        tools: advertised.iter().map(|v| v.definition.clone()).collect(),
+                        max_output_tokens: spec.max_output_tokens.min(model.max_output_tokens),
+                        output_schema: if typed_schema {
+                            None
+                        } else {
+                            spec.output_schema.clone()
+                        },
+                    };
+                    let (wire, context_report) = if let Some(compiler) = &mut self.context_compiler
+                    {
+                        if intelligent_context {
+                            let current = self
+                                .store
+                                .journal()
+                                .task(&spec.task_id)
+                                .map_err(store_error)?;
+                            compiler.set_turn_state(crate::context_intelligence::TurnState {
                             task_id: spec.task_id.clone(),
                             run_id: spec.run_id.clone(),
                             profile_id: spec.profile_id.clone(),
@@ -782,142 +833,110 @@ impl Gateway {
                             milestone:compiler.milestone(),
                             budget:json!({"limits":current.contract.limits,"spent":self.store.journal().model_budget(&spec.task_id).map_err(store_error)?,"authority":"live host ledger; does not alter model output or reasoning settings"}),
                         });
-                    }
-                    let (wire, report) = compiler.compile(
-                        &mut request,
-                        &self.transport,
-                        &model.endpoint,
-                        model.context_tokens,
-                        &mut self.store,
-                        &spec.task_id,
-                        &spec.run_id,
-                        archived,
-                    )?;
-                    for archived in &report.archived {
-                        if !result.artifact_refs.contains(&archived.artifact_ref) {
-                            result.artifact_refs.push(archived.artifact_ref.clone());
                         }
-                    }
-                    (wire, Some(report))
-                } else {
-                    (
-                        self.transport.request_body(&model.endpoint, &request)?,
-                        None,
-                    )
-                };
-                let request_bytes = encoded(
-                    &json!({"schema_version":"melissa.model-request-envelope/v1","provider_id":model.endpoint.provider_id,"endpoint":model.endpoint.url.as_str(),"protocol":model.endpoint.protocol,"task_id":spec.task_id,"profile_id":spec.profile_id,"pricing_snapshot":model.rate_card,"configured_context_tokens":model.context_tokens,"configured_max_output_tokens":model.max_output_tokens,"configured_max_history_bytes":self.transport.request_limits().max_history_bytes,"capabilities":model.capabilities,"configured_output_mode":if spec.output_schema.is_some(){Some(output_mode)}else{None},"output_capability_evidence":self.output_capabilities.record(&model.registration_id),"context_report":context_report,"body":wire}),
-                )?;
-                let request_id = format!("model:{}:{}", spec.run_id, result.request_ids.len() + 1);
-                let task = self
-                    .store
-                    .journal()
-                    .task(&spec.task_id)
-                    .map_err(store_error)?;
-                // Only an exact host-registered native tokenizer can reduce
-                // the reservation. UTF-8 units are not a provider billing proof.
-                let reserved_input = context_report
-                    .as_ref()
-                    .and_then(|r| r.exact_token_count)
-                    .unwrap_or(model.context_tokens);
-                let reserved_output = request.max_output_tokens;
-                let budget = self
-                    .store
-                    .journal()
-                    .model_budget(&spec.task_id)
-                    .map_err(store_error)?;
-                let cost = if let Some(card) = &model.rate_card {
-                    card.upper_bound(reserved_input, reserved_output)?
-                } else {
-                    let remaining = task
-                        .contract
-                        .limits
-                        .max_cost_micro_usd
-                        .saturating_sub(budget.charged_cost_micro_usd);
-                    // The ledger rejects a zero-cost unpriced reservation as
-                    // Invalid, not Quota; an exhausted budget must stop here.
-                    if remaining == 0 {
-                        result.status = RunStatus::BudgetExhausted;
-                        return self.complete(result);
-                    }
-                    remaining
-                };
-                let reservation = ModelReservation {
-                    schema_version: "melissa.model-reservation/v1".into(),
-                    request_id: request_id.clone(),
-                    task_id: spec.task_id.clone(),
-                    profile_id: spec.profile_id.clone(),
-                    provider_id: model.endpoint.provider_id.clone(),
-                    model_id: model.model_id.clone(),
-                    request_digest: digest(&request_bytes),
-                    pricing_digest: model.rate_card.as_ref().map(|v| v.digest()),
-                    reserved_input_tokens: reserved_input,
-                    reserved_output_tokens: reserved_output,
-                    reserved_cost_micro_usd: cost,
-                    created_at_unix_ms: now()?,
-                };
-                let record = match self
-                    .store
-                    .journal_mut()
-                    .reserve_model_request_with_provider_limit(
-                        &reservation,
-                        task.record.version,
-                        model.max_concurrency,
-                    ) {
-                    Ok(v) => v,
-                    Err(melissa_local_store::StoreError::Quota(_)) => {
-                        result.status = RunStatus::BudgetExhausted;
-                        return self.complete(result);
-                    }
-                    Err(e) => return Err(store_error(e)),
-                };
-                let prep = self.artifact(
-                    &spec.task_id,
-                    &format!("{request_id}:request"),
-                    "model.request",
-                    &request_bytes,
-                    &mut result.artifact_refs,
-                );
-                if let Err(error) = prep {
-                    let proof = digest(&encoded(
-                        &json!({"request_id":request_id,"never_dispatched":true,"reason":"request evidence failed before dispatch"}),
-                    )?);
-                    let _ = self.store.journal_mut().finish_model_request(
-                        &request_id,
-                        record.version,
-                        &ModelSettlement {
-                            state: ModelRequestState::NeverDispatched,
-                            usage: ModelUsage {
-                                input_tokens: Some(0),
-                                output_tokens: Some(0),
-                                cached_input_tokens: Some(0),
-                                cost_micro_usd: Some(0),
-                            },
-                            receipt_digest: Some(proof),
-                            reason: Some("host never dispatched request".into()),
-                            completed_at_unix_ms: now()?,
-                        },
-                    );
-                    return Err(error);
-                }
-                // Synchronous CAS/SQLite work above may consume the remaining
-                // deadline without yielding to the async watcher.
-                let deadline_expired = begin.elapsed().as_millis() >= wall as u128
-                    || now()? >= self.policy.expires_at_unix_ms;
-                if cancelled.load(Ordering::Acquire)
-                    || combined.load(Ordering::Acquire)
-                    || deadline_expired
-                {
-                    let proof = self.artifact(
-                        &spec.task_id,
-                        &format!("{request_id}:not-sent"),
-                        "model.never_dispatched",
-                        &encoded(&json!({"request_id":request_id,"never_dispatched":true,"reason":"cancelled_or_expired_before_dispatch"}))?,
-                        &mut result.artifact_refs,
+                        let (wire, report) = compiler.compile(
+                            &mut request,
+                            &self.transport,
+                            &model.endpoint,
+                            model.context_tokens,
+                            &mut self.store,
+                            &spec.task_id,
+                            &spec.run_id,
+                            archived,
+                        )?;
+                        for archived in &report.archived {
+                            if !result.artifact_refs.contains(&archived.artifact_ref) {
+                                result.artifact_refs.push(archived.artifact_ref.clone());
+                            }
+                        }
+                        (wire, Some(report))
+                    } else {
+                        (
+                            self.transport.request_body(&model.endpoint, &request)?,
+                            None,
+                        )
+                    };
+                    let request_bytes = encoded(
+                        &json!({"schema_version":"melissa.model-request-envelope/v1","provider_id":model.endpoint.provider_id,"endpoint":model.endpoint.url.as_str(),"protocol":model.endpoint.protocol,"task_id":spec.task_id,"profile_id":spec.profile_id,"pricing_snapshot":model.rate_card,"configured_context_tokens":model.context_tokens,"configured_max_output_tokens":model.max_output_tokens,"configured_max_history_bytes":self.transport.request_limits().max_history_bytes,"capabilities":model.capabilities,"configured_output_mode":if spec.output_schema.is_some(){Some(output_mode)}else{None},"output_capability_evidence":self.output_capabilities.record(&model.registration_id),"context_report":context_report,"body":wire}),
                     )?;
-                    self.store
+                    let request_id =
+                        format!("model:{}:{}", spec.run_id, result.request_ids.len() + 1);
+                    let task = self
+                        .store
+                        .journal()
+                        .task(&spec.task_id)
+                        .map_err(store_error)?;
+                    // Only an exact host-registered native tokenizer can reduce
+                    // the reservation. UTF-8 units are not a provider billing proof.
+                    let reserved_input = context_report
+                        .as_ref()
+                        .and_then(|r| r.exact_token_count)
+                        .unwrap_or(model.context_tokens);
+                    let reserved_output = request.max_output_tokens;
+                    let budget = self
+                        .store
+                        .journal()
+                        .model_budget(&spec.task_id)
+                        .map_err(store_error)?;
+                    let cost = if let Some(card) = &model.rate_card {
+                        card.upper_bound(reserved_input, reserved_output)?
+                    } else {
+                        let remaining = task
+                            .contract
+                            .limits
+                            .max_cost_micro_usd
+                            .saturating_sub(budget.charged_cost_micro_usd);
+                        // The ledger rejects a zero-cost unpriced reservation as
+                        // Invalid, not Quota; an exhausted budget must stop here.
+                        if remaining == 0 {
+                            result.status = RunStatus::BudgetExhausted;
+                            return self.complete(result);
+                        }
+                        remaining
+                    };
+                    let reservation = ModelReservation {
+                        schema_version: "melissa.model-reservation/v1".into(),
+                        request_id: request_id.clone(),
+                        task_id: spec.task_id.clone(),
+                        profile_id: spec.profile_id.clone(),
+                        provider_id: model.endpoint.provider_id.clone(),
+                        model_id: model.model_id.clone(),
+                        request_digest: digest(&request_bytes),
+                        pricing_digest: model.rate_card.as_ref().map(|v| v.digest()),
+                        reserved_input_tokens: reserved_input,
+                        reserved_output_tokens: reserved_output,
+                        reserved_cost_micro_usd: cost,
+                        created_at_unix_ms: now()?,
+                    };
+                    let record = match self
+                        .store
                         .journal_mut()
-                        .finish_model_request(
+                        .reserve_model_request_with_provider_limit(
+                            &reservation,
+                            task.record.version,
+                            model.max_concurrency,
+                        ) {
+                        Ok(v) => v,
+                        Err(melissa_local_store::StoreError::Quota(_)) => {
+                            result.status = RunStatus::BudgetExhausted;
+                            return self.complete(result);
+                        }
+                        Err(e) => return Err(store_error(e)),
+                    };
+                    let request_evidence_started = std::time::Instant::now();
+                    let prep = self.artifact(
+                        &spec.task_id,
+                        &format!("{request_id}:request"),
+                        "model.request",
+                        &request_bytes,
+                        &mut result.artifact_refs,
+                    );
+                    let request_evidence_elapsed = request_evidence_started.elapsed();
+                    if let Err(error) = prep {
+                        let proof = digest(&encoded(
+                            &json!({"request_id":request_id,"never_dispatched":true,"reason":"request evidence failed before dispatch"}),
+                        )?);
+                        let _ = self.store.journal_mut().finish_model_request(
                             &request_id,
                             record.version,
                             &ModelSettlement {
@@ -929,476 +948,512 @@ impl Gateway {
                                     cost_micro_usd: Some(0),
                                 },
                                 receipt_digest: Some(proof),
-                                reason: Some("host stopped before dispatch".into()),
+                                reason: Some("host never dispatched request".into()),
                                 completed_at_unix_ms: now()?,
                             },
-                        )
+                        );
+                        return Err(error);
+                    }
+                    // Synchronous CAS/SQLite work above may consume the remaining
+                    // deadline without yielding to the async watcher.
+                    let deadline_expired = begin.elapsed().as_millis() >= wall as u128
+                        || now()? >= self.policy.expires_at_unix_ms;
+                    if cancelled.load(Ordering::Acquire)
+                        || combined.load(Ordering::Acquire)
+                        || deadline_expired
+                    {
+                        let proof = self.artifact(
+                        &spec.task_id,
+                        &format!("{request_id}:not-sent"),
+                        "model.never_dispatched",
+                        &encoded(&json!({"request_id":request_id,"never_dispatched":true,"reason":"cancelled_or_expired_before_dispatch"}))?,
+                        &mut result.artifact_refs,
+                    )?;
+                        self.store
+                            .journal_mut()
+                            .finish_model_request(
+                                &request_id,
+                                record.version,
+                                &ModelSettlement {
+                                    state: ModelRequestState::NeverDispatched,
+                                    usage: ModelUsage {
+                                        input_tokens: Some(0),
+                                        output_tokens: Some(0),
+                                        cached_input_tokens: Some(0),
+                                        cost_micro_usd: Some(0),
+                                    },
+                                    receipt_digest: Some(proof),
+                                    reason: Some("host stopped before dispatch".into()),
+                                    completed_at_unix_ms: now()?,
+                                },
+                            )
+                            .map_err(store_error)?;
+                        result.request_ids.push(request_id);
+                        result.status = if deadline_expired {
+                            RunStatus::Deadline
+                        } else {
+                            RunStatus::Cancelled
+                        };
+                        return self.complete(result);
+                    }
+                    // Wire validation, local evidence preparation and admission have
+                    // succeeded. Only the actual dispatch boundary makes resume unsafe.
+                    if self.continuation.is_some()
+                        && let Err(error) =
+                            self.publish_turn(&crate::continuation::TurnCheckpointView {
+                                schema_version: "melissa.gateway-turn-checkpoint/v1",
+                                binding_digest: &binding,
+                                phase: crate::continuation::Phase::InferencePending,
+                                next_turn: turn,
+                                messages: &messages,
+                                seen_calls: &seen_calls,
+                                successful: &successful,
+                                selected_model: selected,
+                                result: &result,
+                            })
+                    {
+                        self.store
+                            .journal_mut()
+                            .finish_model_request(
+                                &request_id,
+                                record.version,
+                                &ModelSettlement {
+                                    state: ModelRequestState::NeverDispatched,
+                                    usage: ModelUsage {
+                                        input_tokens: Some(0),
+                                        output_tokens: Some(0),
+                                        cached_input_tokens: Some(0),
+                                        cost_micro_usd: Some(0),
+                                    },
+                                    receipt_digest: Some(digest(
+                                        b"checkpoint failed before transport dispatch",
+                                    )),
+                                    reason: Some("host never dispatched request".into()),
+                                    completed_at_unix_ms: now()?,
+                                },
+                            )
+                            .map_err(store_error)?;
+                        return Err(error);
+                    }
+                    let record = self
+                        .store
+                        .journal_mut()
+                        .dispatch_model_request(&request_id, record.version, now()?)
                         .map_err(store_error)?;
-                    result.request_ids.push(request_id);
-                    result.status = if deadline_expired {
-                        RunStatus::Deadline
-                    } else {
-                        RunStatus::Cancelled
+                    result.request_ids.push(request_id.clone());
+                    let remaining_wall = wall
+                        .saturating_sub(begin.elapsed().as_millis().min(u64::MAX as u128) as u64);
+                    let host_deadline_limited = remaining_wall <= model.timeout_ms;
+                    let timeout = model.timeout_ms.min(remaining_wall);
+                    if timeout == 0
+                        || cancelled.load(Ordering::Acquire)
+                        || now()? >= self.policy.expires_at_unix_ms
+                    {
+                        combined.store(true, Ordering::Release);
+                    }
+                    let outcome = self
+                        .transport
+                        .generate(
+                            &model.endpoint,
+                            &request,
+                            timeout,
+                            self.policy.decoder_limits,
+                            Arc::clone(&combined),
+                        )
+                        .await;
+                    let evidence = (|| -> Result<String> {
+                        let response_evidence_started = std::time::Instant::now();
+                        let raw = self.artifact(
+                            &spec.task_id,
+                            &format!("{request_id}:raw-sse"),
+                            "model.raw_sse",
+                            &outcome.raw_sse,
+                            &mut result.artifact_refs,
+                        )?;
+                        let response = outcome.response.as_ref().map(encoded).transpose()?;
+                        if let Some(bytes) = response {
+                            self.artifact(
+                                &spec.task_id,
+                                &format!("{request_id}:response"),
+                                "model.response",
+                                &bytes,
+                                &mut result.artifact_refs,
+                            )?;
+                        }
+                        let evidence_write_us = request_evidence_elapsed
+                            .saturating_add(response_evidence_started.elapsed())
+                            .as_micros()
+                            .min(u64::MAX as u128)
+                            as u64;
+                        self.artifact(&spec.task_id,&format!("{request_id}:receipt"),"model.receipt",&encoded(&json!({"schema_version":"melissa.model-receipt/v1","request_id":request_id,"request_digest":reservation.request_digest,"provider_id":model.endpoint.provider_id,"requested_model":model.model_id,"served_model":outcome.response.as_ref().map(|r|&r.model),"delivery":outcome.delivery,"http_status":outcome.http_status,"provider_request_id":outcome.provider_request_id,"elapsed_ms":outcome.elapsed_ms,"response_bytes":outcome.response_bytes,"raw_sse_digest":raw,"accepted_complete":outcome.response.is_some(),"error_kind":outcome.error.as_ref().map(|e|e.kind),"usage":outcome.response.as_ref().map(|r|r.usage),"model_evidence_write_us":evidence_write_us,"cost_basis":"host_rate_card_conservative_accounting_not_invoice","task_accepted":false}))?,&mut result.artifact_refs)
+                    })();
+                    let receipt = match evidence {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = self.store.journal_mut().mark_model_request_unknown(
+                                &request_id,
+                                record.version,
+                                "response evidence could not be committed",
+                                now()?,
+                            );
+                            self.unknown_permits.insert(request_id, permit);
+                            return Err(e);
+                        }
                     };
-                    return self.complete(result);
-                }
-                // Wire validation, local evidence preparation and admission have
-                // succeeded. Only the actual dispatch boundary makes resume unsafe.
-                if self.continuation.is_some()
-                    && let Err(error) =
-                        self.publish_turn(&crate::continuation::TurnCheckpointView {
-                            schema_version: "melissa.gateway-turn-checkpoint/v1",
-                            binding_digest: &binding,
-                            phase: crate::continuation::Phase::InferencePending,
-                            next_turn: turn,
-                            messages: &messages,
-                            seen_calls: &seen_calls,
-                            successful: &successful,
-                            selected_model: selected,
-                            result: &result,
-                        })
-                {
+                    let usage = outcome
+                        .response
+                        .as_ref()
+                        .map(|r| r.usage)
+                        .unwrap_or_default();
+                    let not_sent =
+                        outcome.response.is_none() && outcome.delivery == Delivery::NotSent;
+                    let accounted = if not_sent {
+                        ModelUsage {
+                            input_tokens: Some(0),
+                            output_tokens: Some(0),
+                            cached_input_tokens: Some(0),
+                            cost_micro_usd: Some(0),
+                        }
+                    } else {
+                        ModelUsage {
+                            input_tokens: usage.input_tokens,
+                            output_tokens: usage.output_tokens,
+                            cached_input_tokens: usage.cached_input_tokens,
+                            cost_micro_usd: if let Some(card) = &model.rate_card {
+                                card.usage_upper_bound(&usage)?
+                            } else {
+                                None
+                            },
+                        }
+                    };
+                    let state = if outcome.response.is_some() {
+                        ModelRequestState::Succeeded
+                    } else if not_sent {
+                        ModelRequestState::Failed
+                    } else {
+                        ModelRequestState::OutcomeUnknown
+                    };
                     self.store
                         .journal_mut()
                         .finish_model_request(
                             &request_id,
                             record.version,
                             &ModelSettlement {
-                                state: ModelRequestState::NeverDispatched,
-                                usage: ModelUsage {
-                                    input_tokens: Some(0),
-                                    output_tokens: Some(0),
-                                    cached_input_tokens: Some(0),
-                                    cost_micro_usd: Some(0),
-                                },
-                                receipt_digest: Some(digest(
-                                    b"checkpoint failed before transport dispatch",
-                                )),
-                                reason: Some("host never dispatched request".into()),
+                                state,
+                                usage: accounted,
+                                receipt_digest: Some(receipt),
+                                reason: outcome.error.as_ref().map(|e| {
+                                    format!(
+                                        "{:?}; delivery {:?}; {}",
+                                        e.kind,
+                                        outcome.delivery,
+                                        if not_sent {
+                                            "host proves no request sent; known zero usage"
+                                        } else {
+                                            "unknown usage retains reservation"
+                                        }
+                                    )
+                                }),
                                 completed_at_unix_ms: now()?,
                             },
                         )
                         .map_err(store_error)?;
-                    return Err(error);
-                }
-                let record = self
-                    .store
-                    .journal_mut()
-                    .dispatch_model_request(&request_id, record.version, now()?)
-                    .map_err(store_error)?;
-                result.request_ids.push(request_id.clone());
-                let remaining_wall =
-                    wall.saturating_sub(begin.elapsed().as_millis().min(u64::MAX as u128) as u64);
-                let host_deadline_limited = remaining_wall <= model.timeout_ms;
-                let timeout = model.timeout_ms.min(remaining_wall);
-                if timeout == 0
-                    || cancelled.load(Ordering::Acquire)
-                    || now()? >= self.policy.expires_at_unix_ms
-                {
-                    combined.store(true, Ordering::Release);
-                }
-                let outcome = self
-                    .transport
-                    .generate(
-                        &model.endpoint,
-                        &request,
-                        timeout,
-                        self.policy.decoder_limits,
-                        Arc::clone(&combined),
-                    )
-                    .await;
-                let evidence = (|| -> Result<String> {
-                    let raw = self.artifact(
-                        &spec.task_id,
-                        &format!("{request_id}:raw-sse"),
-                        "model.raw_sse",
-                        &outcome.raw_sse,
-                        &mut result.artifact_refs,
-                    )?;
-                    let response = outcome.response.as_ref().map(encoded).transpose()?;
-                    if let Some(bytes) = response {
-                        self.artifact(
-                            &spec.task_id,
-                            &format!("{request_id}:response"),
-                            "model.response",
-                            &bytes,
-                            &mut result.artifact_refs,
-                        )?;
+                    if state == ModelRequestState::OutcomeUnknown {
+                        result.requires_reconciliation = true;
+                        self.unknown_permits.insert(request_id.clone(), permit);
+                    } else {
+                        drop(permit);
                     }
-                    self.artifact(&spec.task_id,&format!("{request_id}:receipt"),"model.receipt",&encoded(&json!({"schema_version":"melissa.model-receipt/v1","request_id":request_id,"request_digest":reservation.request_digest,"provider_id":model.endpoint.provider_id,"requested_model":model.model_id,"served_model":outcome.response.as_ref().map(|r|&r.model),"delivery":outcome.delivery,"http_status":outcome.http_status,"provider_request_id":outcome.provider_request_id,"elapsed_ms":outcome.elapsed_ms,"response_bytes":outcome.response_bytes,"raw_sse_digest":raw,"accepted_complete":outcome.response.is_some(),"error_kind":outcome.error.as_ref().map(|e|e.kind),"usage":outcome.response.as_ref().map(|r|r.usage),"cost_basis":"host_rate_card_conservative_accounting_not_invoice","task_accepted":false}))?,&mut result.artifact_refs)
-                })();
-                let receipt = match evidence {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let _ = self.store.journal_mut().mark_model_request_unknown(
-                            &request_id,
-                            record.version,
-                            "response evidence could not be committed",
-                            now()?,
-                        );
-                        self.unknown_permits.insert(request_id, permit);
-                        return Err(e);
-                    }
-                };
-                let usage = outcome
-                    .response
-                    .as_ref()
-                    .map(|r| r.usage)
-                    .unwrap_or_default();
-                let not_sent = outcome.response.is_none() && outcome.delivery == Delivery::NotSent;
-                let accounted = if not_sent {
-                    ModelUsage {
-                        input_tokens: Some(0),
-                        output_tokens: Some(0),
-                        cached_input_tokens: Some(0),
-                        cost_micro_usd: Some(0),
-                    }
-                } else {
-                    ModelUsage {
-                        input_tokens: usage.input_tokens,
-                        output_tokens: usage.output_tokens,
-                        cached_input_tokens: usage.cached_input_tokens,
-                        cost_micro_usd: if let Some(card) = &model.rate_card {
-                            card.usage_upper_bound(&usage)?
-                        } else {
-                            None
-                        },
-                    }
-                };
-                let state = if outcome.response.is_some() {
-                    ModelRequestState::Succeeded
-                } else if not_sent {
-                    ModelRequestState::Failed
-                } else {
-                    ModelRequestState::OutcomeUnknown
-                };
-                self.store
-                    .journal_mut()
-                    .finish_model_request(
-                        &request_id,
-                        record.version,
-                        &ModelSettlement {
-                            state,
-                            usage: accounted,
-                            receipt_digest: Some(receipt),
-                            reason: outcome.error.as_ref().map(|e| {
-                                format!(
-                                    "{:?}; delivery {:?}; {}",
-                                    e.kind,
-                                    outcome.delivery,
-                                    if not_sent {
-                                        "host proves no request sent; known zero usage"
-                                    } else {
-                                        "unknown usage retains reservation"
-                                    }
-                                )
-                            }),
-                            completed_at_unix_ms: now()?,
-                        },
-                    )
-                    .map_err(store_error)?;
-                if state == ModelRequestState::OutcomeUnknown {
-                    result.requires_reconciliation = true;
-                    self.unknown_permits.insert(request_id.clone(), permit);
-                } else {
-                    drop(permit);
-                }
-                if self
-                    .store
-                    .journal()
-                    .model_budget(&spec.task_id)
-                    .map_err(store_error)?
-                    .budget_exceeded
-                {
-                    result.status = RunStatus::BudgetExhausted;
-                    return self.complete(result);
-                }
-                if let Some(response) = outcome.response {
-                    selected = Some(index);
-                    accepted = Some((response, request_id, advertised));
-                    break;
-                }
-                let kind = outcome
-                    .error
-                    .as_ref()
-                    .map(|e| e.kind)
-                    .unwrap_or(ErrorKind::Protocol);
-                if kind == ErrorKind::Refused {
-                    result.status = RunStatus::Refused;
-                    return self.complete(result);
-                }
-                if kind == ErrorKind::Cancelled
-                    || kind == ErrorKind::Timeout
-                        && (host_deadline_limited || combined.load(Ordering::Acquire))
-                {
-                    result.status = if (kind == ErrorKind::Timeout && host_deadline_limited)
-                        || begin.elapsed().as_millis() >= wall as u128
+                    if self
+                        .store
+                        .journal()
+                        .model_budget(&spec.task_id)
+                        .map_err(store_error)?
+                        .budget_exceeded
                     {
+                        result.status = RunStatus::BudgetExhausted;
+                        return self.complete(result);
+                    }
+                    if let Some(response) = outcome.response {
+                        selected = Some(index);
+                        accepted = Some((response, request_id, advertised));
+                        break;
+                    }
+                    let kind = outcome
+                        .error
+                        .as_ref()
+                        .map(|e| e.kind)
+                        .unwrap_or(ErrorKind::Protocol);
+                    if kind == ErrorKind::Refused {
+                        result.status = RunStatus::Refused;
+                        return self.complete(result);
+                    }
+                    if kind == ErrorKind::Cancelled
+                        || kind == ErrorKind::Timeout
+                            && (host_deadline_limited || combined.load(Ordering::Acquire))
+                    {
+                        result.status = if (kind == ErrorKind::Timeout && host_deadline_limited)
+                            || begin.elapsed().as_millis() >= wall as u128
+                        {
+                            RunStatus::Deadline
+                        } else {
+                            RunStatus::Cancelled
+                        };
+                        return self.complete(result);
+                    }
+                    let mut recovery_retry = false;
+                    if self.recovery.is_some()
+                        && matches!(
+                            kind,
+                            ErrorKind::Timeout
+                                | ErrorKind::Transport
+                                | ErrorKind::RateLimited
+                                | ErrorKind::ProviderUnavailable
+                        )
+                    {
+                        if let Some(repair) =
+                            self.recovery_failure(crate::recovery::RecoveryEvent {
+                                task: spec.task_id.clone(),
+                                run: spec.run_id.clone(),
+                                request: request_id.clone(),
+                                kind: if not_sent {
+                                    crate::recovery::FailureKind::ProviderTimeout
+                                } else {
+                                    crate::recovery::FailureKind::UnknownEffect
+                                },
+                                calls: vec![],
+                                diagnostic: format!(
+                                    "{kind:?}; delivery {:?}; not_sent={not_sent}",
+                                    outcome.delivery
+                                ),
+                                evidence: result.artifact_refs.clone(),
+                            })?
+                        {
+                            recovery_retry = not_sent && repair.continue_run;
+                        }
+                        if !not_sent {
+                            result.status = RunStatus::NeedsReconciliation;
+                            return self.complete(result);
+                        }
+                    }
+                    let retry = recovery_retry
+                        || matches!(
+                            kind,
+                            ErrorKind::Timeout
+                                | ErrorKind::Transport
+                                | ErrorKind::RateLimited
+                                | ErrorKind::ProviderUnavailable
+                        ) && self.policy.allow_fallback;
+                    if !retry || attempt + 1 >= self.policy.max_requests {
+                        result.status = RunStatus::ProviderFailed;
+                        return self.complete(result);
+                    }
+                    let delay = outcome
+                        .retry_after_ms
+                        .unwrap_or(10u64.saturating_mul(1u64 << attempt.min(12)))
+                        .min(self.policy.max_backoff_ms);
+                    tokio::select! {_=tokio::time::sleep(Duration::from_millis(delay))=>{},_=crate::transport::wait_cancelled(&combined)=>{}}
+                }
+                let Some((response, request_id, advertised)) = accepted else {
+                    result.status = RunStatus::ProviderFailed;
+                    return self.complete(result);
+                };
+                if cancelled.load(Ordering::Acquire)
+                    || combined.load(Ordering::Acquire)
+                    || begin.elapsed().as_millis() >= wall as u128
+                {
+                    result.status = if begin.elapsed().as_millis() >= wall as u128 {
                         RunStatus::Deadline
                     } else {
                         RunStatus::Cancelled
                     };
                     return self.complete(result);
                 }
-                let mut recovery_retry = false;
-                if self.recovery.is_some()
-                    && matches!(
-                        kind,
-                        ErrorKind::Timeout
-                            | ErrorKind::Transport
-                            | ErrorKind::RateLimited
-                            | ErrorKind::ProviderUnavailable
-                    )
-                {
-                    if let Some(repair) = self.recovery_failure(crate::recovery::RecoveryEvent {
-                        task: spec.task_id.clone(),
-                        run: spec.run_id.clone(),
-                        request: request_id.clone(),
-                        kind: if not_sent {
-                            crate::recovery::FailureKind::ProviderTimeout
-                        } else {
-                            crate::recovery::FailureKind::UnknownEffect
-                        },
-                        calls: vec![],
-                        diagnostic: format!(
-                            "{kind:?}; delivery {:?}; not_sent={not_sent}",
-                            outcome.delivery
-                        ),
-                        evidence: result.artifact_refs.clone(),
-                    })? {
-                        recovery_retry = not_sent && repair.continue_run;
-                    }
-                    if !not_sent {
-                        result.status = RunStatus::NeedsReconciliation;
+                let current = self
+                    .store
+                    .journal()
+                    .task(&spec.task_id)
+                    .map_err(store_error)?;
+                if !matches!(
+                    current.record.state,
+                    TaskState::Running | TaskState::Repairing | TaskState::Verifying
+                ) {
+                    result.status = RunStatus::Cancelled;
+                    return self.complete(result);
+                }
+                match response.stop {
+                    StopReason::Refusal => {
+                        result.status = RunStatus::Refused;
                         return self.complete(result);
                     }
-                }
-                let retry = recovery_retry
-                    || matches!(
-                        kind,
-                        ErrorKind::Timeout
-                            | ErrorKind::Transport
-                            | ErrorKind::RateLimited
-                            | ErrorKind::ProviderUnavailable
-                    ) && self.policy.allow_fallback;
-                if !retry || attempt + 1 >= self.policy.max_requests {
-                    result.status = RunStatus::ProviderFailed;
-                    return self.complete(result);
-                }
-                let delay = outcome
-                    .retry_after_ms
-                    .unwrap_or(10u64.saturating_mul(1u64 << attempt.min(12)))
-                    .min(self.policy.max_backoff_ms);
-                tokio::select! {_=tokio::time::sleep(Duration::from_millis(delay))=>{},_=crate::transport::wait_cancelled(&combined)=>{}}
-            }
-            let Some((response, request_id, advertised)) = accepted else {
-                result.status = RunStatus::ProviderFailed;
-                return self.complete(result);
-            };
-            if cancelled.load(Ordering::Acquire)
-                || combined.load(Ordering::Acquire)
-                || begin.elapsed().as_millis() >= wall as u128
-            {
-                result.status = if begin.elapsed().as_millis() >= wall as u128 {
-                    RunStatus::Deadline
-                } else {
-                    RunStatus::Cancelled
-                };
-                return self.complete(result);
-            }
-            let current = self
-                .store
-                .journal()
-                .task(&spec.task_id)
-                .map_err(store_error)?;
-            if !matches!(
-                current.record.state,
-                TaskState::Running | TaskState::Repairing | TaskState::Verifying
-            ) {
-                result.status = RunStatus::Cancelled;
-                return self.complete(result);
-            }
-            match response.stop {
-                StopReason::Refusal => {
-                    result.status = RunStatus::Refused;
-                    return self.complete(result);
-                }
-                StopReason::EndTurn => {
-                    if self.recovery.is_some() {
-                        let invalid = self.candidate_submission_tool.is_some()
-                            || !spec.required_tool_names.is_subset(&successful)
-                            || response.text.trim().is_empty()
-                            || spec.output_schema.as_ref().is_some_and(|schema| {
-                                crate::schema::validate_output_with_limit(
-                                    schema,
-                                    &response.text,
-                                    self.policy.decoder_limits.max_output_bytes,
-                                )
-                                .is_err()
-                            });
-                        if invalid {
-                            let repair = self.recovery_failure(crate::recovery::RecoveryEvent {
+                    StopReason::EndTurn => {
+                        if self.recovery.is_some() {
+                            let invalid = self.candidate_submission_tool.is_some()
+                                || !spec.required_tool_names.is_subset(&successful)
+                                || response.text.trim().is_empty()
+                                || spec.output_schema.as_ref().is_some_and(|schema| {
+                                    crate::schema::validate_output_with_limit(
+                                        schema,
+                                        &response.text,
+                                        self.policy.decoder_limits.max_output_bytes,
+                                    )
+                                    .is_err()
+                                });
+                            if invalid {
+                                let repair = self.recovery_failure(crate::recovery::RecoveryEvent {
                                 task: spec.task_id.clone(), run: spec.run_id.clone(), request: request_id.clone(), kind: crate::recovery::FailureKind::InvalidOutput,
                                 calls: vec![], diagnostic: "Candidate fails unchanged final schema, required successful tools, or typed-submission contract. Original raw response is preserved; no host repair occurred.".into(), evidence: result.artifact_refs.clone(),
                             })?.expect("enabled recovery hook");
-                            if !repair.continue_run {
-                                result.status = RunStatus::InvalidOutput;
-                                return self.complete(result);
+                                if !repair.continue_run {
+                                    result.status = RunStatus::InvalidOutput;
+                                    return self.complete(result);
+                                }
+                                messages.push(Message::Assistant { response });
+                                messages.push(Message::User {
+                                    text: repair.feedback,
+                                });
+                                if self.continuation.is_some() {
+                                    self.publish_turn(&crate::continuation::TurnCheckpointView {
+                                        schema_version: "melissa.gateway-turn-checkpoint/v1",
+                                        binding_digest: &binding,
+                                        phase: crate::continuation::Phase::Safe,
+                                        next_turn: turn + 1,
+                                        messages: &messages,
+                                        seen_calls: &seen_calls,
+                                        successful: &successful,
+                                        selected_model: selected,
+                                        result: &result,
+                                    })?;
+                                }
+                                continue;
                             }
-                            messages.push(Message::Assistant { response });
-                            messages.push(Message::User {
-                                text: repair.feedback,
-                            });
-                            if self.continuation.is_some() {
-                                self.publish_turn(&crate::continuation::TurnCheckpointView {
-                                    schema_version: "melissa.gateway-turn-checkpoint/v1",
-                                    binding_digest: &binding,
-                                    phase: crate::continuation::Phase::Safe,
-                                    next_turn: turn + 1,
-                                    messages: &messages,
-                                    seen_calls: &seen_calls,
-                                    successful: &successful,
-                                    selected_model: selected,
-                                    result: &result,
-                                })?;
-                            }
-                            continue;
                         }
-                    }
-                    if self.candidate_submission_tool.is_some() {
-                        result.status = RunStatus::NoAction;
+                        if self.candidate_submission_tool.is_some() {
+                            result.status = RunStatus::NoAction;
+                            return self.complete(result);
+                        }
+                        if !spec.required_tool_names.is_subset(&successful) {
+                            result.status = RunStatus::NoAction;
+                            return self.complete(result);
+                        }
+                        if response.text.trim().is_empty() {
+                            result.status = RunStatus::NoAction;
+                            return self.complete(result);
+                        }
+                        if let Some(schema) = &spec.output_schema
+                            && crate::schema::validate_output_with_limit(
+                                schema,
+                                &response.text,
+                                self.policy.decoder_limits.max_output_bytes,
+                            )
+                            .is_err()
+                        {
+                            result.status = RunStatus::InvalidOutput;
+                            return self.complete(result);
+                        }
+                        result.status = RunStatus::FinalCandidate;
+                        result.answer = Some(response.text);
                         return self.complete(result);
                     }
-                    if !spec.required_tool_names.is_subset(&successful) {
-                        result.status = RunStatus::NoAction;
-                        return self.complete(result);
-                    }
-                    if response.text.trim().is_empty() {
-                        result.status = RunStatus::NoAction;
-                        return self.complete(result);
-                    }
-                    if let Some(schema) = &spec.output_schema
-                        && crate::schema::validate_output_with_limit(
-                            schema,
-                            &response.text,
-                            self.policy.decoder_limits.max_output_bytes,
-                        )
-                        .is_err()
-                    {
+                    StopReason::ToolCalls => {}
+                    _ => {
                         result.status = RunStatus::InvalidOutput;
                         return self.complete(result);
                     }
-                    result.status = RunStatus::FinalCandidate;
-                    result.answer = Some(response.text);
-                    return self.complete(result);
                 }
-                StopReason::ToolCalls => {}
-                _ => {
+                if response.calls.is_empty() {
                     result.status = RunStatus::InvalidOutput;
                     return self.complete(result);
                 }
-            }
-            if response.calls.is_empty() {
-                result.status = RunStatus::InvalidOutput;
-                return self.complete(result);
-            }
-            if result.tool_calls as usize + response.calls.len() > self.policy.max_tools as usize {
-                result.status = RunStatus::ToolLimit;
-                return self.complete(result);
-            }
-            let mut preflight_error = false;
-            let mut preflight_diagnostics = Vec::new();
-            let mut authority_denied = false;
-            for call in &response.calls {
-                if self.recovery.is_some() {
-                    if let Some(definition) =
-                        advertised.iter().find(|d| d.definition.name == call.name)
-                    {
-                        if let Err(e) = crate::schema::validate_output(
-                            &definition.definition.parameters,
-                            &call.arguments,
-                        ) {
-                            preflight_diagnostics.push(format!("{}: {}", call.name, e));
-                        } else if let Err(e) = dispatcher.validate_call(call) {
-                            authority_denied |= e.kind == ErrorKind::Authorization;
-                            preflight_diagnostics.push(format!("{}: {}", call.name, e));
+                if result.tool_calls as usize + response.calls.len()
+                    > self.policy.max_tools as usize
+                {
+                    result.status = RunStatus::ToolLimit;
+                    return self.complete(result);
+                }
+                let mut preflight_error = false;
+                let mut preflight_diagnostics = Vec::new();
+                let mut authority_denied = false;
+                for call in &response.calls {
+                    if self.recovery.is_some() {
+                        if let Some(definition) =
+                            advertised.iter().find(|d| d.definition.name == call.name)
+                        {
+                            if let Err(e) = crate::schema::validate_output(
+                                &definition.definition.parameters,
+                                &call.arguments,
+                            ) {
+                                preflight_diagnostics.push(format!("{}: {}", call.name, e));
+                            } else if let Err(e) = dispatcher.validate_call(call) {
+                                authority_denied |= e.kind == ErrorKind::Authorization;
+                                preflight_diagnostics.push(format!("{}: {}", call.name, e));
+                            }
+                        } else {
+                            authority_denied = true;
+                            preflight_diagnostics
+                                .push("requested tool is outside host bindings".into());
                         }
-                    } else {
-                        authority_denied = true;
-                        preflight_diagnostics
-                            .push("requested tool is outside host bindings".into());
+                    }
+                    if self.candidate_submission_tool.as_ref() == Some(&call.name)
+                        && (response.calls.len() != 1
+                            || !spec
+                                .required_tool_names
+                                .iter()
+                                .filter(|n| *n != &call.name)
+                                .all(|n| successful.contains(n))
+                            || crate::schema::validate_output_with_limit(
+                                spec.output_schema
+                                    .as_ref()
+                                    .expect("validated submission schema"),
+                                &call.arguments,
+                                self.policy.decoder_limits.max_output_bytes,
+                            )
+                            .is_err())
+                    {
+                        preflight_error = true;
+                    }
+                    if !seen_calls.insert(call.id.clone())
+                        || advertised
+                            .iter()
+                            .find(|d| d.definition.name == call.name)
+                            .is_none_or(|d| {
+                                crate::schema::validate_output(
+                                    &d.definition.parameters,
+                                    &call.arguments,
+                                )
+                                .is_err()
+                            })
+                        || dispatcher.validate_call(call).is_err()
+                    {
+                        preflight_error = true;
                     }
                 }
-                if self.candidate_submission_tool.as_ref() == Some(&call.name)
-                    && (response.calls.len() != 1
-                        || !spec
-                            .required_tool_names
-                            .iter()
-                            .filter(|n| *n != &call.name)
-                            .all(|n| successful.contains(n))
-                        || crate::schema::validate_output_with_limit(
-                            spec.output_schema
-                                .as_ref()
-                                .expect("validated submission schema"),
-                            &call.arguments,
-                            self.policy.decoder_limits.max_output_bytes,
-                        )
-                        .is_err())
-                {
-                    preflight_error = true;
-                }
-                if !seen_calls.insert(call.id.clone())
-                    || advertised
-                        .iter()
-                        .find(|d| d.definition.name == call.name)
-                        .is_none_or(|d| {
-                            crate::schema::validate_output(
-                                &d.definition.parameters,
-                                &call.arguments,
-                            )
-                            .is_err()
-                        })
-                    || dispatcher.validate_call(call).is_err()
-                {
-                    preflight_error = true;
-                }
-            }
-            let calls = response.calls.clone();
-            self.artifact(&spec.task_id,&format!("{request_id}:tool-preflight"),"model.tool_preflight",&encoded(&json!({"schema_version":"melissa.model-tool-preflight/v1","request_id":request_id,"call_ids":calls.iter().map(|c|&c.id).collect::<Vec<_>>(),"batch_valid":!preflight_error,"executed":false,"task_accepted":false}))?,&mut result.artifact_refs)?;
-            messages.push(Message::Assistant { response });
-            let repair = if preflight_error {
-                self.recovery_failure(crate::recovery::RecoveryEvent {
+                let calls = response.calls.clone();
+                self.artifact(&spec.task_id,&format!("{request_id}:tool-preflight"),"model.tool_preflight",&encoded(&json!({"schema_version":"melissa.model-tool-preflight/v1","request_id":request_id,"call_ids":calls.iter().map(|c|&c.id).collect::<Vec<_>>(),"batch_valid":!preflight_error,"executed":false,"task_accepted":false}))?,&mut result.artifact_refs)?;
+                messages.push(Message::Assistant { response });
+                let repair = if preflight_error {
+                    self.recovery_failure(crate::recovery::RecoveryEvent {
                     task: spec.task_id.clone(), run: spec.run_id.clone(), request: request_id.clone(),
                     kind: if authority_denied { crate::recovery::FailureKind::AuthorityDenied } else { crate::recovery::FailureKind::InvalidArguments },
                     calls: calls.clone(),
                     diagnostic: if preflight_diagnostics.is_empty() { "Rejected batch: duplicate call identity, candidate contract, or invalid arguments. No call executed.".into() } else { preflight_diagnostics.join("\n") },
                     evidence: result.artifact_refs.clone(),
                 })?
-            } else {
-                None
-            };
-            if repair.as_ref().is_some_and(|r| !r.continue_run) {
-                result.status = if authority_denied {
-                    RunStatus::NeedsAuthorization
                 } else {
-                    RunStatus::NoAction
+                    None
                 };
-                return self.complete(result);
-            }
-            if self.continuation.is_some() {
-                self.publish_turn(&crate::continuation::TurnCheckpointView {
-                    schema_version: "melissa.gateway-turn-checkpoint/v1",
-                    binding_digest: &binding,
-                    phase: crate::continuation::Phase::ToolsPending,
-                    next_turn: turn,
-                    messages: &messages,
-                    seen_calls: &seen_calls,
-                    successful: &successful,
-                    selected_model: selected,
-                    result: &result,
-                })?;
-            }
-            for call in calls {
+                if repair.as_ref().is_some_and(|r| !r.continue_run) {
+                    result.status = if authority_denied {
+                        RunStatus::NeedsAuthorization
+                    } else {
+                        RunStatus::NoAction
+                    };
+                    return self.complete(result);
+                }
+                (calls, preflight_error, repair, request_id)
+            };
+            let call_count = calls.len();
+            for (index, call) in calls.into_iter().enumerate() {
                 if preflight_error {
                     messages.push(Message::ToolResult {
                         call_id: call.id,
@@ -1419,6 +1474,19 @@ impl Gateway {
                 {
                     result.status = RunStatus::Cancelled;
                     return self.complete(result);
+                }
+                if self.continuation.is_some() && index % TOOL_CHECKPOINT_GROUP == 0 {
+                    self.publish_turn(&crate::continuation::TurnCheckpointView {
+                        schema_version: "melissa.gateway-turn-checkpoint/v1",
+                        binding_digest: &binding,
+                        phase: crate::continuation::Phase::ToolsPending,
+                        next_turn: turn,
+                        messages: &messages,
+                        seen_calls: &seen_calls,
+                        successful: &successful,
+                        selected_model: selected,
+                        result: &result,
+                    })?;
                 }
                 let call_hash = blake3::hash(call.id.as_bytes()).to_hex().to_string();
                 let invocation_id = format!("model-tool:{}:{}", spec.run_id, &call_hash[..24]);
@@ -1609,6 +1677,22 @@ impl Gateway {
                     // A crash before result publication remains ToolsPending and
                     // cannot replay an unacknowledged effect on continuation.
                     return self.complete(result);
+                }
+                if self.continuation.is_some()
+                    && (index + 1) % TOOL_CHECKPOINT_GROUP == 0
+                    && index + 1 < call_count
+                {
+                    self.publish_turn(&crate::continuation::TurnCheckpointView {
+                        schema_version: "melissa.gateway-turn-checkpoint/v1",
+                        binding_digest: &binding,
+                        phase: crate::continuation::Phase::BatchReady,
+                        next_turn: turn,
+                        messages: &messages,
+                        seen_calls: &seen_calls,
+                        successful: &successful,
+                        selected_model: selected,
+                        result: &result,
+                    })?;
                 }
             }
             if self.continuation.is_some() {

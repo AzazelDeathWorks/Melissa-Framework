@@ -20,6 +20,7 @@ pub enum Kind {
     Invalid,
     Authority,
     Conflict,
+    RepairEvidence,
     Stale,
     Cancelled,
     Uncertain,

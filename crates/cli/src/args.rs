@@ -1,4 +1,6 @@
 use crate::{Error, Result};
+pub const METRICS_HELP: &str =
+    "\nGörev ölçümleri:\n  melissa [--home PATH] --json task metrics ID\n";
 pub const CAPABILITIES_HELP: &str = "\nProje belleği ve görev hazırlığı:\n  melissa task prepare --workspace PATH --goal TEXT --out NEW_FILE [--acceptance PRIVATE_RECIPE]\n  melissa memory list --workspace PATH\n  melissa memory accept|reject|forget --workspace PATH --id MEMORY_ID --digest REVIEW_DIGEST\n  melissa task replan ID --recipe REVIEWED_RECIPE\n\nPrepare yerel, incelenebilir taslak çıkarır; modeli çalıştırmaz veya kabul cevabı uydurmaz. Bellek önerileri operatör kabul edene kadar aramada kullanılmaz. Replan güvenli pause durumunda yalnız kalan uzman adımlarını değiştirir; çalışan adım korunur, revizyon o adım bittikten sonra etkinleşir. İlk dosya, kabul, süre ve maliyet yetkisi değişmez.\n";
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -48,6 +50,7 @@ pub enum Command {
     },
     List,
     Show(String),
+    Metrics(String),
     Diff(String),
     Events(String),
     Cancel(String),
@@ -231,11 +234,12 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options> {
                         recipe,
                     }
                 }
-                "show" | "diff" | "events" | "history" | "cancel" | "pause" | "run" | "resume"
-                | "plan" | "progress" | "logs" => {
+                "show" | "metrics" | "diff" | "events" | "history" | "cancel" | "pause" | "run"
+                | "resume" | "plan" | "progress" | "logs" => {
                     let id = text(a.next().ok_or(Error::Usage("Görev kimliği gerekli."))?)?;
                     match action.as_str() {
                         "show" => Command::Show(id),
+                        "metrics" => Command::Metrics(id),
                         "diff" => {
                             if a.peek().and_then(|s| s.to_str()) == Some("--content") {
                                 a.next();

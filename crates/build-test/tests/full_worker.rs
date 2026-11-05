@@ -109,6 +109,20 @@ fn actual_python_compiler_pyright_ruff_and_repeated_pytest_are_source_bound() {
     }
 }
 #[test]
+fn python_check_resolves_modules_at_the_captured_project_root() {
+    let files = [
+        (
+            "main.py",
+            "from root_offset import shift\n\nprint(shift(1))\n",
+        ),
+        (
+            "root_offset.py",
+            "def shift(value: int) -> int:\n    return value + 1\n",
+        ),
+    ];
+    passed(execute(Language::Python, Operation::Check {}, &files, None));
+}
+#[test]
 fn actual_javascript_and_typescript_compile_check_lint_format_and_node_tests() {
     for (language, extension, body) in [
         (

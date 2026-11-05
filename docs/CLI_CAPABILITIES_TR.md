@@ -205,6 +205,17 @@ yönlendirme için durdurma sebebidir.
 
 ## Uzun görevler ve teşhise dayalı onarım
 
+Görevin kalıcı ölçüm kaydını `melissa --json task metrics TASK_ID` ile
+okuyabilirsin. Çıktı doğrulanmış kabulü, model gönderim girişimlerini, araç
+denemelerini, süreyi, bağlamı ve kayda geçen token kullanımını gösterir.
+`known_total` yalnız bildirilen örnekleri toplar. `missing_samples` eksik
+örnekleri ayrı sayar. Sağlayıcı kullanım bildirmezse ilgili toplam boş kalır.
+Maliyet, yerel fiyat kartı ve rezervasyon kayıtlarından gelir. Görev süresi
+ilk çalışma kaydından bitişe kadardır ve aradaki duraklamaları içerir.
+Model kanıtı yazma süresi, yeni alındılarda istek ve yanıt kanıtlarının
+yazımından ölçülür. Süreç RAM’i ve I/O sayaçları deney koşucusunun ayrı
+ölçümleridir. [Harness Lab rehberi](HARNESS_LAB_TR.md)
+
 Görev onayı, toplam duvar süresi ve bitiş zamanını belirler. Model
 isteğinin zaman aşımı model ayarından, SDK işleminin sınırı worker
 politikasından gelir. Toplam süre dolduğunda yürütücü çalışmayı durdurur.

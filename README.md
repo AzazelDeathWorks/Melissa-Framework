@@ -4,7 +4,10 @@ Rust tabanlı, geliştirme aşamasındaki ajan ve araç orkestrasyonu çatısı.
 
 Genel ajan/worker tanımları, skill paketleri, tipli sözleşmeler, kalıcılık, izin denetimi, araç bağlantıları, iş akışı ve hata toparlama kodları bulunur. Katalogdaki tanımlar, bütün ajanların aynı anda çalıştığı anlamına gelmez.
 
-## CLI — 0.3.0
+## CLI — 0.3.0-alpha.1
+
+Windows x64 önizlemesi için [kurulum ve ilk görev rehberi](docs/QUICKSTART_WINDOWS.md).
+Güvenlik bildirimleri için [gizli bildirim yolu](SECURITY.md).
 
 Aktif ürün kapsamı 6 Core ve 12 Code profilidir. Diğer alanların genel tanımları
 korunur; derlenen CLI'ya dahil edilmez. Masaüstü arayüzü bu kapsamda yoktur.

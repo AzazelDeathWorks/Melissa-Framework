@@ -1646,3 +1646,89 @@ async fn settled_provider_boundary_starts_clean_native_wire_and_keeps_task_charg
     );
     assert!(!r.task_accepted);
 }
+
+#[tokio::test]
+async fn large_tool_batch_resumes_without_replaying_settled_calls() {
+    use melissa_model_gateway::continuation::{ContinuationStore, Phase, TurnCheckpoint};
+
+    struct PauseOnce {
+        checkpoint: Arc<Mutex<Option<TurnCheckpoint>>>,
+        pause: bool,
+    }
+    impl ContinuationStore for PauseOnce {
+        fn begin(
+            &mut self,
+            _: &mut LocalStore,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<TurnCheckpoint>> {
+            Ok(self.checkpoint.lock().unwrap().clone())
+        }
+        fn publish(&mut self, _: &mut LocalStore, state: &TurnCheckpoint) -> Result<()> {
+            *self.checkpoint.lock().unwrap() = Some(state.clone());
+            if self.pause && state.phase == Phase::BatchReady {
+                return Err(GatewayError::new(ErrorKind::Cancelled, "fixture pause"));
+            }
+            Ok(())
+        }
+    }
+
+    for call_count in [17, 40] {
+        let dir = tempfile::tempdir().unwrap();
+        let ids = (0..call_count)
+            .map(|i| format!("batch-{i}"))
+            .collect::<Vec<_>>();
+        let calls = ids
+            .iter()
+            .map(|id| (id.as_str(), "process_exec", r#"{"value":"ok"}"#))
+            .collect::<Vec<_>>();
+        let http = http_fixture(vec![
+            HttpPlan::sse(tool_response(&calls)),
+            HttpPlan::sse(text_response("complete", false, true)),
+        ])
+        .await;
+        let mut policy = policy();
+        policy.max_tools = 80;
+        let store = store(&dir.path().join("store"), 1_000_000);
+        let connected = store.connect().unwrap();
+        let checkpoint = Arc::new(Mutex::new(None));
+        let mut tools = FakeTools::default();
+        let request = spec("large-resumable-batch");
+        let mut first =
+            gateway(store, &http, policy.clone()).with_continuation(Box::new(PauseOnce {
+                checkpoint: checkpoint.clone(),
+                pause: true,
+            }));
+        let stop = first
+            .run(&request, &mut tools, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap_err();
+        assert_eq!(stop.kind, ErrorKind::Cancelled);
+        assert_eq!(tools.executed.load(Ordering::SeqCst), 8);
+        assert_eq!(http.requests.load(Ordering::SeqCst), 1);
+        drop(first);
+
+        let mut second = gateway(connected, &http, policy).with_continuation(Box::new(PauseOnce {
+            checkpoint: checkpoint.clone(),
+            pause: false,
+        }));
+        let result = second
+            .run(&request, &mut tools, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert_eq!(result.status, RunStatus::FinalCandidate);
+        assert_eq!(result.tool_calls as usize, call_count);
+        assert_eq!(tools.executed.load(Ordering::SeqCst), call_count);
+        assert_eq!(http.requests.load(Ordering::SeqCst), 2);
+        let actual = tools.contexts.lock().unwrap();
+        for (context, id) in actual.iter().zip(ids) {
+            let hash = blake3::hash(id.as_bytes()).to_hex().to_string();
+            assert_eq!(
+                context.invocation_id,
+                format!("model-tool:large-resumable-batch:{}", &hash[..24])
+            );
+        }
+        assert!(!result.task_accepted);
+    }
+}

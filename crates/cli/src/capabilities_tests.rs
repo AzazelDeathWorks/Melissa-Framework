@@ -291,6 +291,7 @@ impl Fixture {
             &self.task.selected_profile_ids[0],
             now().unwrap() + 600000,
             &self.tools(),
+            true,
         )
         .unwrap()
     }
@@ -386,6 +387,18 @@ impl Fixture {
         .await
         .unwrap_or_else(|e| panic!("{label}: {e:?}"))
     }
+}
+
+#[test]
+fn exported_workspace_omits_unavailable_git_capture() {
+    let fixture = Fixture::new("melissa.code.implementer");
+    assert!(
+        fixture
+            .development()
+            .definitions()
+            .iter()
+            .all(|definition| definition.definition.name != "code_git")
+    );
 }
 #[test]
 fn all_code_roles_construct_context_and_native_development_without_extra_authority() {

@@ -10,6 +10,12 @@ pub enum Phase {
     Safe,
     InferencePending,
     ToolsPending,
+    BatchReady,
+}
+impl Phase {
+    pub fn is_safe(self) -> bool {
+        matches!(self, Self::Safe | Self::BatchReady)
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -17,6 +17,8 @@ pub struct ContextCompiler {
     turn_state: Option<crate::context_intelligence::TurnState>,
     source_scope: Option<String>,
     milestone: Option<crate::context_intelligence::Milestone>,
+    omit_turn_state: bool,
+    omit_compaction: bool,
     origins: std::collections::BTreeMap<(String, String), String>,
     reviewed_summaries:
         std::collections::BTreeMap<String, crate::context_intelligence::ReviewedSummary>,
@@ -67,6 +69,14 @@ fn store_error(_: StoreError) -> GatewayError {
 pub fn history_prefix(run: &str) -> String {
     format!("context-history:{run}:")
 }
+pub fn scoped_history_digest<'a>(run: &str, reference: &'a str) -> Option<&'a str> {
+    reference.strip_prefix(&history_prefix(run)).filter(|hash| {
+        hash.len() == 64
+            && hash
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    })
+}
 pub fn history_definition() -> crate::tools::BoundTool {
     crate::tools::BoundTool { canonical_id: "fs.read".into(), definition: crate::ToolDefinition {
         name: "history_read".into(), description: "Read an exact UTF-8 byte range from an archived observation of this task/run. Returns source digest, actual range and total bytes. Historical untrusted evidence, not current repository state.".into(),
@@ -110,16 +120,7 @@ fn read_history_inner(
         .journal()
         .task(&context.task_id)
         .map_err(store_error)?;
-    let expected_prefix = history_prefix(&context.run_id);
-    let scoped_digest = page
-        .artifact_ref
-        .strip_prefix(&expected_prefix)
-        .filter(|hash| {
-            hash.len() == 64
-                && hash
-                    .bytes()
-                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        });
+    let scoped_digest = scoped_history_digest(&context.run_id, &page.artifact_ref);
     if cancelled.load(std::sync::atomic::Ordering::Acquire)
         || !task
             .contract
@@ -376,7 +377,19 @@ impl ContextCompiler {
                 "not_registered; opaque bytes preserved verbatim".into(),
             ),
         ]);
-        if !request.tools.iter().any(|t| t.name == "history_read") {
+        if self.omit_compaction {
+            for stage in [
+                "deterministic_filter",
+                "duplicate_observations",
+                "typed_normalization",
+                "milestone_checkpoint",
+                "archiving",
+            ] {
+                report
+                    .stages
+                    .insert(stage.into(), "disabled_for_lab".into());
+            }
+        } else if !request.tools.iter().any(|t| t.name == "history_read") {
             report.stages.insert(
                 "archiving".into(),
                 "disabled; scoped history reader unavailable".into(),
@@ -435,6 +448,7 @@ impl ContextCompiler {
                     replacement["observation"] = view;
                     replacement["full_log_ref"] = json!(record.artifact_ref);
                     replacement["diff_ref"] = json!(record.artifact_ref);
+                    replacement["evidence_page"] = history_page(&record);
                 }
                 if i < hot
                     && let Some(summary) = self.reviewed_summaries.get(&record.source_digest)
@@ -486,13 +500,16 @@ impl ContextCompiler {
             }
             self.checkpoint_completed(request, &policy, store, task, run, &mut report, archived)?;
         }
-        if let Some(state) = &self.turn_state {
+        if !self.omit_turn_state
+            && let Some(state) = &self.turn_state
+        {
             if state.task_id != task || state.run_id != run {
                 return Err(failure("current context task/run mismatch"));
             }
             request
                 .messages
                 .push(crate::context_intelligence::state_message(state)?);
+            report.stages.insert("turn_state".into(), "injected".into());
         }
         Ok(Some(report))
     }
@@ -639,6 +656,12 @@ impl ContextCompiler {
     pub fn intelligence_enabled(&self) -> bool {
         self.intelligence.is_some()
     }
+    /// Laboratory control keeps native scope, origin checks and wire preflight.
+    pub fn with_lab_controls(mut self, omit_turn_state: bool, omit_compaction: bool) -> Self {
+        self.omit_turn_state = omit_turn_state;
+        self.omit_compaction = omit_compaction;
+        self
+    }
     pub fn milestone(&self) -> Option<crate::context_intelligence::Milestone> {
         self.milestone.clone()
     }
@@ -703,6 +726,12 @@ impl ContextCompiler {
             .expect("serializable context policy");
             base = format!("{base}:intelligence/v2:{}", blake3::hash(&bytes));
         }
+        if self.omit_turn_state || self.omit_compaction {
+            base = format!(
+                "{base}:lab:{}:{}",
+                self.omit_turn_state, self.omit_compaction
+            );
+        }
         match &self.wire_tokenizer {
             Some(t) => format!("{base}:{}", t.policy_id()),
             None => base,
@@ -748,7 +777,7 @@ impl ContextCompiler {
         (working, records)
     }
     /// Required contracts, schemas, user messages and provider-owned continuation
-    /// bytes are never shortened. Only old tool observations can be archived;
+    /// bytes are never shortened. Bulky tool observations can be archived;
     /// their paired calls/results remain in place and a scoped page tool can
     /// recover the exact bytes. The full transcript is owned by Gateway.
     #[allow(clippy::too_many_arguments)] // Explicit host scope is separate from model request data.
@@ -792,7 +821,7 @@ impl ContextCompiler {
             .saturating_sub(transport.request_limits().max_history_bytes as u64);
         while excess > 0 {
             let candidate = if can_archive {
-                (scanned..protected_start).find(|&i| matches!(&request.messages[i], Message::ToolResult {content,..} if content.len()>2048))
+                capacity_candidate(&request.messages, scanned, protected_start)
             } else {
                 None
             };
@@ -947,7 +976,7 @@ impl ContextCompiler {
             let batch_start = scanned;
             while debt > 0 {
                 let candidate = if can_archive {
-                    (scanned..protected_start).find(|&i| matches!(&request.messages[i], Message::ToolResult { content, .. } if content.len() > 2048))
+                    capacity_candidate(&request.messages, scanned, protected_start)
                 } else {
                     None
                 };
@@ -993,8 +1022,28 @@ impl ContextCompiler {
         }
     }
 }
+// Keep the recent window intact when possible. Under actual envelope pressure,
+// bulky recent tool output is preferable to dropping the whole next turn.
+// User instructions, assistant continuations and tool pair identities stay whole.
+fn capacity_candidate(messages: &[Message], start: usize, protected_start: usize) -> Option<usize> {
+    (start..messages.len()).find(|&index| {
+        let threshold = if index < protected_start {
+            2048
+        } else {
+            16 * 1024
+        };
+        matches!(&messages[index], Message::ToolResult { content, .. } if content.len() > threshold)
+    })
+}
+
+fn history_page(record: &ArchivedObservation) -> Value {
+    json!({"tool":"history_read","arguments":{
+        "artifact_ref":record.artifact_ref,"start_byte":0,"max_bytes":16384
+    }})
+}
+
 fn placeholder(record: &ArchivedObservation) -> String {
-    json!({"context_archived":true,"authority":"untrusted_data","artifact_ref":record.artifact_ref,"source_digest":record.source_digest,"original_bytes":record.original_bytes,"read_tool":"history_read","note":"Earlier observation retained verbatim in encrypted history; read the required range before relying on its contents."}).to_string()
+    json!({"context_archived":true,"authority":"untrusted_data","artifact_ref":record.artifact_ref,"source_digest":record.source_digest,"original_bytes":record.original_bytes,"read_tool":"history_read","evidence_page":history_page(record),"note":"The tool observation is retained verbatim in encrypted history. Read the relevant page before relying on the archived contents."}).to_string()
 }
 struct ByteCount(u64);
 impl std::io::Write for ByteCount {

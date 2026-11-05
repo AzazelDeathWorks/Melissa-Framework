@@ -36,6 +36,7 @@ fn visit(root: &Path, dir: &Path, files: &mut Vec<String>) {
     }
 }
 fn main() {
+    println!("cargo:rerun-if-env-changed=MELISSA_BUILD_COMMIT");
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()

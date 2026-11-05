@@ -25,6 +25,8 @@ pub enum Error {
     Conflict(&'static str),
     Unavailable(&'static str),
     Reconciliation(&'static str),
+    Model(melissa_model_gateway::ErrorKind),
+    Verification(&'static str),
     Store,
     Repository,
     Io,
@@ -37,6 +39,12 @@ impl Error {
             Self::Conflict(_) => "conflict",
             Self::Unavailable(_) => "unavailable",
             Self::Reconciliation(_) => "requires_reconciliation",
+            Self::Model(melissa_model_gateway::ErrorKind::Protocol) => "model_protocol",
+            Self::Model(melissa_model_gateway::ErrorKind::ProviderUnavailable) => {
+                "provider_unavailable"
+            }
+            Self::Model(_) => "model_execution",
+            Self::Verification(_) => "verification",
             Self::Store => "store_integrity",
             Self::Repository => "repository_boundary",
             Self::Io => "io",
@@ -45,12 +53,20 @@ impl Error {
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Self::Model(kind) = self {
+            return write!(
+                f,
+                "Model çağrısı durdu ({kind:?}); istek kaydını inceleyin."
+            );
+        }
         f.write_str(match self {
             Self::Usage(s)
             | Self::Denied(s)
             | Self::Conflict(s)
             | Self::Unavailable(s)
-            | Self::Reconciliation(s) => s,
+            | Self::Reconciliation(s)
+            | Self::Verification(s) => s,
+            Self::Model(_) => unreachable!(),
             Self::Store => "Şifreli görev kaydı doğrulanamadı; mevcut dosyaları koruyup inceleyin.",
             Self::Repository => {
                 "Çalışma klasörü güvenli dosya sınırlarını veya kaynak sürümü denetimini geçmedi."
@@ -81,5 +97,6 @@ pub(crate) fn digest(b: &[u8]) -> String {
 
 mod model_pool;
 pub mod model_tools;
+mod telemetry;
 
 mod verification;

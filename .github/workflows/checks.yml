@@ -68,6 +68,8 @@ jobs:
         run: rustup toolchain install 1.98.0 --profile minimal
       - name: Workflow tests
         run: cargo +1.98.0 test --locked -p melissa-workflow --test adaptive_serial --test attenuation --test comparison --test coordinator --test serial_tools --test shared_ledger --test complete_native_race
+      - name: Harness Lab freeze and accounting contracts
+        run: python3 -B -m unittest discover -s tools/tests -p test_harness_lab.py
       - name: Skill context tests
         run: cargo +1.98.0 test --locked -p melissa-skill-context --test package_runtime --test context_state --test retrieval --test registry_versions --test incremental_context
       - name: Repository grammar and archive contracts

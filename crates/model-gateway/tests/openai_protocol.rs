@@ -328,10 +328,6 @@ fn all_buffer_bounds_are_enforced_before_a_call_is_exposed() {
             ..DecoderLimits::default()
         },
         DecoderLimits {
-            max_tool_calls: 0,
-            ..DecoderLimits::default()
-        },
-        DecoderLimits {
             max_argument_bytes: 4,
             ..DecoderLimits::default()
         },

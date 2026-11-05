@@ -1045,7 +1045,7 @@ impl Scheduler {
         source: &str,
         success: bool,
         content: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         require(
             identifier(tool) && crate::plan::hash(source) && content.len() <= 4 * 1024 * 1024,
             Kind::Invalid,
@@ -1054,7 +1054,7 @@ impl Scheduler {
         let state = self.state()?;
         let version = self.check_state(&state, lease)?;
         if state.adaptive.is_none() {
-            return Ok(());
+            return Ok(None);
         }
         let artifact = format!("workflow-check:{}:{}", lease.run, state.sequence);
         let previous = state.adaptive.as_ref().expect("checked");
@@ -1140,7 +1140,7 @@ impl Scheduler {
             version,
             true,
         )?;
-        Ok(())
+        Ok(Some(artifact))
     }
 
     /// Reuse only explicit successful native evidence at the exact source.
@@ -1294,7 +1294,7 @@ impl Scheduler {
                     grammar_fix
                         || full_public_suite
                         || ledger.verified_facts.get(&key) == Some(&ledger.source_version),
-                    Kind::Conflict,
+                    Kind::RepairEvidence,
                     "repair needs an actual passing re-test on current source",
                 )?;
             }
@@ -1305,7 +1305,7 @@ impl Scheduler {
                 .repairs
                 .iter()
                 .any(|r| r.diagnostic.fingerprint == diagnostic.fingerprint),
-            Kind::Conflict,
+            Kind::RepairEvidence,
             "unchanged diagnostic persists after a bounded repair",
         )?;
         // Use the same initial writer and final verification templates as the

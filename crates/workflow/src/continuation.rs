@@ -179,7 +179,7 @@ impl ContinuationStore for WorkflowContinuation {
                     .collect::<BTreeSet<_>>();
                 require(
                     last.state.binding_digest == binding
-                        && last.state.phase == Phase::Safe
+                        && last.state.phase.is_safe()
                         && last.handoff_digest == digest(&serde_json::to_vec(&self.packet)?)
                         && own_ids == ids
                         && cost >= last.known_cost

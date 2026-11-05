@@ -218,7 +218,7 @@ impl TurnRequest {
                     }
                 }
                 Message::Assistant { response } => {
-                    if !pending.is_empty() || response.calls.len() > 16 {
+                    if !pending.is_empty() {
                         return Err(GatewayError::invalid("assistant history ordering"));
                     }
                     for c in &response.calls {
@@ -306,7 +306,6 @@ pub struct DecoderLimits {
     pub max_event_bytes: usize,
     pub max_total_bytes: usize,
     pub max_output_bytes: usize,
-    pub max_tool_calls: usize,
     pub max_argument_bytes: usize,
     pub max_items: usize,
 }
@@ -316,7 +315,6 @@ impl Default for DecoderLimits {
             max_event_bytes: 1024 * 1024,
             max_total_bytes: 8 * 1024 * 1024,
             max_output_bytes: 256 * 1024,
-            max_tool_calls: 16,
             max_argument_bytes: 256 * 1024,
             max_items: 128,
         }
@@ -332,8 +330,6 @@ impl DecoderLimits {
             || self.max_output_bytes > 8 * 1024 * 1024
             || self.max_argument_bytes == 0
             || self.max_argument_bytes > 1024 * 1024
-            || self.max_tool_calls == 0
-            || self.max_tool_calls > 64
             || self.max_items == 0
             || self.max_items > 4096
         {

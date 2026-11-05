@@ -31,6 +31,23 @@ pub struct PoolModel {
     pub settings: Settings,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LabVariant {
+    #[default]
+    Production,
+    ContextStateOff,
+    CompactionOff,
+    RepositoryIndexCacheOff,
+    ProjectMemoryOff,
+    AdaptiveReplanningOff,
+}
+impl LabVariant {
+    fn is_production(&self) -> bool {
+        *self == Self::Production
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -63,6 +80,8 @@ pub struct Settings {
         skip_serializing_if = "crate::model_tools::ToolProfile::is_precision"
     )]
     pub tool_profile: crate::model_tools::ToolProfile,
+    #[serde(default, skip_serializing_if = "LabVariant::is_production")]
+    pub(crate) lab_variant: LabVariant,
 }
 fn default_request_timeout() -> u64 {
     1_800_000
@@ -75,6 +94,11 @@ impl Settings {
         if self.model_pool.len() > 15 {
             return Err(Error::Usage("Model pool supports at most 16 models."));
         }
+        if !self.lab_variant.is_production() && !self.model_pool.is_empty() {
+            return Err(Error::Usage(
+                "A single-feature lab control requires one fixed model.",
+            ));
+        }
         let mut ids = std::collections::BTreeSet::from(["cli-selected"]);
         let mut models = std::collections::BTreeSet::from([(&self.provider_id, &self.model)]);
         self.validate_model()?;
@@ -82,6 +106,7 @@ impl Settings {
             if !melissa_workflow::plan::identifier(&entry.id)
                 || !ids.insert(&entry.id)
                 || !entry.settings.model_pool.is_empty()
+                || !entry.settings.lab_variant.is_production()
                 || !models.insert((&entry.settings.provider_id, &entry.settings.model))
             {
                 return Err(Error::Usage("Invalid or duplicate model pool entry."));
@@ -161,7 +186,7 @@ impl Settings {
     pub(crate) fn model_summary(&self) -> Value {
         json!(self.models().map(|(id, m)| json!({
             "id":id,"provider":m.provider_id,"model":m.model,"origin":url::Url::parse(&m.endpoint).ok().map(|url|url.origin().ascii_serialization()),
-            "protocol":m.protocol,"tool_profile":m.tool_profile,"measurements":m.measurements,
+            "protocol":m.protocol,"tool_profile":m.tool_profile,"measurements":m.measurements,"lab_variant":m.lab_variant,
             "context_tokens":m.context_tokens,"max_output_tokens":m.max_output_tokens,"request_timeout_ms":m.request_timeout_ms,
             "json_object":m.json_object,"native_json_schema":m.native_json_schema,
             "capabilities":m.capabilities,
@@ -225,7 +250,11 @@ impl Settings {
     ) -> Result<melissa_model_gateway::context_compiler::ContextCompiler> {
         let compiler = melissa_model_gateway::context_compiler::ContextCompiler::default()
             .with_intelligence(Default::default())
-            .map_err(|_| Error::Store)?;
+            .map_err(|_| Error::Store)?
+            .with_lab_controls(
+                self.lab_variant == LabVariant::ContextStateOff,
+                self.lab_variant == LabVariant::CompactionOff,
+            );
         match &self.local_tokenizer {
             Some(config) => Ok(compiler.with_wire_tokenizer(
                 melissa_model_gateway::local_tokenizer::LocalWireTokenizer::load(
@@ -290,6 +319,41 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lab_variant_changes_the_approved_settings_and_only_one_model_is_allowed() {
+        let mut settings: Settings = serde_json::from_slice(include_bytes!(
+            "../../../examples/cli/settings.template.json"
+        ))
+        .unwrap();
+        let digest = settings.digest().unwrap();
+        assert!(
+            serde_json::to_value(&settings)
+                .unwrap()
+                .get("lab_variant")
+                .is_none()
+        );
+        let alternative = settings.clone();
+        settings.lab_variant = LabVariant::ContextStateOff;
+        assert_ne!(settings.digest().unwrap(), digest);
+        assert!(
+            settings
+                .context_compiler()
+                .unwrap()
+                .policy_id()
+                .contains(":lab:true:false")
+        );
+        settings.model_pool.push(PoolModel {
+            id: "lab-test".into(),
+            settings: alternative,
+        });
+        assert!(
+            settings
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("lab control")
+        );
+    }
     #[test]
     fn optional_tokenizer_preserves_legacy_digest_and_binds_new_approvals() {
         let mut s: Settings = serde_json::from_slice(include_bytes!(
