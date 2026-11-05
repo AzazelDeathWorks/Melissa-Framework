@@ -51,6 +51,10 @@ struct Task {
 }
 
 struct Session {
+    environment: crate::project::Environment,
+    budget: Option<u64>,
+    duration: u64,
+    extra_checks: std::collections::BTreeMap<String, crate::project::Command>,
     app: App,
     workspace: PathBuf,
     plan_dir: PathBuf,
@@ -72,8 +76,14 @@ pub async fn run(
     if !home.join("home.json").is_file() {
         App::init(&home)?;
     }
+    let app = App::open(&home)?;
+    let environment = app.project_environment(&workspace)?;
     let mut session = Session {
-        app: App::open(&home)?,
+        environment,
+        budget: None,
+        duration: 3_600_000,
+        extra_checks: Default::default(),
+        app,
         workspace,
         plan_dir: home.join("session-plans"),
         acceptance: None,
@@ -137,6 +147,86 @@ impl Session {
         let result = match (command, argument) {
             ("/help", "") => return self.ui.help(HELP, output),
             ("/doctor", "") => crate::views::doctor()?,
+            ("/project-doctor", "") => self
+                .app
+                .project_doctor(&self.workspace, self.environment.clone())?,
+            ("/environment", "") => {
+                serde_json::json!({"command":"project environment","environment":self.environment})
+            }
+            ("/environment", value) => {
+                let environment = if value.starts_with("sha256:") {
+                    let mut e = self.environment.clone();
+                    e.image_id = value.into();
+                    e
+                } else {
+                    let path = path_argument(value)?;
+                    let repo = melissa_repository::Repository::open(
+                        path.parent().ok_or(Error::Io)?,
+                        Default::default(),
+                        vec![],
+                    )?;
+                    crate::app::decode(
+                        &repo
+                            .read(path.file_name().and_then(|s| s.to_str()).ok_or(Error::Io)?)?
+                            .1,
+                    )?
+                };
+                let result = self.app.save_environment(&self.workspace, environment)?;
+                self.environment = self.app.project_environment(&self.workspace)?;
+                result
+            }
+            ("/budget", value) => {
+                self.budget = Some(dollars(value)?);
+                return self.ui.notice(
+                    "Görev harcama tercihi kaydedildi; model çıktı kapasitesi değiştirilmedi.",
+                    output,
+                );
+            }
+            ("/duration", value) => {
+                let minutes = value
+                    .parse::<u64>()
+                    .map_err(|_| Error::Usage("/duration DAKİKA"))?;
+                self.duration = minutes
+                    .checked_mul(60_000)
+                    .filter(|n| *n > 0)
+                    .ok_or(Error::Usage("Süre geçersiz."))?;
+                self.environment.limits.wall_time_ms = self.duration;
+                self.environment.limits.cpu_time_ms = self.duration;
+                self.environment.validate()?;
+                return self.ui.notice("Toplam görev ve yeni süreç süresi tercihi kaydedildi; onaylı eski görev değişmez.",output);
+            }
+            ("/check", value) => {
+                let command:crate::project::Command=serde_json::from_str(value).map_err(|_|Error::Usage("/check {\"executable\":\"python\",\"argv\":[\"-m\",\"unittest\",\"discover\"],\"cwd\":\".\"}"))?;
+                command.validate()?;
+                self.extra_checks
+                    .insert(format!("operator-{}", self.extra_checks.len() + 1), command);
+                return self.ui.notice(
+                    "Proje kabul komutu eklendi; /create onay kapsamında gösterilecek.",
+                    output,
+                );
+            }
+            ("/preflight" | "/environment-sync" | "/exec", value) => {
+                let operation = match command {
+                    "/preflight" => "preflight",
+                    "/environment-sync" => "sync",
+                    _ => "exec",
+                };
+                let cmd = if operation == "exec" {
+                    Some(serde_json::from_str(value).map_err(|_| {
+                        Error::Usage("/exec için executable/argv/cwd JSON nesnesi gerekli.")
+                    })?)
+                } else {
+                    None
+                };
+                let id = self.task()?.id.clone();
+                let run = Box::pin(self.app.run_project_operation(&id, operation, cmd));
+                let mut previous = String::new();
+                self.ui
+                    .working(run, output, |line| {
+                        running_control(&self.app, &id, line, &mut previous)
+                    })
+                    .await?
+            }
             ("/new", goal) if !goal.is_empty() => {
                 if self
                     .task
@@ -240,12 +330,12 @@ impl Session {
                 ))?;
                 self.app.approve(&task.id, request, digest)?;
                 self.task.as_mut().ok_or(Error::Store)?.approval = None;
-                return self.ui.notice(if self.task()?.executable {"Onay kaydedildi. Başlatmak için /run yaz."}else{"Plan onayı kaydedildi. Bu kayıt proje hazırlığıdır; genel proje yürütmesi henüz bağlı değil."},output);
+                return self.ui.notice(if self.task()?.executable {"Onay kaydedildi. Başlatmak için /run yaz."}else{"Plan onayı kaydedildi. Bu kayıt yalnız hazırlıktır. Yürütme için /new, model ayarı, /budget ve proje kontrolleriyle yeni kapsam oluştur."},output);
             }
             ("/run" | "/resume", "") => {
                 if !self.task()?.executable {
                     return Err(Error::Unavailable(
-                        "Bu kayıt proje hazırlığıdır. Genel proje yürütmesi ve ortam bağlantısı henüz hazır değil; API çağrısı yapılmadı.",
+                        "Bu kayıt proje hazırlığıdır; API çağrısı yapılmadı. /new ardından model ayarı, /budget ve proje kontrolleriyle yürütme kapsamı oluştur.",
                     ));
                 }
                 let id = &self.task()?.id;
@@ -336,6 +426,30 @@ impl Session {
                 draft.plan.clone(),
             )?;
             task
+        } else if self.mode != Mode::Plan
+            && self.budget.is_some()
+            && self.app.configuration().is_ok()
+        {
+            let repo =
+                melissa_repository::Repository::open(&self.workspace, Default::default(), vec![])?;
+            let discovery = crate::project::discovery::discover(&repo)?;
+            let contract = if self.extra_checks.is_empty() {
+                discovery.contract(self.environment.clone())?
+            } else {
+                discovery.contract_with_checks(
+                    self.environment.clone(),
+                    Some(self.extra_checks.clone()),
+                )?
+            };
+            self.app.create_project(
+                &self.workspace,
+                &draft.goal,
+                self.mode,
+                draft.plan.clone(),
+                contract,
+                self.budget.ok_or(Error::Store)?,
+                self.duration,
+            )?
         } else {
             self.app.create_conversation(
                 &self.workspace,
@@ -503,6 +617,33 @@ fn path_argument(path: &str) -> Result<PathBuf> {
     }
     absolute(Path::new(path))
 }
+fn dollars(s: &str) -> Result<u64> {
+    let (whole, part) = s.split_once('.').unwrap_or((s, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|b| b.is_ascii_digit())
+        || part.len() > 6
+        || !part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(Error::Usage(
+            "/budget pozitif USD tutarı; en fazla altı ondalık basamak.",
+        ));
+    }
+    let base = whole
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(1_000_000))
+        .ok_or(Error::Usage("Bütçe taşması."))?;
+    let fraction = if part.is_empty() {
+        0
+    } else {
+        part.parse::<u64>()
+            .map_err(|_| Error::Usage("Bütçe geçersiz."))?
+            * 10u64.pow(6 - part.len() as u32)
+    };
+    base.checked_add(fraction)
+        .filter(|n| *n > 0 && *n <= i64::MAX as u64)
+        .ok_or(Error::Usage("Bütçe geçersiz."))
+}
 
 #[cfg(all(test, windows))]
 mod tests {
@@ -517,6 +658,10 @@ mod tests {
         fs::write(workspace.join("main.py"), "pass\n").unwrap();
         App::init(&home).unwrap();
         let mut s = Session {
+            environment: Default::default(),
+            budget: None,
+            duration: 3_600_000,
+            extra_checks: Default::default(),
             app: App::open(&home).unwrap(),
             workspace: workspace.clone(),
             plan_dir: home.join("session-plans"),

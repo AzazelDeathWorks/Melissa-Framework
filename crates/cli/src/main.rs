@@ -36,6 +36,48 @@ async fn run(options: &args::Options) -> Result<Value> {
     }
     let app = App::open(&home)?;
     match &options.command {
+        Command::ProjectDoctor { workspace } => {
+            app.project_doctor(workspace, app.project_environment(workspace)?)
+        }
+        Command::ProjectOperation {
+            id,
+            operation,
+            command,
+        } => {
+            app.run_project_operation(
+                id,
+                operation,
+                command
+                    .as_ref()
+                    .map(|s| {
+                        serde_json::from_str(s)
+                            .map_err(|_| melissa_cli::Error::Usage("--command-json geçersiz."))
+                    })
+                    .transpose()?,
+            )
+            .await
+        }
+        Command::ProjectPoll { id, session, after } => {
+            app.project_poll(id, session, *after, 32 * 1024)
+        }
+        Command::ProjectInput {
+            id,
+            session,
+            operation,
+            hex,
+        } => app.project_input(
+            id,
+            session,
+            &format!(
+                "operator:{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|_| melissa_cli::Error::Io)?
+                    .as_nanos()
+            ),
+            operation,
+            hex,
+        ),
         Command::New {
             workspace,
             goal,
@@ -116,6 +158,7 @@ async fn main() {
     if matches!(options.command, Command::Help) {
         println!("{}", args::HELP);
         println!("{}", args::SESSION_HELP);
+        println!("{}", args::PROJECT_HELP);
         println!("{}", args::EXECUTION_HELP);
         println!("{}", args::DOMAIN_HELP);
         println!("{}", args::CAPABILITIES_HELP);

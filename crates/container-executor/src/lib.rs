@@ -61,6 +61,7 @@ pub struct ContainerLimits {
     pub output_bytes: u64,
     /// Linux cgroup pids includes threads and the one trusted keeper process.
     pub max_processes: u32,
+    /// Zero explicitly disables workspace archive capture.
     pub export_bytes: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,9 +142,9 @@ impl ContainerRequest {
         }
         let l = &self.limits;
         if l.wall_time_ms == 0
-            || l.wall_time_ms > 1_800_000
+            || l.wall_time_ms > i64::MAX as u64 / 1_000_000
             || l.cpu_time_ms == 0
-            || l.cpu_time_ms > 1_800_000
+            || l.cpu_time_ms > i64::MAX as u64 / 1_000_000
             || !(1..=10_000).contains(&l.cpu_rate_basis_points)
         {
             return bad("wall/CPU bounds");
@@ -161,7 +162,7 @@ impl ContainerRequest {
         }
         if l.output_bytes > MAX_CAPTURE
             || l.export_bytes > MAX_CAPTURE
-            || l.export_bytes < 1024
+            || (l.export_bytes != 0 && l.export_bytes < 1024)
             || l.max_processes > 4096
         {
             return bad("output/export/pid bounds");

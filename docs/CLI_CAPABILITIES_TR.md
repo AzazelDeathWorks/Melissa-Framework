@@ -10,7 +10,8 @@ Canlı AI kabulü bu çalışma kapsamında **NOT_RUN**; sağlayıcı çağrıs�
 | Alan | Davranış | Sınır |
 | --- | --- | --- |
 | Araç ön kontrolü ve sonuç kaydı | Host kaynak/ortam bağlamı, şema/argüman özetleri, ayrı `tool.preflight` ve `tool.receipt` kanıtları | Araç PASS sonucu görev kabulü değildir; çalışmayan veya belirsiz işlem başarı sayılmaz. [Ayrıntılar](TOOL_ADAPTERS_TR.md). |
-| Konuşmalı oturum ve proje talimatı | Plan/review/develop; özel tarif olmadan proje hazırlığı; kapsam farkları, kalıcı mesajlar, hedefli soru/yanıt ve çalışan görev kontrolü; kullanıcı/kök/alt klasör AGENTS.md yenilemesi | Hazırlık kapsamı mevcut yürütmeye yetki eklemez. Genel proje yürütmesi henüz etkin değildir. Canlı model token akışı yerine aşama/olay ilerlemesi gösterilir. [Ayrıntılar](CONVERSATION_TR.md). |
+| Konuşmalı oturum ve proje talimatı | Plan/review/develop; kapsam farkları, kalıcı mesajlar, hedefli soru/yanıt ve çalışan görev kontrolü; kullanıcı/kök/alt klasör AGENTS.md yenilemesi | Hazırlık tek başına yürütme izni değildir. Açık proje sözleşmesi, ortam, bütçe ve onayla genel yürütme etkinleşir. Canlı model token akışı yerine aşama/olay ilerlemesi gösterilir. [Ayrıntılar](CONVERSATION_TR.md). |
+| Genel proje ortamı ve süreçleri | Manifestten komut keşfi; projeye özel image/sürüm seçimi; Cargo, npm/pnpm/yarn, uv/pip ve mise; uzun süreç, ham stdout/stderr, stdin, poll/wait/cancel | Host mount/ağ/global kurulum yok; eksik ortam BLOCKED. Salt okunur uzman yalnız onaylı komutları çalıştırır. Son kaynakta komut kabulü ayrı yürütülür. [Ayrıntılar](PROJECT_RUNTIME_TR.md). |
 | Proje belleği | `memory_search` ve `memory_propose`; proje kimliğine bağlı şifreli kayıt, yeni oturumdan açma, kaynak yeniliği kontrolü | Öneriler operatör kabul edene kadar geri çağrılmaz. Başka proje bilgisi karışmaz; değişen kaynak eski bilgiyi geçersiz kılar. |
 | Skill ve bağlam | Pinin tamamını yükleme; kaynak arama, template/factory, gerçek izole Python helper, ortak scriptler | Model komut, interpreter, kök klasör veya yetki seçemez. Helper sonucu aday/gözlemdir. |
 | Anlamsal gezinti | `code_semantic`: gerçek rust-analyzer, TypeScript dil sunucusu veya Pyright üzerinden definition, references, symbols, hover, diagnostics | Dil sorgulanan dosyadan seçilir. Konumlar sıfır tabanlı UTF-16; build scriptleri kapalı. Eski `code_references` yalnız sözdizimsel aramadır. |
@@ -23,7 +24,9 @@ Model bağlamı ve çıktı-token ayarları düşürülmedi. Çekirdeğin mevcut
 istek/araç, disk, worker ve geçmiş boyutu sınırları geçerlidir; sınırsız çalışma
 iddiası yoktur. Geçmiş otomatik özetlenip silinmez. SDK işlemleri mevcut sabit
 image ve ağsız izole worker kullanır; bağımlılık/SDK yokluğu PASS sayılmaz.
-CLI'nın bu geliştirme worker bağında tek işlem için 90 saniye duvar süresi vardır.
+Eski sabit SDK araçlarında tek işlem için 90 saniye duvar süresi vardır; genel
+proje süreçlerinde süre onaylanan proje ortamı ve görev bitiş zamanından gelir.
+Genel proje modunda sabit SDK build/test araçları yerine seçilen ortam kullanılır.
 Yalnız HTML/CSS/SQL gibi bu grammar/SDK kümesi dışındaki kaynaklarda erken
 kontrol `NOT_RUN` kalır; Python kontrolü uydurulmaz. İlgili domain araçları ve
 ayrı son doğrulama kullanılmaya devam eder. Karma depolarda kontrol dışındaki
@@ -257,8 +260,9 @@ melissa --json task prepare --workspace C:/Projects/example --goal 'src/main.py 
 Çıktı kaynak özeti, önerilen uzmanlar, olası yazma kapsamı ve eksik kabul
 girdilerini içerir. Varsayılan taslak `ready_to_create:false` (özel yürütme
 tarifi hazır değil), `ready_to_record_project_task:true` olur. Terminalde
-`/create` özel oracle olmadan bu hazırlığı kaydeder; genel proje yürütmesi
-ve ortam bağlantısı henüz etkin değildir. Kabul tarifi
+`/create` özel oracle olmadan bu hazırlığı kaydeder; model yapılandırması,
+açık `/budget` ve kabul komutları varsa onaya bağlı genel proje yürütmesini
+oluşturur. [Ortam bağlantısı ve süreçler](PROJECT_RUNTIME_TR.md). Kabul tarifi
 hazırsa `--acceptance C:/MelissaPrivate/acceptance.json` eklenebilir: özel oracle,
 süre/maliyet ve dosya yetkileri şablondan alınır; öneri şablonun dosya kapsamını
 genişletemez. Ortaya çıkan tarif yine incelenir ve normal `task new`, kaynak

@@ -26,8 +26,9 @@ korunur; derlenen CLI'ya dahil edilmez. Masaüstü arayüzü bu kapsamda yoktur.
 Desteklenen diller, çalışma sınırları ve komutlar:
 [CLI kullanım rehberi](docs/CLI_CAPABILITIES_TR.md).
 Görev taslağı yerel kurallarla hazırlanır. Özel tarif olmadan proje hazırlık
-görevi kaydedilebilir; genel proje yürütmesi ve ortam bağlantısı henüz etkin
-değildir. Mevcut özel kabul tarifli yürütme ayrıca kullanıcı incelemesi
+görevi kaydedilebilir. Model ayarı, harcama tercihi ve incelenmiş ortamla
+[genel proje yürütmesi](docs/PROJECT_RUNTIME_TR.md) de açılır: süreç oturumları,
+stdin/stdout/stderr, sürüm seçimi ve kilitli bağımlılık kontrolleri. Mevcut özel kabul tarifli yürütme ayrıca kullanıcı incelemesi
 gerektirir. Yeni bağlantılar için yerel testler çalıştırılmıştır; canlı model
 başarısı veya tamamlanmış üretim sürümü iddiası yoktur.
 

@@ -7,8 +7,9 @@ gösterir. `/create` özel kabul tarifi veya model anahtarı olmadan proje hazı
 görevi kaydeder. `/approve` bu hazırlık kaydını kabul eder; model veya süreç
 izni oluşturmaz.
 
-**Genel proje yürütmesi ve ortam bağlantısı bu sürümde henüz etkin değil.**
-Hazırlık görevi için `/run` bunu açıkça bildirir ve API çağrısı yapmaz. Mevcut
+Genel yürütme için model ayarı, `/budget` ve incelenmiş proje ortamı gereklidir;
+[proje çalışma rehberi](PROJECT_RUNTIME_TR.md) adımları açıklar. Bunlar olmadan
+oluşturulmuş hazırlık kaydı `/run` ile API çağrısı yapmaz. Mevcut
 özel kabul tarifiyle yürütme yolu ayrıca çalışır; projeden ayrı `/acceptance`
 dosyası bu yolun bağımsız kabul sözleşmesidir. Genel kullanım için bu dosyayı
 elle hazırlamak zorunda değilsin.
@@ -47,10 +48,11 @@ hazırlık kapsamını kabul edebilirsin. Birden çok ek istek birikir; yeni far
 önceki özeti geçersiz kılar. Zaten kayıtlı kapsam yeniden onay istemez.
 Korunan veya proje dışındaki dosyalar kabul edilmez.
 
-Bu onay **hazırlık kapsamını** günceller. Mevcut yürütmenin değişmez tarifi,
-kaynak izni, uzman yetkisi, süre ve bütçesi değişmez. Yeni dosyada yazma veya
-servis başlatma yapılmış sayılmaz. Genel yürütme bağlantısı bu incelenmiş
-kapsamı ayrıca işlem sözleşmesine bağlamalıdır.
+Bu onay hazırlık kaydını günceller. Yeni proje yürütmeleri ilk onayda bu
+özelliği seçmişse ek dosya kapsamı güvenli pause noktasında kabul edilip
+`/resume` ile etkinleşir. Özel eski oracle tarifleri genişlemez. Görev kimliği,
+uzman yetki tavanı, kabul komutları, süre ve bütçe değişmez. Servis başlatıldığı
+veya yeni dosyada henüz yazma yapıldığı varsayılmaz.
 
 ## Çalışan görevi yönlendirme
 

@@ -1163,7 +1163,10 @@ pub(crate) fn run_interactive(
     }
     // The only remaining process is the protected keeper. A bounded
     // unprivileged tar now sees tmpfs without any workload writer present.
-    let (export_status, export) = if stop_failed || namespace_stopped {
+    let (export_status, export) = if l.export_bytes == 0 && !stop_failed && !namespace_stopped {
+        // An explicit zero allowance disables export; it never means unlimited.
+        (Some(0), Output::default())
+    } else if stop_failed || namespace_stopped {
         (None, Output::default())
     } else {
         docker.capture(

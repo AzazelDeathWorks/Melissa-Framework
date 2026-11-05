@@ -13,6 +13,7 @@ pub mod domain;
 pub mod engine;
 pub mod instructions;
 pub mod preparation;
+pub mod project;
 pub mod project_memory;
 pub mod recipe;
 mod repository_signals;

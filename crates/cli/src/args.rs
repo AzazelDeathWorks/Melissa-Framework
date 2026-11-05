@@ -2,6 +2,7 @@ use crate::{Error, Result};
 pub const METRICS_HELP: &str =
     "\nGörev ölçümleri:\n  melissa [--home PATH] --json task metrics ID\n";
 pub const SESSION_HELP: &str = "\nTerminal oturumu:\n  melissa\n  melissa [--home PATH] session [--workspace PATH]\n\nGörevini yaz veya oturum komutları için /help yaz.";
+pub const PROJECT_HELP: &str = "\nGenel proje ortamı ve komutları:\n  Oturum: /config PATH, /budget USD, /environment [IMAGE|JSON_PATH], /project-doctor\n  Amaç yaz, /create, /details, /approve, /run\n  /preflight, /environment-sync veya /exec JSON_COMMAND modeli çağırmaz; /resume ile model akışı sürer.\n  melissa --json project doctor --workspace PATH\n  melissa --json project preflight|sync TASK_ID\n  melissa --json project exec TASK_ID --command-json JSON_COMMAND\n  melissa --json project poll TASK_ID SESSION_ID [--after N]\n  melissa --json project stdin TASK_ID SESSION_ID --hex HEX_BYTES\n  melissa --json project eof|cancel TASK_ID SESSION_ID\n  Komutlar private snapshot kullanır; host mount/host writeback/ağ yoktur. Belgeler: docs/PROJECT_RUNTIME_TR.md\n";
 pub const CAPABILITIES_HELP: &str = "\nProje belleği ve görev hazırlığı:\n  melissa task prepare --workspace PATH --goal TEXT --out NEW_FILE [--acceptance PRIVATE_RECIPE]\n  melissa memory list --workspace PATH\n  melissa memory accept|reject|forget --workspace PATH --id MEMORY_ID --digest REVIEW_DIGEST\n  melissa task replan ID --recipe REVIEWED_RECIPE\n\nPrepare yerel, incelenebilir taslak çıkarır; modeli çalıştırmaz veya kabul cevabı uydurmaz. Bellek önerileri operatör kabul edene kadar aramada kullanılmaz. Replan güvenli pause durumunda yalnız kalan uzman adımlarını değiştirir; çalışan adım korunur, revizyon o adım bittikten sonra etkinleşir. İlk dosya, kabul, süre ve maliyet yetkisi değişmez.\n";
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -19,6 +20,25 @@ pub struct Options {
 pub const DOMAIN_HELP: &str = "\nWeb/API/veritabanı (v2 özel tarif):\n  melissa task preview ID [--out NEW_DIRECTORY]\n  melissa task evidence ID [--artifact ARTIFACT_ID --out NEW_FILE]\n\nYerel tarayıcı/API/SQLite/PostgreSQL akışları sabit image üzerinde çalışır. Public development ve private final testleri ayrıdır. Preview kaynağa bağlı PNG ihracıdır; kalıcı web sunucusu açmaz.\n";
 #[derive(Debug)]
 pub enum Command {
+    ProjectDoctor {
+        workspace: PathBuf,
+    },
+    ProjectOperation {
+        id: String,
+        operation: String,
+        command: Option<String>,
+    },
+    ProjectPoll {
+        id: String,
+        session: String,
+        after: u64,
+    },
+    ProjectInput {
+        id: String,
+        session: String,
+        operation: String,
+        hex: String,
+    },
     Help,
     Version,
     Session {
@@ -155,6 +175,64 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options> {
         "init" => Command::Init,
         "profiles" => Command::Profiles,
         "doctor" => Command::Doctor,
+        "project" => {
+            let action = text(a.next().ok_or(Error::Usage(
+                "project doctor|preflight|sync|exec|poll|stdin|eof|cancel gerekli.",
+            ))?)?;
+            match action.as_str() {
+                "doctor" => {
+                    let mut f = flags(&mut a, &["--workspace"])?;
+                    Command::ProjectDoctor {
+                        workspace: required(&mut f, "--workspace")?.into(),
+                    }
+                }
+                "preflight" | "sync" | "exec" => {
+                    let id = text(a.next().ok_or(Error::Usage("Görev kimliği gerekli."))?)?;
+                    let mut f = flags(&mut a, &["--command-json"])?;
+                    let command = f.remove("--command-json").map(text).transpose()?;
+                    if (action == "exec") != command.is_some() {
+                        return Err(Error::Usage("Yalnız exec için --command-json gerekli."));
+                    }
+                    Command::ProjectOperation {
+                        id,
+                        operation: action,
+                        command,
+                    }
+                }
+                "poll" => {
+                    let id = text(a.next().ok_or(Error::Usage("Görev kimliği gerekli."))?)?;
+                    let session = text(a.next().ok_or(Error::Usage("Süreç oturumu gerekli."))?)?;
+                    let mut f = flags(&mut a, &["--after"])?;
+                    let after = f
+                        .remove("--after")
+                        .map(text)
+                        .transpose()?
+                        .map(|v| {
+                            v.parse::<u64>()
+                                .map_err(|_| Error::Usage("--after sayısal olmalı."))
+                        })
+                        .transpose()?
+                        .unwrap_or(0);
+                    Command::ProjectPoll { id, session, after }
+                }
+                "stdin" | "eof" | "cancel" => {
+                    let id = text(a.next().ok_or(Error::Usage("Görev kimliği gerekli."))?)?;
+                    let session = text(a.next().ok_or(Error::Usage("Süreç oturumu gerekli."))?)?;
+                    let mut f = flags(&mut a, &["--hex"])?;
+                    let hex = f.remove("--hex").map(text).transpose()?.unwrap_or_default();
+                    if action != "stdin" && !hex.is_empty() {
+                        return Err(Error::Usage("Yalnız stdin --hex alır."));
+                    }
+                    Command::ProjectInput {
+                        id,
+                        session,
+                        operation: action,
+                        hex,
+                    }
+                }
+                _ => return Err(Error::Usage("Proje komutu bilinmiyor.")),
+            }
+        }
         "memory" => {
             let action = text(
                 a.next()

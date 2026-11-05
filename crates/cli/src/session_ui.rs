@@ -34,6 +34,29 @@ const NOTICE: Color = Color::Rgb {
 };
 
 pub(super) const COMMANDS: &[(&str, &str)] = &[
+    (
+        "/project-doctor",
+        "Proje, kilit dosyaları, komutlar ve ortam tercihi",
+    ),
+    (
+        "/environment",
+        "IMAGE veya JSON DOSYASI · projeye özel ortam",
+    ),
+    ("/budget", "USD · yeni görevin harcama tercihi"),
+    ("/duration", "DAKİKA · yeni görev/süreç süresi"),
+    ("/check", "JSON KOMUT · yeni göreve kabul kontrolü ekle"),
+    (
+        "/preflight",
+        "Onaylı proje ortamında sürüm/kapasite kontrolü",
+    ),
+    (
+        "/environment-sync",
+        "Onaylı bağımlılıkları izole kopyada hazırla",
+    ),
+    (
+        "/exec",
+        "JSON KOMUT · onaylı projede model çağrısı olmadan çalıştır",
+    ),
     ("/help", "Komutlar ve kısayollar"),
     ("/doctor", "Windows ve Docker hazırlığı"),
     ("/config", "DOSYA · özel model ayarları"),
@@ -262,7 +285,7 @@ impl Ui {
         self.notice(if ready {
             "Tarifi incele, model ayarlarını /config ile yükle ve /create yaz."
         } else {
-            "Planı incele ve /create ile kaydet. Bu kayıt proje hazırlığıdır; genel yürütme bağlantısı henüz etkin değil. Özel test tarifi zorunlu değil."
+            "Planı incele. /config, /budget ve /environment ile proje yürütmesini hazırla; /create kapsamı gösterir. Bunlar yoksa /create yalnız hazırlık kaydeder. Özel test tarifi zorunlu değil."
         }, output)
     }
 
@@ -305,7 +328,7 @@ impl Ui {
                     lines.push(format!("/answer {} YANIT", text(&q["id"])));
                 }
             }
-            lines.push("Görev/harcama geçmişi korunur. Hazırlık kapsamı, çalışan tarife yeni yetki vermez.".into());
+            lines.push(if brief["runtime_scope_amendments"]==true {"Görev/harcama geçmişi korunur. Ek dosyalar güvenli duraklama ve kapsam onayından sonra /resume ile etkinleşir."}else{"Görev/harcama geçmişi korunur. Hazırlık kapsamı, çalışan tarife yeni yetki vermez."}.into());
             return self.card("KONUŞMA VE KAPSAM", &lines, output);
         }
         if !self.interactive {
@@ -403,7 +426,7 @@ impl Ui {
                     ));
                 }
                 if value["task_accepted"] == true {
-                    lines.push("Korumalı doğrulama geçti.".into());
+                    lines.push("Onaylı görev kontrolleri geçti.".into());
                 }
                 "GÖREV"
             }

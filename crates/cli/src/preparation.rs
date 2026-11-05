@@ -191,7 +191,7 @@ impl App {
             Step { profile, goal: format!("{purpose}. Task goal: {goal}"), write: can_write }
         }).collect::<Vec<_>>();
         let adaptive = json!({
-            "mode":mode,"source_digest":snap.digest,"guidance":crate::instructions::load(&self.home,&repo,&AtomicBool::new(false))?,
+            "mode":mode,"write_intent":write,"source_digest":snap.digest,"guidance":crate::instructions::load(&self.home,&repo,&AtomicBool::new(false))?,
             "task_goal":goal, "complexity":melissa_workflow::adaptive::complexity(&signals),
             "signals":signals, "dependency_evidence":dependency_evidence,
             "scope":{"inspected_paths":affected,"proposed_writes":writable},

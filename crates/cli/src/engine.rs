@@ -890,7 +890,7 @@ pub(crate) fn plan(task: &TaskContractV1, e: &Execution) -> Result<Plan> {
             })
             .cloned()
             .collect::<BTreeSet<_>>();
-        let tools = p
+        let mut tools = p
             .tool_ids
             .iter()
             .filter(|t| {
@@ -925,6 +925,9 @@ pub(crate) fn plan(task: &TaskContractV1, e: &Execution) -> Result<Plan> {
             })
             .cloned()
             .collect::<BTreeSet<_>>();
+        if e.recipe.project.is_some() && s.write && p.tool_ids.iter().any(|t| t == "process.exec") {
+            tools.insert("process.exec".into());
+        }
         let id = format!("step-{i}");
         let (pins, _, _) = resources::skills(
             &s.profile,
@@ -941,6 +944,16 @@ pub(crate) fn plan(task: &TaskContractV1, e: &Execution) -> Result<Plan> {
             "debug":"code_debug_start requires executable source breakpoints and uses the host-selected entry. Always close the returned DAP session; do not patch while it is active.",
             "replan":"Report a needed plan revision with evidence. The operator can pause and use task replan for pending steps within original authority; active/completed steps, acceptance and shared accounting remain fixed."
         });
+        if let Some(project) = &e.recipe.project {
+            let input = &mut nodes.last_mut().ok_or(Error::Store)?.literal_input;
+            input["project"] = serde_json::to_value(project).map_err(|_| Error::Store)?;
+            input["project_onboarding"] = json!(include_str!(
+                "../../../skills/code/repo-onboarding/SKILL.md"
+            ));
+            input["instructions"] = json!(
+                "Use repository tools for host source edits. project_process executes general argv or approved checks in a private isolated snapshot. Generated worker files do not automatically modify the host. Retain session IDs, page stdout/stderr, wait for native completion, and report blocked tools/dependencies honestly. Use the actual environment/version observations. Stop or finish every session before submit_candidate. Final project checks are host-run; never invent private oracle answers. Operator-approved added write paths take effect at safe pause/resume without resetting this task's budget or deadline."
+            );
+        }
         nodes.last_mut().ok_or(Error::Store)?.literal_input["verification_policy"] =
             crate::verification::Policy::for_recipe(&e.recipe).plan(&e.recipe);
         previous = Some(id);
@@ -1083,6 +1096,29 @@ pub(crate) fn native_workers(store: &LocalStore, parent: &str) -> Result<Vec<Val
     Ok(workers)
 }
 pub(crate) fn native_stop_proven(store: &LocalStore, parent: &str) -> Result<bool> {
+    let mut owned = BTreeSet::new();
+    let mut stopped = BTreeSet::new();
+    for artifact in store.list_artifacts(parent)? {
+        if artifact.logical_type == "process.container_identity" {
+            let v: Value = decode(&store.get_artifact(parent, &artifact.artifact_id)?)?;
+            owned.insert(v["container_id"].as_str().ok_or(Error::Store)?.to_owned());
+        }
+        if artifact.logical_type == "process.execution_report" {
+            let v: Value = decode(&store.get_artifact(parent, &artifact.artifact_id)?)?;
+            let r = &v["report"];
+            if r["cleanup_confirmed"] == true
+                && r["tree_confirmed_stopped"] == true
+                && r["policy_verified"] == true
+                && v["requires_reconciliation"] == false
+                && let Some(id) = r["container_id"].as_str()
+            {
+                stopped.insert(id.to_owned());
+            }
+        }
+    }
+    if !owned.is_subset(&stopped) {
+        return Ok(false);
+    }
     let protected_image = |id: &str| {
         matches!(
             id,
@@ -1225,7 +1261,7 @@ impl App {
         let mut store = self.store(id)?;
         let task = store.journal().task(id)?;
         let e = self.execution(&store, id)?.ok_or(Error::Denied(
-            "Bu görev proje hazırlık kaydı. Genel proje yürütmesi ve ortam bağlantısı henüz hazır değil; özel kabul tarifi zorunlu değildir.",
+            "Bu görev yalnız hazırlık kaydı. Model ayarı, bütçe ve proje kontrolleriyle yeni yürütme kapsamı oluştur; özel kabul tarifi zorunlu değildir.",
         ))?;
         if let Some(brief) = self.conversation(id)?
             && (brief.mode == crate::conversation::Mode::Plan
@@ -1323,7 +1359,9 @@ impl App {
         // Read-only availability probe is advisory, not worker authority. The
         // native executor independently pins and verifies its client and policy.
         // Fail before resolving a credential or spending on an unusable backend.
-        if !crate::views::image_present(if e.recipe.domain.is_some() {
+        if !crate::views::image_present(if let Some(project) = &e.recipe.project {
+            &project.environment.image_id
+        } else if e.recipe.domain.is_some() {
             melissa_web_development::plan::WEB_IMAGE
         } else {
             melissa_code_quality::protected::SDK_IMAGE
@@ -1504,6 +1542,9 @@ impl App {
                 || b.active_requests != 0
                 || b.unknown_requests != 0
                 || t.record.unknown_invocation_id.is_some();
+            let environment_blocked = e.recipe.project.is_some()
+                && matches!(error, Error::Unavailable(_))
+                && store.journal().model_requests(id)?.is_empty();
             // The store will not transition a task while model usage is
             // unsettled. Publish the blocked control/evidence state without
             // replacing the original error with a transition conflict.
@@ -1512,7 +1553,7 @@ impl App {
                 && b.active_requests == 0
                 && b.unknown_requests == 0
             {
-                let next = if uncertain {
+                let next = if uncertain || environment_blocked {
                     TaskState::Blocked
                 } else if cancel.load(Ordering::Acquire) && !deadline_elapsed {
                     TaskState::Cancelled
@@ -1521,7 +1562,7 @@ impl App {
                 };
                 store.transition_task(id, t.record.version, next, None)?;
             }
-            let phase = if uncertain {
+            let phase = if uncertain || environment_blocked {
                 "blocked"
             } else if deadline_elapsed {
                 "deadline"
@@ -1568,6 +1609,42 @@ impl App {
         // Resolve only after exact user approval, current source/policy checks,
         // task lease and authenticated live control have been installed.
         control.phase.store(1, Ordering::Release);
+        if let Some(project) = &e.recipe.project {
+            let mut runtime = crate::project::runtime::Runtime::new(
+                self,
+                &t.task_id,
+                "melissa.code.test-engineer",
+                project.clone(),
+                e.expires_at_ms,
+            )?;
+            let command = project.checks.values().next().ok_or(Error::Store)?.clone();
+            let sid = runtime.start(
+                self,
+                store,
+                repo,
+                command,
+                "",
+                control.cancel.clone(),
+                project.sync.is_empty(),
+                !project.sync.is_empty(),
+            )?;
+            let result = tokio::task::block_in_place(|| {
+                crate::project::runtime::Runtime::wait(self, &t.task_id, &sid, &control.cancel)
+            })?;
+            runtime.close()?;
+            put(
+                store,
+                &t.task_id,
+                &format!("cli:project-preflight:{}", control.session),
+                "project.preflight",
+                &bytes(&result)?,
+            )?;
+            if result["status"] != "PASS" {
+                return Err(Error::Unavailable(
+                    "Proje ortamı/sürüm ön kontrolü geçmedi; sağlayıcı çağrısı yapılmadı.",
+                ));
+            }
+        }
         loop {
             control.poll()?;
             if control.cancel.load(Ordering::Acquire) {
@@ -1676,6 +1753,8 @@ impl App {
                     "Başarısız/belirsiz uzman otomatik tekrar çalıştırılmaz.",
                 ));
             };
+            let effective_writes =
+                crate::project::task::effective_writes(self, &t.task_id, &e.recipe)?;
             let repo_tool = RepositoryDispatcher::new(
                 self.source(&self.workspace(store, &t.task_id)?)?,
                 store.connect()?,
@@ -1689,14 +1768,14 @@ impl App {
                         expires_at_ms: e.expires_at_ms,
                         epoch: 1,
                         writable_paths: if node.effects.contains("workspace.apply_patch_scoped") {
-                            e.recipe.writable_paths.clone()
+                            effective_writes.clone()
                         } else {
                             BTreeSet::new()
                         },
                         protected_paths: e.recipe.protected_paths.clone(),
                     },
                     read_repository: true,
-                    enabled_tools: repo_wires(&node.tools),
+                    enabled_tools: project_repo_wires(&node.tools, &effective_writes),
                 },
             )
             .map_err(gw)?
@@ -1704,7 +1783,9 @@ impl App {
             .map_err(gw)?
             .with_recovery_observations()
             .map_err(gw)?;
-            let repo_tool = if e.recipe.schema_version == "melissa.cli-recipe/v2" {
+            let repo_tool = if ["melissa.cli-recipe/v2", "melissa.cli-recipe/v3"]
+                .contains(&e.recipe.schema_version.as_str())
+            {
                 repo_tool.with_portable_patch_wire().map_err(gw)?
             } else {
                 repo_tool
@@ -1745,7 +1826,9 @@ impl App {
                 run: packet.lease.run.clone(),
                 profile: node.profile.clone(),
                 tests: public_tests,
-                build: e.recipe.domain.is_none() && node.tools.contains("code.build"),
+                build: e.recipe.domain.is_none()
+                    && e.recipe.project.is_none()
+                    && node.tools.contains("code.build"),
                 history_read: node.tools.contains("fs.read"),
                 adaptive: (state.plan.mode == Mode::AdaptiveSerial)
                     .then(|| (scheduler.clone(), packet.lease.clone())),
@@ -1791,19 +1874,53 @@ impl App {
                 false,
             )?
             .code
+            .filter(|_| e.recipe.project.is_none())
             .filter(|code| {
                 code.definitions()
                     .iter()
                     .any(|d| d.definition.name == "code_project_check")
             });
             let context_host = context.inner.host();
-            let router = ToolRouter::new(vec![
+            let project_tools = if let Some(project) = &e.recipe.project {
+                if (node.tools.contains("process.exec") || node.tools.contains("code.tests"))
+                    && crate::resources::catalog()?.profiles[&node.profile]
+                        .tool_ids
+                        .iter()
+                        .any(|id| id == "process.exec")
+                {
+                    Some(crate::project::tools::ProjectTools::new(
+                        self,
+                        store,
+                        &t.task_id,
+                        &node.profile,
+                        Arc::new(self.source(&self.workspace(store, &t.task_id)?)?),
+                        project.clone(),
+                        e.expires_at_ms,
+                        node.effects.contains("workspace.apply_patch_scoped")
+                            && node.tools.contains("process.exec"),
+                    )?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let project_lifecycle = project_tools.as_ref().map(|p| p.runtime.clone());
+            let development: Box<dyn ToolDispatcher> = if e.recipe.project.is_some() {
+                Box::new(crate::project::tools::NavigationOnly(Box::new(development)))
+            } else {
+                Box::new(development)
+            };
+            let mut dispatchers: Vec<Box<dyn ToolDispatcher>> = vec![
                 Box::new(repo_tool),
                 Box::new(task_tools),
                 Box::new(context),
-                Box::new(development),
-            ])
-            .map_err(|error| {
+                development,
+            ];
+            if let Some(project) = project_tools {
+                dispatchers.push(Box::new(project));
+            }
+            let router = ToolRouter::new(dispatchers).map_err(|error| {
                 setup_failure(store, &packet, "Specialist tool routing failed.", error)
             })?;
             let checked = crate::development::CheckedEdits {
@@ -1917,6 +2034,7 @@ impl App {
                     "os":std::env::consts::OS,"arch":std::env::consts::ARCH,
                     "settings_digest":e.settings_digest,"recipe":e.recipe,
                     "runtime_digest":e.runtime_digest,
+                    "effective_write_scope":effective_writes,
                     "basis":"reviewed_configuration_not_runtime_health_attestation"
                 }))?),
                 conversation: Some(crate::tool_adapter::ConversationHost {
@@ -2046,6 +2164,9 @@ impl App {
                     control.cancel.clone(),
                 )
                 .await;
+            if let Some(lifecycle) = project_lifecycle {
+                lifecycle.lock().map_err(|_| Error::Store)?.close()?;
+            }
             if paused.load(Ordering::Acquire) {
                 return Ok(json!({"paused":true}));
             }
@@ -2177,6 +2298,39 @@ impl App {
         }
         // Final proof is produced after the agent has stopped and has no
         // reference to oracle bytes or the verifier's private session key.
+        if let Some(project) = &e.recipe.project {
+            let receipt = crate::project::task::verify(
+                self,
+                store,
+                t,
+                &final_source,
+                repo,
+                project,
+                e.expires_at_ms,
+                control.cancel.clone(),
+            )?;
+            if !native_stop_proven(store, &t.task_id)? {
+                return Err(Error::Reconciliation(
+                    "Proje kontrollerinin süreç duruşu doğrulanmadı.",
+                ));
+            }
+            let (package, package_digest) = crate::project::task::manifest(&final_source)?;
+            layers["project_checks"] = json!("PASS");
+            layers["private_oracle"] = json!("NOT_RUN");
+            return complete_delivery(
+                scheduler,
+                store,
+                t,
+                &final_source,
+                &package,
+                &package_digest,
+                &receipt,
+                &layers,
+                &outputs,
+                work,
+                &control.session,
+            );
+        }
         if e.recipe.domain.is_some() {
             let verified = tokio::task::block_in_place(|| {
                 crate::domain::final_verify(
@@ -2301,8 +2455,9 @@ fn complete_delivery(
     }
     let directory = work.join("delivery");
     write_tree(&directory, package)?;
+    let project_acceptance = receipt["acceptance_kind"] == "host_source_bound_project_checks";
     let payload = bytes(
-        &json!({"schema_version":"melissa.cli-task-delivery/v1","task_id":t.task_id,"source_digest":source.snapshot().digest,"package_digest":package_digest,"package":package,"receipt":receipt,"verification_layers":verification_layers,"workflow_outputs":outputs,"protected_checks_passed":true,"release_security_license_acceptance":false,"environment":"existing_CODE03_immutable_SDK"}),
+        &json!({"schema_version":"melissa.cli-task-delivery/v1","task_id":t.task_id,"source_digest":source.snapshot().digest,"package_digest":package_digest,"package":package,"receipt":receipt,"verification_layers":verification_layers,"workflow_outputs":outputs,"protected_checks_passed":true,"protected_checks_kind":if project_acceptance{"host_source_bound_project_checks"}else{"private_protected_oracle"},"private_oracle":!project_acceptance,"release_security_license_acceptance":false,"environment":if project_acceptance{"approved_project_environment"}else{"existing_CODE03_immutable_SDK"}}),
     )?;
     let artifact = format!("cli:delivery:{session}");
     let final_artifact = store.put_artifact(
@@ -2335,7 +2490,14 @@ fn complete_delivery(
         acceptance_digest: t.acceptance_contract_digest.clone(),
         final_digest: final_artifact.digest.clone(),
         verified_digest: final_artifact.digest,
-        verifier_run_id: format!("cli-protected:{session}"),
+        verifier_run_id: format!(
+            "cli-{}:{session}",
+            if project_acceptance {
+                "project"
+            } else {
+                "protected"
+            }
+        ),
         protected_checks_passed: true,
         actual_tool_run: true,
         raw_artifact_refs: vec![artifact.clone()],
@@ -2371,6 +2533,17 @@ fn repo_wires(tools: &BTreeSet<String>) -> BTreeSet<String> {
     .filter(|(_, id)| tools.contains(*id))
     .map(|(wire, _)| wire.into())
     .collect()
+}
+fn project_repo_wires(tools: &BTreeSet<String>, writes: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut wires = repo_wires(tools);
+    if writes.is_empty() {
+        // Empty scope means no mutation authority. A reviewed scope amendment
+        // can enable these routes only when the dispatcher is rebuilt on resume.
+        for wire in ["fs_patch", "fs_create", "fs_delete", "fs_move"] {
+            wires.remove(wire);
+        }
+    }
+    wires
 }
 fn record_handoff(store: &mut LocalStore, p: &WorkPacket) -> Result {
     let id = format!("workflow-handoff:{}", p.lease.run);
@@ -2429,6 +2602,17 @@ fn mirror_qa(root: &mut LocalStore, parent: &str, qa: &ProtectedQa) -> Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn empty_project_scope_never_exposes_mutation_routes() {
+        let tools = BTreeSet::from(["fs.read".into(), "fs.patch".into(), "fs.snapshot".into()]);
+        let wires = project_repo_wires(&tools, &BTreeSet::new());
+        assert!(wires.contains("fs_read"));
+        for mutation in ["fs_patch", "fs_create", "fs_delete", "fs_move"] {
+            assert!(!wires.contains(mutation));
+        }
+        let reviewed = BTreeSet::from(["new.py".into()]);
+        assert!(project_repo_wires(&tools, &reviewed).contains("fs_create"));
+    }
     async fn profile_repository_call(
         dispatcher: &mut RepositoryDispatcher,
         contract: &TaskContractV1,
@@ -2684,6 +2868,7 @@ mod tests {
             ],
             development_checks: vec![],
             domain: None,
+            project: None,
             source_ref: None,
             candidate_schema: None,
             report_checks: vec![],

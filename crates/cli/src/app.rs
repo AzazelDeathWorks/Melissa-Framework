@@ -363,35 +363,39 @@ impl App {
                 "Frontend tarifi gerçek görsel girdi destekli model gerektirir.",
             ));
         }
-        let negative = Repository::open(
-            &absolute(&recipe.negative_workspace)?,
-            Limits::default(),
-            vec![],
-        )?;
-        if source_root.root_identity() == negative.root_identity()
-            || negative.root_path().starts_with(source_root.root_path())
-            || source_root.root_path().starts_with(negative.root_path())
-        {
-            return Err(Error::Denied(
-                "Negatif kaynak ve asıl proje tamamen ayrı olmalı.",
-            ));
-        }
-        let frozen = FrozenSource::capture(&negative, &AtomicBool::new(false))
-            .map_err(|_| Error::Repository)?;
-        let negative_files = frozen
-            .snapshot()
-            .files
-            .iter()
-            .map(|f| {
-                Ok((
-                    f.path.clone(),
-                    frozen
-                        .bytes(&f.path)
-                        .map_err(|_| Error::Repository)?
-                        .to_vec(),
-                ))
-            })
-            .collect::<Result<_>>()?;
+        let negative_files = if recipe.project.is_none() {
+            let negative = Repository::open(
+                &absolute(&recipe.negative_workspace)?,
+                Limits::default(),
+                vec![],
+            )?;
+            if source_root.root_identity() == negative.root_identity()
+                || negative.root_path().starts_with(source_root.root_path())
+                || source_root.root_path().starts_with(negative.root_path())
+            {
+                return Err(Error::Denied(
+                    "Negatif kaynak ve asıl proje tamamen ayrı olmalı.",
+                ));
+            }
+            let frozen = FrozenSource::capture(&negative, &AtomicBool::new(false))
+                .map_err(|_| Error::Repository)?;
+            frozen
+                .snapshot()
+                .files
+                .iter()
+                .map(|f| {
+                    Ok((
+                        f.path.clone(),
+                        frozen
+                            .bytes(&f.path)
+                            .map_err(|_| Error::Repository)?
+                            .to_vec(),
+                    ))
+                })
+                .collect::<Result<_>>()?
+        } else {
+            BTreeMap::new()
+        };
         let profile = recipe.agents[0].profile.clone();
         let expires_at_ms = now()?
             .checked_add(recipe.wall_time_ms)
@@ -533,6 +537,10 @@ impl App {
             task.limits.max_wall_time_ms = e.recipe.wall_time_ms;
             task.acceptance_criteria=vec!["Independent source-bound protected suite with rejected negative control; no unknown effects; exact final artifact and recorded candidate".into()];
             task.acceptance_contract_digest = e.recipe.acceptance_digest()?;
+            if let Some(project) = &e.recipe.project {
+                task.acceptance_criteria=vec!["Host executes the approved project checks on exact final source in the approved environment; native receipts, stopped workers and no unknown effects required. Public project checks are not a private oracle or release acceptance.".into()];
+                task.limits.max_disk_bytes = project.environment.limits.disk_bytes;
+            }
         }
         let dir = self.home.join("tasks").join(&id);
         fs::create_dir(&dir)?;
@@ -605,13 +613,16 @@ impl App {
         let request: Approval = decode(&s.get_artifact(id, APPROVAL)?)?;
         let mut value = json!({"command":"task show","task_id":id,"state":t.record.state,"version":t.record.version,"goal":t.contract.goal,"profile":t.contract.selected_profile_ids,"workspace":w.root,"source_digest":t.contract.input_snapshot_digest,"source_files":w.snapshot.files.len(),"excluded_prefixes":w.snapshot.excluded_prefixes,"approval":{"request_id":request.request_id,"digest":digest(&bytes(&request)?),"meaning":request.meaning,"pending":t.record.state==TaskState::AwaitingApproval},"model_budget":s.journal().model_budget(id)?,"task_accepted":t.record.state==TaskState::Completed,"execution_backend":"not_connected_in_first_CLI_slice"});
         if let Some(e) = self.execution(s, id)? {
-            value["execution_backend"] =
-                json!("Gateway_workflow_scoped_repository_CODE03_protected_QA");
+            value["execution_backend"] = json!(if e.recipe.project.is_some() {
+                "Gateway_workflow_project_environment_checks"
+            } else {
+                "Gateway_workflow_scoped_repository_CODE03_protected_QA"
+            });
             value["execution_plan"] = e.recipe.public_plan();
             value["execution_plan"]["verification"] =
                 crate::verification::Policy::for_recipe(&e.recipe).plan(&e.recipe);
             value["execution_plan"]["timing"] = json!({"task_wall_time_ms":e.recipe.wall_time_ms,
-                "task_deadline_ms":e.expires_at_ms,"default_sdk_tool_wall_time_ms":crate::development::limits().wall_time_ms});
+                "task_deadline_ms":e.expires_at_ms,"default_sdk_tool_wall_time_ms":crate::development::limits().wall_time_ms,"project_tool_wall_time_ms":e.recipe.project.as_ref().map(|p|p.environment.limits.wall_time_ms)});
             value["settings_digest"] = json!(e.settings_digest);
             if let Ok(settings) = self.settings()
                 && settings.digest()? == e.settings_digest
