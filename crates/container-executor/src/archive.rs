@@ -34,7 +34,13 @@ fn octal(dest: &mut [u8], value: u64) {
 }
 pub(crate) fn pack(snapshot: &Snapshot) -> ExecutorResult<Vec<u8>> {
     snapshot.validate(MAX_CAPTURE)?;
-    let mut tar = Vec::new();
+    let size = 1024
+        + snapshot
+            .files
+            .values()
+            .map(|data| 512 + data.len().div_ceil(512) * 512)
+            .sum::<usize>();
+    let mut tar = Vec::with_capacity(size);
     for (name, data) in &snapshot.files {
         let mut header = [0u8; 512];
         let (prefix, leaf) = split_ustar_name(name)?;

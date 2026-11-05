@@ -614,6 +614,28 @@ fn cache_evicts_old_entries_and_oversized_results_do_not_poison_persistence() {
     assert!(cache.get(&first, 11, &admission()).unwrap().is_none());
 }
 #[test]
+fn cache_enforces_ttl_independently_of_the_grant_expiry() {
+    let mut cache = Cache::default();
+    let first = key(CacheKind::Prompt);
+    cache
+        .put(first.clone(), b"first".to_vec(), 1, u64::MAX, &admission())
+        .unwrap();
+    assert!(cache.get(&first, 300_000, &admission()).unwrap().is_some());
+    assert!(cache.get(&first, 300_001, &admission()).unwrap().is_none());
+    let mut next = first.clone();
+    next.source_digest = digest(b"updated source");
+    cache
+        .put(next, b"second".to_vec(), 300_001, u64::MAX, &admission())
+        .unwrap();
+    let old = first.digest().unwrap();
+    assert!(
+        !encode_state(&cache)
+            .unwrap()
+            .windows(old.len())
+            .any(|window| window == old.as_bytes())
+    );
+}
+#[test]
 fn all_seven_cache_types_bind_sources_and_every_execution_dependency() {
     for kind in [
         CacheKind::Prompt,

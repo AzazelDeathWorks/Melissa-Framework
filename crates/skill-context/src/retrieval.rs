@@ -30,31 +30,6 @@ pub struct Source {
     pub links: Vec<String>,
 }
 impl Source {
-    pub(crate) fn reference_view(&self) -> impl Serialize + '_ {
-        #[derive(Serialize)]
-        struct Reference<'a> {
-            id: &'a str,
-            version: &'a str,
-            namespace: &'a Namespace,
-            domain: Domain,
-            digest: &'a str,
-            observed_at_ms: u64,
-            valid_until_ms: u64,
-            symbols: &'a [String],
-            links: &'a [String],
-        }
-        Reference {
-            id: &self.id,
-            version: &self.version,
-            namespace: &self.namespace,
-            domain: self.domain,
-            digest: &self.digest,
-            observed_at_ms: self.observed_at_ms,
-            valid_until_ms: self.valid_until_ms,
-            symbols: &[],
-            links: &[],
-        }
-    }
     pub fn reference(&self) -> SourceRef {
         SourceRef {
             id: self.id.clone(),

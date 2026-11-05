@@ -58,23 +58,20 @@ impl LocalStore {
         if bytes.len() as u64 > self.instance.config.max_blob_bytes {
             return Err(StoreError::Quota("per-blob plaintext limit".into()));
         }
-        // Separate connection lets a file guard and an IMMEDIATE transaction
-        // coexist without borrowing the public journal mutably.
+        use std::sync::atomic::Ordering;
+        const FULL_CHECK_INTERVAL: usize = 128;
         let _guard = self.file_guard()?;
-        let mut connection = self.connect()?;
-        connection.journal.task(&request.task_id)?;
-        let tx = connection
-            .journal
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM tasks WHERE task_id=?1)",
-            [&request.task_id],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            return Err(StoreError::NotFound("artifact producer task".into()));
+        let publications = &self.instance.publications_since_check;
+        if publications.load(Ordering::Relaxed) >= FULL_CHECK_INTERVAL {
+            self.journal.integrity_check()?;
+            self.check_artifact_integrity()?;
+            publications.store(0, Ordering::Relaxed);
         }
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.journal.conn,
+            TransactionBehavior::Immediate,
+        )?;
+        self.journal.task_on(&tx, &request.task_id)?;
         let duplicate: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM artifacts WHERE artifact_id=?1)",
             [&request.artifact_id],
@@ -106,7 +103,7 @@ impl LocalStore {
         }
         // Blob publication precedes metadata commit. A crash may leave an
         // unreferenced blob; it cannot commit a reference to a partial blob.
-        let blob = self.cas.put(bytes)?;
+        let blob = self.cas.put_prehashed(bytes, &digest)?;
         let now = unix_ms()?;
         let metadata = ArtifactMetadata {
             artifact_id: request.artifact_id.clone(),
@@ -134,6 +131,7 @@ impl LocalStore {
             params![metadata.artifact_id,metadata.task_id,metadata.digest,metadata.content_type,metadata.logical_type,metadata.schema_version,integer(now)?,integer(metadata.retain_until_ms)?,metadata.legal_hold,payload])?;
         tx.execute("INSERT INTO artifact_refs(owner_task_id,owner_kind,owner_id,artifact_id) VALUES(?1,'task',?1,?2)", params![metadata.task_id,metadata.artifact_id])?;
         tx.commit()?;
+        publications.fetch_add(1, Ordering::Relaxed);
         Ok(metadata)
     }
 
@@ -182,11 +180,10 @@ impl LocalStore {
     ) -> StoreResult<()> {
         integer(retain_until_ms)?;
         let _guard = self.file_guard()?;
-        let mut connection = self.connect()?;
-        let tx = connection
-            .journal
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.journal.conn,
+            TransactionBehavior::Immediate,
+        )?;
         let mut metadata = artifact_on(&tx, &self.instance.key, task_id, artifact_id)?;
         metadata.retain_until_ms = retain_until_ms;
         metadata.legal_hold = legal_hold;
@@ -209,13 +206,12 @@ impl LocalStore {
     /// this retention action.
     pub fn release_artifact(&mut self, task_id: &str, artifact_id: &str) -> StoreResult<()> {
         let _guard = self.file_guard()?;
-        let mut connection = self.connect()?;
-        let tx = connection
-            .journal
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.journal.conn,
+            TransactionBehavior::Immediate,
+        )?;
         let metadata = artifact_on(&tx, &self.instance.key, task_id, artifact_id)?;
-        let task = self.journal.task(task_id)?;
+        let task = self.journal.task_on(&tx, task_id)?;
         if !task.record.state.is_terminal() {
             return Err(StoreError::Conflict(
                 "active task artifact must remain referenced".into(),
@@ -239,11 +235,10 @@ impl LocalStore {
     ) -> StoreResult<()> {
         text(pin_id, "pin ID", 256)?;
         let _guard = self.file_guard()?;
-        let mut connection = self.connect()?;
-        let tx = connection
-            .journal
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.journal.conn,
+            TransactionBehavior::Immediate,
+        )?;
         artifact_on(&tx, &self.instance.key, task_id, artifact_id)?;
         tx.execute("INSERT INTO artifact_refs(owner_task_id,owner_kind,owner_id,artifact_id) VALUES(?1,'pin',?2,?3) ON CONFLICT DO NOTHING",params![task_id,pin_id,artifact_id])?;
         tx.commit()?;
@@ -258,11 +253,10 @@ impl LocalStore {
     ) -> StoreResult<()> {
         text(pin_id, "pin ID", 256)?;
         let _guard = self.file_guard()?;
-        let mut connection = self.connect()?;
-        let tx = connection
-            .journal
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.journal.conn,
+            TransactionBehavior::Immediate,
+        )?;
         artifact_on(&tx, &self.instance.key, task_id, artifact_id)?;
         tx.execute("DELETE FROM artifact_refs WHERE owner_task_id=?1 AND owner_kind='pin' AND owner_id=?2 AND artifact_id=?3",params![task_id,pin_id,artifact_id])?;
         tx.commit()?;
@@ -278,6 +272,8 @@ impl LocalStore {
         let cutoff = now_ms.saturating_sub(orphan_grace_ms);
         let _guard = self.file_guard()?;
         self.release_inventory_pins()?;
+        // Collection verifies the journal through its own read transaction
+        // while holding the separate garbage-collection writer transaction.
         let mut connection = self.connect()?;
         let tx = connection
             .journal

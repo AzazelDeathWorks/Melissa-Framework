@@ -117,7 +117,9 @@ impl DebugPlan {
         limits: ContainerLimits,
         cancel: &AtomicBool,
     ) -> Result<Self> {
-        let mut snapshot = repo.worker_input(source, cancel)?.snapshot;
+        let mut snapshot = repo
+            .worker_input_with_budget(source, cancel, limits.disk_bytes)?
+            .snapshot;
         validate_source(&snapshot)?;
         if !snapshot.files.contains_key(&entry) {
             return Err(Error::Invalid("debug entry absent from captured source"));
@@ -139,14 +141,19 @@ impl DebugPlan {
             ));
         }
         let options = crate::full::compiler_contract(&snapshot, language)?;
-        let program = json!({"schema_version":"melissa.debug-program/v1","language":language.wire(),"entry":entry,"breakpoints":breakpoints,"expected_binary_sha256":expected_binary_sha256,"source_digest":source.digest,"sources":snapshot.files.iter().map(|(p,b)|(p.clone(),hex(b))).collect::<BTreeMap<_,_>>(),"compiler_options":options,"trace_limit":limits.output_bytes});
+        let program = json!({"schema_version":"melissa.debug-program/v1","language":language.wire(),"entry":entry,"breakpoints":breakpoints,"expected_binary_sha256":expected_binary_sha256,"source_digest":source.digest,"source_manifest_version":melissa_container_executor::source_manifest::VERSION,"sources":melissa_container_executor::source_manifest::seal(&snapshot),"compiler_options":options,"trace_limit":limits.output_bytes});
         snapshot.files.insert(
             ".melissa-code06-debug/program.json".into(),
             serde_json::to_vec(&program)?,
         );
         snapshot.files.insert(
             ".melissa-code06-debug/driver.py".into(),
-            DRIVER.as_bytes().to_vec(),
+            [
+                melissa_container_executor::source_manifest::VERIFIER,
+                DRIVER,
+            ]
+            .join("\n")
+            .into_bytes(),
         );
         snapshot
             .validate(limits.disk_bytes)

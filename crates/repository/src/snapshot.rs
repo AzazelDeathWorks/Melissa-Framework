@@ -265,6 +265,28 @@ impl Repository {
         check_cancel(cancel)?;
         self.read_locked_with_cancel(&mut self.lock(path, false)?, path, Some(cancel))
     }
+    /// Read a source by the exact path that a repository snapshot would emit.
+    /// A case alias must not become a second durable source identity.
+    pub fn read_source_cancellable(
+        &self,
+        path: &str,
+        cancel: &AtomicBool,
+    ) -> Result<Option<(FileVersion, Vec<u8>)>> {
+        check_cancel(cancel)?;
+        let mut pin = match self.lock(path, false) {
+            Ok(pin) => pin,
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let expected = self.root.canonical.join(path.replace('/', "\\"));
+        if pin.canonical.as_os_str() != expected.as_os_str() {
+            return Ok(None);
+        }
+        self.read_locked_with_cancel(&mut pin, path, Some(cancel))
+            .map(Some)
+    }
     pub fn snapshot(&self, cancel: &AtomicBool) -> Result<RepositorySnapshot> {
         self.capture(cancel, |path, pin| {
             self.read_locked_with_cancel(pin, path, Some(cancel))
@@ -482,14 +504,23 @@ impl Repository {
         source: &RepositorySnapshot,
         cancel: &AtomicBool,
     ) -> Result<WorkerInput> {
-        self.validate_snapshot(source, cancel)?;
+        self.worker_input_with_budget(source, cancel, self.limits.max_total_bytes)
+    }
+
+    pub fn worker_input_with_budget(
+        &self,
+        source: &RepositorySnapshot,
+        cancel: &AtomicBool,
+        disk_bytes: u64,
+    ) -> Result<WorkerInput> {
+        check_cancel(cancel)?;
+        let bytes_limit = disk_bytes.min(self.limits.max_total_bytes);
         melissa_container_executor::Snapshot::preflight(
-            source.files.iter().map(|f| (f.path.as_str(), f.bytes)), self.limits.max_total_bytes,
+            source.files.iter().map(|f| (f.path.as_str(), f.bytes)), bytes_limit,
         ).map_err(|_| Error::Quota("worker transfer preflight: file count, bytes, reserved path or ustar path capacity"))?;
         let mut files = std::collections::BTreeMap::new();
         for f in &source.files {
-            check_cancel(cancel)?;
-            let (current, bytes) = self.read(&f.path)?;
+            let (current, bytes) = self.read_cancellable(&f.path, cancel)?;
             if current != *f {
                 return Err(Error::Stale("worker snapshot source changed"));
             }
@@ -497,7 +528,7 @@ impl Repository {
         }
         let snapshot = melissa_container_executor::Snapshot { files };
         snapshot
-            .validate(self.limits.max_total_bytes)
+            .validate(bytes_limit)
             .map_err(|_| Error::Quota("worker input format or bytes"))?;
         self.validate_snapshot(source, cancel)?;
         Ok(WorkerInput {
@@ -707,6 +738,26 @@ mod search_tests {
         assert!(matches!(
             find_chunked(&bytes, 0, &finder, 3, &cancel),
             Err(Error::Cancelled)
+        ));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod worker_preflight_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_worker_transfer_is_rejected_before_source_materialization() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("source.bin");
+        std::fs::write(&file, vec![0xa5; 64 * 1024]).unwrap();
+        let repo = Repository::open(directory.path(), Limits::default(), vec![]).unwrap();
+        let cancel = AtomicBool::new(false);
+        let snapshot = repo.snapshot(&cancel).unwrap();
+        std::fs::remove_file(file).unwrap();
+        assert!(matches!(
+            repo.worker_input_with_budget(&snapshot, &cancel, 4096),
+            Err(Error::Quota(_))
         ));
     }
 }

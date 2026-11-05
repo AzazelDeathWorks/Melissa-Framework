@@ -183,6 +183,7 @@ impl RepositoryIndex {
         bytes.extend_from_slice(&(meta.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&meta);
         bytes.extend_from_slice(&image);
+        Self::restore(self.binding, &bytes)?;
         cache.save(&self.binding, &bytes)?;
         self.dirty = false;
         Ok(Persistence::Saved)

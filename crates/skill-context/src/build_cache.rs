@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, sync::atomic::AtomicBool};
 const PRIVATE: &str = "c07-cache";
+const CACHE_TTL_MS: u64 = 15 * 60 * 1000;
+const CACHE_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
 const DRIVER: &str = r#"import subprocess,json,pathlib,hashlib,os,shutil,stat
 c=['/usr/local/cargo/bin/cargo','build','--locked','--offline','--config','build.incremental=false','--target-dir','c07-cache','--message-format=json']
 r=subprocess.run(c,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
@@ -34,6 +37,26 @@ struct Bundle {
     expires: u64,
     files: BTreeMap<String, Vec<u8>>,
 }
+impl Bundle {
+    fn validate(&self) -> Result<()> {
+        self.namespace.validate()?;
+        require(!self.files.is_empty(), "empty build seed")?;
+        Snapshot::preflight(
+            self.files
+                .iter()
+                .map(|(p, bytes)| (p.as_str(), bytes.len() as u64)),
+            crate::MAX_STATE_BYTES as u64,
+        )
+        .map_err(|e| Error(e.to_string()))?;
+        require(
+            self.files.iter().all(|(path, bytes)| {
+                path.starts_with("c07-cache/") && bytes.len() as u64 <= CACHE_MAX_FILE_BYTES
+            }),
+            "build seed path or file byte limit",
+        )
+    }
+}
+
 pub struct BuildSeed(Bundle);
 pub struct NativeBuildPlan {
     request: ContainerRequest,
@@ -58,7 +81,9 @@ impl BuildSeed {
     ) -> Result<Self> {
         let b = store.get_artifact(task, id)?;
         require(digest(&b) == expected_digest, "build seed receipt mismatch")?;
-        Ok(Self(crate::json(&b)?))
+        let bundle: Bundle = crate::json(&b)?;
+        bundle.validate()?;
+        Ok(Self(bundle))
     }
 }
 impl NativeBuildPlan {
@@ -79,7 +104,7 @@ impl NativeBuildPlan {
         )?;
         let source = repo.snapshot(cancel).map_err(|e| Error(e.to_string()))?;
         let mut snapshot = repo
-            .worker_input(&source, cancel)
+            .worker_input_with_budget(&source, cancel, limits.disk_bytes)
             .map_err(|e| Error(e.to_string()))?
             .snapshot;
         require(
@@ -101,6 +126,16 @@ impl NativeBuildPlan {
                 seed.0.key == key && seed.0.namespace == namespace && now < seed.0.expires,
                 "native build cache source/SDK/config/policy/scope changed",
             )?;
+            seed.0.validate()?;
+            Snapshot::preflight(
+                snapshot
+                    .files
+                    .iter()
+                    .chain(&seed.0.files)
+                    .map(|(p, b)| (p.as_str(), b.len() as u64)),
+                limits.disk_bytes,
+            )
+            .map_err(|e| Error(e.to_string()))?;
             for (p, b) in &seed.0.files {
                 require(
                     p.starts_with(&format!("{PRIVATE}/")) && !snapshot.files.contains_key(p),
@@ -134,7 +169,7 @@ impl NativeBuildPlan {
             source,
             key,
             namespace,
-            expires,
+            expires: expires.min(now.saturating_add(CACHE_TTL_MS)),
             reused: seed.is_some(),
         })
     }
@@ -217,7 +252,9 @@ impl NativeBuildPlan {
             files: output,
         });
         let id = format!("{}:native-build-seed", identity.attempt_id);
-        let bytes = serde_json::to_vec(&seed.0)?;
+        seed.0.validate()?;
+        let bytes = crate::encode_state(&seed.0)?;
+        crate::json::<Bundle>(&bytes)?.validate()?;
         put(broker.store_mut(), task, &id, "native-build.seed", &bytes)?;
         Ok(NativeBuildResult {
             observation: json!({"native":observed,"cache_seed_reused":self.reused,"cache_key":self.key,"seed_digest":digest(&bytes),"source_digest":self.source.digest,"raw_artifact":raw_id,"fresh_compiler_executed":true,"protected_acceptance":false}),

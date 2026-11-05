@@ -2,10 +2,11 @@
 //! intersection and CODE-03 atomic admission apply to cache hits as well.
 use crate::{
     Error, Namespace, Result, digest, json,
+    memory_sources::ObservedSources,
     package::{Registry, SkillPolicy},
     repository_index::{Persistence, RankingHints, Refresh, RepositoryIndex, Restore, SearchQuery},
     require,
-    retrieval::{Domain, Hit, SearchScope, Source},
+    retrieval::{Domain, Hit, SearchScope},
     scripts,
     state::{Cache, CacheAdmission, CacheKey, CacheKind, MemoryBook},
 };
@@ -20,7 +21,7 @@ use melissa_model_gateway::{
     ErrorKind, GatewayError, ToolCall, ToolDefinition,
     tools::{BoundTool, ToolContext, ToolDispatcher, ToolExecution},
 };
-use melissa_repository::{Repository, polyglot::PolyglotIndex};
+use melissa_repository::Repository;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json as value};
 use std::{
@@ -171,13 +172,12 @@ pub struct ContextRuntime {
     registry: Registry,
     revoked: Arc<AtomicBool>,
     state: RuntimeState,
+    external_project_memory: bool,
     imported: Vec<MemoryBook>,
-    source_inventory: Vec<Source>,
     repository_index: Option<RepositoryIndex>,
     index_binding: [u8; 32],
     index_cache: RepositoryIndexCache,
     repository_hints: BTreeMap<RepositoryHintKind, (String, BTreeMap<String, usize>)>,
-    parse_cache: melissa_repository::polyglot::ParseCache,
     native_scripts: BTreeMap<String, NativeScriptRoute>,
     native_dispatcher: Option<Box<dyn ToolDispatcher>>,
     release_gate: Option<ReleaseGate>,
@@ -269,6 +269,18 @@ impl ContextRuntime {
     pub fn memory_book(&self) -> MemoryBook {
         self.state.memory.clone()
     }
+    /// The CLI owns the durable project book. Task checkpoints keep their
+    /// task state without publishing duplicate copies of the project facts.
+    pub fn use_external_project_memory(&mut self, book: MemoryBook) -> Result<()> {
+        self.replace_memory_book(book)?;
+        self.external_project_memory = true;
+        Ok(())
+    }
+
+    pub fn memory_book_mut(&mut self) -> &mut MemoryBook {
+        &mut self.state.memory
+    }
+
     pub fn open(
         repo: Arc<Repository>,
         store: LocalStore,
@@ -311,13 +323,12 @@ impl ContextRuntime {
             registry,
             revoked: Arc::new(AtomicBool::new(false)),
             state: RuntimeState::default(),
+            external_project_memory: false,
             imported: Vec::new(),
-            source_inventory: Vec::new(),
             repository_index: None,
             index_binding,
             index_cache,
             repository_hints: BTreeMap::new(),
-            parse_cache: Default::default(),
             native_scripts: BTreeMap::new(),
             native_dispatcher: None,
             release_gate: None,
@@ -338,6 +349,9 @@ impl ContextRuntime {
             )?;
             let mut state: RuntimeState = json(&bytes)?;
             state.sequence = sequence;
+            let now =
+                melissa_execution_broker::unix_ms().map_err(|_| Error("host clock".into()))?;
+            state.cache.restore(&host.grant.namespace, now)?;
             host.state = state;
         }
         for anchor in anchors {
@@ -461,92 +475,46 @@ impl ContextRuntime {
         }
         Ok(())
     }
-    fn sources(&mut self) -> Result<(String, Vec<Source>)> {
-        let cancel = AtomicBool::new(false);
-        let snapshot = self.repo.snapshot(&cancel).map_err(map_repo)?;
-        let key = self.cache_key(
-            CacheKind::Parse,
-            digest(b"real-polyglot-grammars/v1"),
-            snapshot.digest.clone(),
-        )?;
-        let admission = CacheAdmission {
-            authorized_now: true,
-            deterministic_readonly: true,
-            cancelled: self.revoked.load(Ordering::Acquire),
-        };
-        let now = melissa_execution_broker::unix_ms().map_err(|_| Error("clock".into()))?;
-        let ast = if let Some(bytes) = self.state.cache.get(&key, now, &admission)? {
-            let ast: Value = json(bytes)?;
-            *self.state.telemetry.entry("parse.hit".into()).or_default() += 1;
-            ast
-        } else {
-            let ast = value!(
-                PolyglotIndex::build_incremental(
-                    &self.repo,
-                    &snapshot,
-                    &cancel,
-                    &mut self.parse_cache
-                )
-                .map_err(map_repo)?
-            );
-            self.state.cache.put(
-                key,
-                serde_json::to_vec(&ast)?,
-                now,
-                self.grant.expires_at_ms.min(now + 60000),
-                &admission,
-            )?;
-            *self.state.telemetry.entry("parse.miss".into()).or_default() += 1;
-            ast
-        };
+    fn observe_memory(
+        &mut self,
+        additional: &[String],
+        cancel: &AtomicBool,
+    ) -> Result<(ObservedSources, SearchScope)> {
+        let ns = &self.grant.namespace;
         let now = melissa_execution_broker::unix_ms().map_err(|_| Error("host clock".into()))?;
-        let mut result = Vec::new();
-        for f in &snapshot.files {
-            let (_, bytes) = self.repo.read(&f.path).map_err(map_repo)?;
-            let Ok(text) = String::from_utf8(bytes) else {
-                continue;
-            };
-            let symbols = ast["symbols"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|s| s["path"] == f.path)
-                .filter_map(|s| s["name"].as_str().map(str::to_owned))
-                .collect();
-            result.push(Source {
-                id: f.path.clone(),
-                version: f.identity.clone() + ":" + &f.digest,
-                namespace: self.grant.namespace.clone(),
-                domain: Domain::Code,
-                digest: digest(text.as_bytes()),
-                content: text,
-                observed_at_ms: now,
-                valid_until_ms: self.grant.expires_at_ms.min(now + 60000),
-                symbols,
-                links: if self.state.semantic_snapshot == snapshot.digest {
-                    self.state
-                        .semantic
-                        .get(&f.path)
-                        .cloned()
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                },
-            });
-        }
-        self.repo
-            .validate_snapshot(&snapshot, &cancel)
-            .map_err(map_repo)?;
-        self.state.memory.revalidate_scoped(
-            &self.grant.namespace,
-            &result,
-            &snapshot.excluded_prefixes,
-        );
+        let observed = ObservedSources::observe(
+            &self.repo,
+            ns,
+            self.state
+                .memory
+                .source_ids(ns)
+                .chain(self.imported.iter().flat_map(|book| book.source_ids(ns)))
+                .chain(additional.iter().map(String::as_str)),
+            now,
+            self.grant.expires_at_ms,
+            cancel,
+        )?;
+        let excluded = self.repo.source_visibility().excluded_prefixes();
+        self.state
+            .memory
+            .revalidate_references(ns, observed.references(), excluded);
         for book in &mut self.imported {
-            book.revalidate_scoped(&self.grant.namespace, &result, &snapshot.excluded_prefixes);
+            book.revalidate_references(ns, observed.references(), excluded);
         }
-        Ok((snapshot.digest, result))
+        *self
+            .state
+            .telemetry
+            .entry("memory.source_bytes_read".into())
+            .or_default() += observed.bytes_read;
+        *self
+            .state
+            .telemetry
+            .entry("memory.files_read".into())
+            .or_default() += observed.files_read as u64;
+        let scope = observed.scope(ns, now);
+        Ok((observed, scope))
     }
+
     fn cache_key(
         &self,
         kind: CacheKind,
@@ -730,47 +698,58 @@ impl ContextRuntime {
         }
         Ok(())
     }
-    fn scope(&self, sources: &[Source]) -> SearchScope {
-        SearchScope {
-            namespace: self.grant.namespace.clone(),
-            domain: Domain::Code,
-            now_ms: melissa_execution_broker::unix_ms().unwrap_or(u64::MAX),
-            current: sources
-                .iter()
-                .map(|s| (s.id.clone(), (s.version.clone(), s.digest.clone())))
-                .collect(),
-        }
-    }
     fn persist(&mut self) -> Result<String> {
         let id = format!(
             "context-state:{}:{}",
             self.grant.task_id, self.state.sequence
         );
-        let artifact = format!("{id}:artifact");
-        let bytes = match crate::encode_state(&self.state) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                // Derived cache eviction cannot discard reviewed project facts.
-                self.state.cache = Cache::default();
-                self.parse_cache = Default::default();
-                crate::encode_state(&self.state)?
-            }
+        let project_book = self
+            .external_project_memory
+            .then(|| std::mem::take(&mut self.state.memory));
+        let encode = |state: &RuntimeState| -> Result<Vec<u8>> {
+            let bytes = crate::encode_state(state)?;
+            let _: RuntimeState = json(&bytes)?;
+            Ok(bytes)
         };
-        put(
-            &mut self.store,
-            &self.grant.task_id,
-            &artifact,
-            "context.project-state",
-            &bytes,
-        )?;
+        let bytes = encode(&self.state).or_else(|_| {
+            // Derived cache eviction cannot discard reviewed project facts.
+            self.state.cache = Cache::default();
+            encode(&self.state)
+        });
+        if let Some(book) = project_book {
+            self.state.memory = book;
+        }
+        let bytes = bytes?;
+        let mut object = blake3::Hasher::new();
+        object.update(&(id.len() as u64).to_le_bytes());
+        object.update(id.as_bytes());
+        object.update(&bytes);
+        let artifact = format!("context-state-object:{}", object.finalize().to_hex());
+        match self.store.artifact_metadata(&self.grant.task_id, &artifact) {
+            Ok(_) => require(
+                self.store.get_artifact(&self.grant.task_id, &artifact)? == bytes,
+                "checkpoint artifact mismatch",
+            )?,
+            Err(melissa_local_store::StoreError::NotFound(_)) => put(
+                &mut self.store,
+                &self.grant.task_id,
+                &artifact,
+                "context.project-state",
+                &bytes,
+            )?,
+            Err(error) => return Err(error.into()),
+        }
         let v = self
             .store
             .journal()
             .task(&self.grant.task_id)?
             .record
             .version;
-        self.store.journal_mut().append_checkpoint(
-            &id,
+        self.store.journal_mut().append_series_checkpoint(
+            (
+                &format!("context-state:{}:", self.grant.task_id),
+                self.state.sequence,
+            ),
             &self.grant.task_id,
             v,
             &artifact,
@@ -795,8 +774,7 @@ impl ContextRuntime {
         // Not present in ToolDispatcher definitions. Only a trusted reviewer
         // supplies this independently checked transition and evidence artifact.
         self.authority("memory.propose")?;
-        let (_, sources) = self.sources()?;
-        let scope = self.scope(&sources);
+        let (_, scope) = self.observe_memory(&[], &self.revoked.clone())?;
         self.store.get_artifact(&self.grant.task_id, evidence)?;
         self.state
             .memory
@@ -814,7 +792,6 @@ impl ContextRuntime {
         match id {
             "artifact_cleanup" => {
                 self.state.cache = Cache::default();
-                self.parse_cache = Default::default();
                 self.index_cache.clear(&self.index_binding)?;
                 self.repository_index = None;
                 self.state
@@ -992,25 +969,63 @@ impl ContextRuntime {
                 crate::graph_view::render(index, &self.repo, &report.snapshot, &query, cancel)?;
             return Ok(value!({"cached":false,"data":data}));
         }
-        let (snapshot, sources) = self.sources()?;
-        let scope = self.scope(&sources);
-        self.source_inventory = sources;
-        let now = scope.now_ms;
-        let kind = match op {
-            ContextOperation::SkillLoad { .. } => CacheKind::Prompt,
-            _ => CacheKind::ToolResult,
+        match op {
+            ContextOperation::MemorySearch { query } => {
+                let (_, scope) = self.observe_memory(&[], cancel)?;
+                let mut records = self.state.memory.search(&scope, query);
+                for book in &self.imported {
+                    records.extend(book.search(&scope, query));
+                }
+                return Ok(
+                    value!({"cached":false,"data":{"accepted":records,"proposal_is_not_fact":true}}),
+                );
+            }
+            ContextOperation::MemoryPropose {
+                key,
+                claim,
+                source_ids,
+            } => {
+                let (observed, _) = self.observe_memory(source_ids, cancel)?;
+                let selected = observed.select(source_ids.iter().map(String::as_str))?;
+                let id = format!("memory:{}", ctx.invocation_id);
+                let hash = self.state.memory.propose_references(
+                    &id,
+                    self.grant.namespace.clone(),
+                    key,
+                    claim,
+                    &selected,
+                )?;
+                return Ok(
+                    value!({"cached":false,"data":{"id":id,"proposal_digest":hash,"status":"proposed","verified":false}}),
+                );
+            }
+            _ => {}
+        }
+        let now = melissa_execution_broker::unix_ms().map_err(|_| Error("host clock".into()))?;
+        let key = match op {
+            ContextOperation::SkillLoad { .. } | ContextOperation::Template { .. } => {
+                // These inputs are pinned packages or explicit template fields.
+                // Bind to workspace visibility without reading unrelated files.
+                Some(self.cache_key(
+                    if matches!(op, ContextOperation::SkillLoad { .. }) {
+                        CacheKind::Prompt
+                    } else {
+                        CacheKind::ToolResult
+                    },
+                    digest(&serde_json::to_vec(op)?),
+                    self.repo.source_visibility_digest().map_err(map_repo)?,
+                )?)
+            }
+            _ => None,
         };
-        let key=self.cache_key(kind,digest(&serde_json::to_vec(&value!({"operation":op,"native_semantic_snapshot":self.state.semantic_snapshot,"native_semantic_graph":self.state.semantic}))?),snapshot)?;
-        let cacheable = matches!(
-            op,
-            ContextOperation::SkillLoad { .. } | ContextOperation::Template { .. }
-        );
         let admission = CacheAdmission {
             authorized_now: true,
             deterministic_readonly: true,
             cancelled: cancel.load(Ordering::Acquire),
         };
-        if cacheable && let Some(bytes) = self.state.cache.get(&key, now, &admission)? {
+        if let Some(key) = &key
+            && let Some(bytes) = self.state.cache.get(key, now, &admission)?
+        {
             let output: Value = json(bytes)?;
             *self
                 .state
@@ -1031,43 +1046,8 @@ impl ContextRuntime {
             ContextOperation::Search { .. } => {
                 unreachable!("search handled before source collection")
             }
-            ContextOperation::MemorySearch { query } => {
-                let mut values = self
-                    .state
-                    .memory
-                    .search(&scope, query)
-                    .into_iter()
-                    .cloned()
-                    .collect::<Vec<_>>();
-                for b in &self.imported {
-                    values.extend(b.search(&scope, query).into_iter().cloned());
-                }
-                value!({"accepted":values,"proposal_is_not_fact":true})
-            }
-            ContextOperation::MemoryPropose {
-                key,
-                claim,
-                source_ids,
-            } => {
-                let selected = source_ids
-                    .iter()
-                    .map(|id| {
-                        self.source_inventory
-                            .iter()
-                            .find(|s| &s.id == id)
-                            .ok_or_else(|| Error("unknown memory source".into()))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                crate::state::validate_memory_sources(selected.iter().copied())?;
-                let id = format!("memory:{}", ctx.invocation_id);
-                let d = self.state.memory.propose_borrowed(
-                    &id,
-                    self.grant.namespace.clone(),
-                    key,
-                    claim,
-                    &selected,
-                )?;
-                value!({"id":id,"proposal_digest":d,"status":"proposed","verified":false})
+            ContextOperation::MemorySearch { .. } | ContextOperation::MemoryPropose { .. } => {
+                unreachable!("memory handled above")
             }
             ContextOperation::Template { pin, path, fields } => {
                 require(self.grant.pins.contains(pin), "unselected template package")?;
@@ -1087,7 +1067,7 @@ impl ContextRuntime {
             }
             ContextOperation::CommonScript { id, input } => self.local_script(id, input)?,
         };
-        if cacheable {
+        if let Some(key) = key {
             *self
                 .state
                 .telemetry

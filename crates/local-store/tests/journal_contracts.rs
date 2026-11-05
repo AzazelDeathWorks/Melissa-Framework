@@ -819,3 +819,68 @@ fn two_live_unknown_outcomes_preserve_first_marker_and_both_attempts() {
     );
     j.integrity_check().unwrap();
 }
+
+#[test]
+fn indexed_checkpoint_series_migrates_restarts_and_rejects_head_rollback() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("j.db");
+    let mut j = open(&path);
+    running(&mut j, "a");
+    running(&mut j, "b");
+    fake_artifact(&path, "artifact", "a");
+    let version = j.task("a").unwrap().record.version;
+    j.append_checkpoint("series:0", "a", version, "artifact", json!({"n":0}))
+        .unwrap();
+    j.append_series_checkpoint(("series:", 1), "a", version, "artifact", json!({"n":1}))
+        .unwrap();
+    let sql = Connection::open(&path).unwrap();
+    let first: Vec<u8> = sql
+        .query_row(
+            "SELECT value FROM store_metadata WHERE name GLOB 'checkpoint-series/v1:*'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        j.append_series_checkpoint(("series:", 2), "a", version, "missing", json!({}))
+            .is_err()
+    );
+    assert!(
+        j.append_checkpoint("series:2", "a", version, "artifact", json!({}))
+            .is_err()
+    );
+    assert_eq!(j.latest_checkpoint_in_series("a", "series:").unwrap().0, 2);
+    for n in 2..320 {
+        j.append_series_checkpoint(("series:", n), "a", version, "artifact", json!({"n":n}))
+            .unwrap();
+    }
+    assert_eq!(
+        j.latest_checkpoint_in_series("b", "series:").unwrap(),
+        (0, None)
+    );
+    drop(j);
+    let j = open(&path);
+    let start = std::time::Instant::now();
+    let (next, checkpoint) = j.latest_checkpoint_in_series("a", "series:").unwrap();
+    assert_eq!(next, 320);
+    assert_eq!(checkpoint.unwrap().data["n"], 319);
+    eprintln!(
+        "CHECKPOINT_HEAD history=320 lookup_us={}",
+        start.elapsed().as_micros()
+    );
+    sql.execute(
+        "UPDATE store_metadata SET value=?1 WHERE name GLOB 'checkpoint-series/v1:*'",
+        [first],
+    )
+    .unwrap();
+    assert!(j.latest_checkpoint_in_series("a", "series:").is_err());
+    assert!(j.integrity_check().is_err());
+    sql.execute(
+        "DELETE FROM store_metadata WHERE name GLOB 'checkpoint-series/v1:*'",
+        [],
+    )
+    .unwrap();
+    assert!(j.latest_checkpoint_in_series("a", "series:").is_err());
+    drop(j);
+    assert!(Journal::open(&path, key(), JournalLimits::default()).is_err());
+}
