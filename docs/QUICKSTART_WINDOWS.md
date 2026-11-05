@@ -2,7 +2,23 @@
 
 The preview uses a Windows x64 CLI and Docker Desktop with the Linux engine for isolated build and test jobs. An offline task preparation example also runs without Docker or model credentials. These are separate checks.
 
-## Verify and unpack
+## Install with one command
+
+Put `install.ps1`, the Windows ZIP and `SHA256SUMS.txt` from the same build in one directory. In PowerShell, run:
+
+```powershell
+.\install.ps1
+```
+
+The installer checks the ZIP and executable hashes, installs into `%LOCALAPPDATA%\Programs\Melissa`, and registers the command in the current and future PowerShell sessions for your account. During an update it keeps the previous executable under `previous` so you can reopen tasks tied to its exact binary.
+
+For a published version, download the installer from the matching GitHub Release and run `.\install.ps1 -Version 0.3.0-alpha.2` to download and verify its package.
+
+Open PowerShell in your project directory and run `melissa`. Type your task to prepare a plan locally. Use `/help` for the session commands. You can also use `melissa session --workspace C:\Projects\Example` to select a project explicitly.
+
+For a model-backed task, use `/config PATH` for private model settings and `/acceptance PATH` for an operator-authored recipe outside the project. Then type the task, review the draft, and use `/create` to see the exact scope and budget. `/approve` records approval and `/run` starts model-backed execution. Use `/status` and `/diff` to inspect the result. Use `/open TASK_ID` in the same project to reopen a saved task.
+
+## Verify and unpack for the offline example
 
 Download the Windows ZIP and its SHA-256 list from the same release. Run `Get-FileHash -Algorithm SHA256 <zip>` and compare the value with `SHA256SUMS.txt`. Extract the ZIP to a new directory. Its manifest identifies the source commit, executable hash and required SDK worker image.
 

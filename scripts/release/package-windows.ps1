@@ -72,4 +72,5 @@ try {
 
 $hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
 Set-Content -LiteralPath (Join-Path $target 'SHA256SUMS.txt') -Encoding ascii -Value "$hash  $archiveName"
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'install.ps1') -Destination $target
 [pscustomobject]@{archive = $archivePath; sha256 = $hash; version = $version; source_commit = $revision}

@@ -405,6 +405,28 @@ impl App {
         };
         self.create_inner(workspace, goal, &profile, excludes, Some(execution))
     }
+    pub(crate) fn require_separate_workspace(&self, repo: &Repository) -> Result {
+        for p in self.home.ancestors() {
+            if let Ok(r) = Repository::open(p, Limits::default(), vec![])
+                && r.root_identity() == repo.root_identity()
+            {
+                return Err(Error::Denied(
+                    "CLI veri klasörü çalışma projesinin dışında olmalı.",
+                ));
+            }
+        }
+        for p in repo.root_path().ancestors() {
+            if let Ok(r) = Repository::open(p, Limits::default(), vec![])
+                && r.root_identity() == self._pin.root_identity()
+            {
+                return Err(Error::Denied(
+                    "Veri klasörünün içi kaynak projesi olarak kullanılamaz.",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn create_inner(
         &self,
         workspace: &Path,
@@ -428,24 +450,7 @@ impl App {
         let root = absolute(workspace)?;
         let limits = Limits::default();
         let repo = Repository::open(&root, limits.clone(), excludes.clone())?;
-        for p in self.home.ancestors() {
-            if let Ok(r) = Repository::open(p, Limits::default(), vec![])
-                && r.root_identity() == repo.root_identity()
-            {
-                return Err(Error::Denied(
-                    "CLI veri klasörü çalışma projesinin dışında olmalı.",
-                ));
-            }
-        }
-        for p in root.ancestors() {
-            if let Ok(r) = Repository::open(p, Limits::default(), vec![])
-                && r.root_identity() == self._pin.root_identity()
-            {
-                return Err(Error::Denied(
-                    "Veri klasörünün içi kaynak projesi olarak kullanılamaz.",
-                ));
-            }
-        }
+        self.require_separate_workspace(&repo)?;
         let frozen =
             FrozenSource::capture(&repo, &AtomicBool::new(false)).map_err(|_| Error::Repository)?;
         let id = format!("task_{}", nonce()?);

@@ -1,6 +1,7 @@
 use crate::{Error, Result};
 pub const METRICS_HELP: &str =
     "\nGörev ölçümleri:\n  melissa [--home PATH] --json task metrics ID\n";
+pub const SESSION_HELP: &str = "\nTerminal oturumu:\n  melissa\n  melissa [--home PATH] session [--workspace PATH]\n\nGörevini yaz veya oturum komutları için /help yaz.";
 pub const CAPABILITIES_HELP: &str = "\nProje belleği ve görev hazırlığı:\n  melissa task prepare --workspace PATH --goal TEXT --out NEW_FILE [--acceptance PRIVATE_RECIPE]\n  melissa memory list --workspace PATH\n  melissa memory accept|reject|forget --workspace PATH --id MEMORY_ID --digest REVIEW_DIGEST\n  melissa task replan ID --recipe REVIEWED_RECIPE\n\nPrepare yerel, incelenebilir taslak çıkarır; modeli çalıştırmaz veya kabul cevabı uydurmaz. Bellek önerileri operatör kabul edene kadar aramada kullanılmaz. Replan güvenli pause durumunda yalnız kalan uzman adımlarını değiştirir; çalışan adım korunur, revizyon o adım bittikten sonra etkinleşir. İlk dosya, kabul, süre ve maliyet yetkisi değişmez.\n";
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -20,6 +21,9 @@ pub const DOMAIN_HELP: &str = "\nWeb/API/veritabanı (v2 özel tarif):\n  meliss
 pub enum Command {
     Help,
     Version,
+    Session {
+        workspace: Option<PathBuf>,
+    },
     Init,
     Profiles,
     Doctor,
@@ -139,6 +143,15 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options> {
     {
         "--help" | "-h" | "help" => Command::Help,
         "--version" => Command::Version,
+        "session" => {
+            if json {
+                return Err(Error::Usage("Terminal oturumu --json ile kullanılamaz."));
+            }
+            let mut f = flags(&mut a, &["--workspace"])?;
+            Command::Session {
+                workspace: f.remove("--workspace").map(PathBuf::from),
+            }
+        }
         "init" => Command::Init,
         "profiles" => Command::Profiles,
         "doctor" => Command::Doctor,

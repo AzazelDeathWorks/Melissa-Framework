@@ -1,6 +1,6 @@
 [package]
 name = "melissa-cli"
-version = "0.3.0-alpha.1"
+version = "0.3.0-alpha.2"
 edition.workspace = true
 publish.workspace = true
 license.workspace = true

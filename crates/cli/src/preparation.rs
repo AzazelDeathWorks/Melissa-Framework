@@ -73,6 +73,7 @@ impl App {
             ));
         }
         let repo = Repository::open(&root, Limits::default(), vec![])?;
+        self.require_separate_workspace(&repo)?;
         let snap = repo.snapshot(&AtomicBool::new(false))?;
         let acceptance_template = acceptance.map(Recipe::read).transpose()?;
         let (role, write) = intent(goal);

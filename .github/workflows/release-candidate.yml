@@ -46,7 +46,7 @@ jobs:
         with:
           name: melissa-windows-x64-preview
           path: ${{ runner.temp }}/melissa-download
-      - name: Verify and use the ZIP on a fresh Windows runner
+      - name: Install and open a project session on a fresh Windows runner
         shell: pwsh
         run: |
           $root = Join-Path $env:RUNNER_TEMP 'melissa-download'
@@ -56,14 +56,24 @@ jobs:
           $hashLine = Get-Content -LiteralPath (Join-Path $root 'SHA256SUMS.txt') -Raw
           $hash = (Get-FileHash -LiteralPath $zip.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($hashLine.Trim() -ne "$hash  $($zip.Name)") { throw 'Package digest mismatch.' }
-          $install = Join-Path $env:RUNNER_TEMP 'melissa-installed'
-          Expand-Archive -LiteralPath $zip.FullName -DestinationPath $install
-          $manifest = Get-Content -LiteralPath (Join-Path $install 'release-manifest.json') -Raw | ConvertFrom-Json
+          $extracted = Join-Path $env:RUNNER_TEMP 'melissa-extracted'
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath $extracted
+          $manifest = Get-Content -LiteralPath (Join-Path $extracted 'release-manifest.json') -Raw | ConvertFrom-Json
           if ($manifest.source_commit -ne $env:GITHUB_SHA) { throw 'Package is from another commit.' }
-          $binary = Join-Path $install 'melissa.exe'
+          $install = & (Join-Path $root 'install.ps1') -InstallRoot (Join-Path $env:RUNNER_TEMP 'melissa-bin')
+          $binary = (Get-Command melissa -CommandType Application -ErrorAction Stop).Source
+          if ($binary -ne $install.executable) { throw 'The installed Melissa did not resolve on PATH.' }
           if ((Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.executable_sha256) {
               throw 'Executable digest mismatch.'
           }
-          $version = & $binary --version
+          $version = melissa --version
           if ($LASTEXITCODE -ne 0 -or $version -ne "melissa $($manifest.version)") { throw 'Unexpected CLI version.' }
-          & (Join-Path $install 'quickstart.ps1') -OutputRoot (Join-Path $env:RUNNER_TEMP 'melissa-offline-demo')
+          $demo = & (Join-Path $extracted 'quickstart.ps1') -Melissa $binary -OutputRoot (Join-Path $env:RUNNER_TEMP 'melissa-offline-demo') | ConvertFrom-Json
+          if ($demo.status -ne 'PASS' -or $demo.model_dispatches -ne 0) { throw 'Offline preparation failed.' }
+          Push-Location -LiteralPath $demo.workspace
+          try {
+              $transcript = @('Fix main.py to reverse the array', '/plan', '/exit') | melissa --home $demo.home session | Out-String
+              if ($LASTEXITCODE -ne 0 -or $transcript -notmatch '"task_goal"' -or $transcript -notmatch 'melissa>') {
+                  throw 'The project session did not prepare a task.'
+              }
+          } finally { Pop-Location }

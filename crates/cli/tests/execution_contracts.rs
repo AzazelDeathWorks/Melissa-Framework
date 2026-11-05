@@ -1,7 +1,12 @@
 #![cfg(windows)]
 use melissa_cli::{app::App, recipe::Recipe, settings::Settings};
 use serde_json::{Value, json};
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    io::Write,
+    path::PathBuf,
+    process::{Command, Stdio},
+};
 struct Fixture {
     temp: tempfile::TempDir,
     home: PathBuf,
@@ -133,6 +138,46 @@ async fn unapproved_execution_cannot_resolve_a_key_or_start_a_model() {
     let current = f.app().show(id).unwrap();
     assert_eq!(current["state"], "awaiting_approval");
     assert_eq!(current["model_budget"]["known_cost_micro_usd"], 0);
+    assert!(!f.home.join("tasks").join(id).join("control").exists());
+}
+#[test]
+fn terminal_prepares_current_project_and_keeps_execution_separate_from_approval() {
+    let f = Fixture::new();
+    let recipe = f.temp.path().join("private acceptance.json");
+    fs::write(&recipe, serde_json::to_vec(&f.recipe).unwrap()).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_melissa"))
+        .current_dir(&f.source)
+        .arg("--home")
+        .arg(&f.home)
+        .arg("session")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        child.stdin.take().unwrap(),
+        "Fix main.py\n/create\n/acceptance \"{}\"\nFix main.py\n/create\n/run\n/approve\n/exit",
+        recipe.display()
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let transcript = String::from_utf8(output.stdout).unwrap();
+    assert!(transcript.contains("Melissa terminal oturumu"));
+    assert!(transcript.contains(f.source.to_str().unwrap()));
+    assert!(transcript.contains("Önce kabul tarifini seç"));
+    assert!(transcript.contains("Yürütme için kaynak bağlı onay"));
+    assert!(transcript.contains("Onay kaydedildi"));
+    assert!(!transcript.contains("\"expected\":"));
+    let list = f.app().list().unwrap();
+    let tasks = list["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0]["state"], "queued");
+    let id = tasks[0]["task_id"].as_str().unwrap();
+    assert_eq!(
+        f.app().metrics(id).unwrap()["metrics"]["model_dispatch_attempts"],
+        0
+    );
     assert!(!f.home.join("tasks").join(id).join("control").exists());
 }
 #[test]

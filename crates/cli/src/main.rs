@@ -2,9 +2,11 @@ use melissa_cli::{
     Result,
     app::{App, default_home},
     args::{self, Command},
-    display,
+    display, session,
 };
 use serde_json::{Value, json};
+use std::io::{self, IsTerminal};
+
 async fn run(options: &args::Options) -> Result<Value> {
     if matches!(options.command, Command::Doctor) {
         return melissa_cli::views::doctor();
@@ -15,6 +17,20 @@ async fn run(options: &args::Options) -> Result<Value> {
         );
     }
     let home = options.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    if let Command::Session { workspace } = &options.command {
+        let workspace = workspace
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(std::env::current_dir)?;
+        session::run(
+            &home,
+            &workspace,
+            &mut io::stdin().lock(),
+            &mut io::stdout().lock(),
+        )
+        .await?;
+        return Ok(Value::Null);
+    }
     if matches!(options.command, Command::Init) {
         return App::init(&home);
     }
@@ -83,7 +99,14 @@ async fn run(options: &args::Options) -> Result<Value> {
 }
 #[tokio::main]
 async fn main() {
-    let options = match args::parse(std::env::args_os().skip(1)) {
+    let mut cli_args = std::env::args_os().skip(1).peekable();
+    let parsed =
+        if cli_args.peek().is_none() && io::stdin().is_terminal() && io::stdout().is_terminal() {
+            args::parse(["session".into()])
+        } else {
+            args::parse(cli_args)
+        };
+    let options = match parsed {
         Ok(o) => o,
         Err(e) => {
             eprintln!("{e}");
@@ -92,6 +115,7 @@ async fn main() {
     };
     if matches!(options.command, Command::Help) {
         println!("{}", args::HELP);
+        println!("{}", args::SESSION_HELP);
         println!("{}", args::EXECUTION_HELP);
         println!("{}", args::DOMAIN_HELP);
         println!("{}", args::CAPABILITIES_HELP);
@@ -103,6 +127,7 @@ async fn main() {
         return;
     }
     match run(&options).await {
+        Ok(_) if matches!(options.command, Command::Session { .. }) => {}
         Ok(value) => match if options.json {
             display::json(&value)
         } else {
