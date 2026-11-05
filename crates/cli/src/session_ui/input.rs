@@ -185,9 +185,14 @@ fn next_boundary(text: &str, cursor: usize) -> usize {
 }
 
 fn viewport(text: &str, cursor: usize, width: usize) -> (String, usize) {
-    let mut start = 0;
-    while text[start..cursor].width() >= width.saturating_sub(1) && start < cursor {
-        start = next_boundary(text, start + 1);
+    let mut start = cursor;
+    let mut occupied = 0;
+    for (index, grapheme) in text[..cursor].grapheme_indices(true).rev() {
+        if occupied + grapheme.width() > width.saturating_sub(2) {
+            break;
+        }
+        start = index;
+        occupied += grapheme.width();
     }
     let prefix = if start == 0 { "" } else { "‹" };
     let mut visible = prefix.to_owned();
@@ -217,5 +222,10 @@ mod tests {
             assert!(visible.width() <= width);
             assert!(cursor < width);
         }
+        let long = "x".repeat(16384);
+        let (visible, cursor) = viewport(&long, long.len(), 24);
+        assert!(visible.starts_with('‹'));
+        assert!(visible.width() <= 24);
+        assert!(cursor < 24);
     }
 }
