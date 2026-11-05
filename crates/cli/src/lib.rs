@@ -78,3 +78,6 @@ impl From<std::io::Error> for Error {
 pub(crate) fn digest(b: &[u8]) -> String {
     format!("blake3:{}", blake3::hash(b))
 }
+
+mod model_pool;
+pub mod model_tools;

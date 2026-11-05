@@ -27,6 +27,11 @@ pub struct Measurements {
     pub verification_cost_micro_usd: Option<u64>,
     pub availability_ppm: Option<u32>,
 }
+impl Measurements {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PriceSource {

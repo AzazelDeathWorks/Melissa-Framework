@@ -1338,3 +1338,72 @@ fn adaptive_test_authoring_keeps_a_writer_and_a_separate_readonly_verifier() {
         json!(["main.py"])
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "isolated native SDK worker; no external provider"]
+async fn terminal_profile_runs_exact_sdk_command_without_arbitrary_arguments() {
+    use crate::model_tools::{ModelTools, ToolProfile};
+    let f = Fixture::new("melissa.code.implementer");
+    let mut tools = ModelTools {
+        inner: Box::new(f.development()),
+        profile: ToolProfile::Terminal,
+        specialist: f.task.selected_profile_ids[0].clone(),
+        writes: true,
+        domain: false,
+    };
+    assert!(
+        tools
+            .definitions()
+            .iter()
+            .any(|t| t.definition.name == "sandbox_check")
+    );
+    let denied = ToolCall {
+        id: "forbidden-argv".into(),
+        name: "sandbox_check".into(),
+        arguments: r#"{"argv":["sh"]}"#.into(),
+    };
+    assert!(tools.validate_call(&denied).is_err());
+    tools.profile = ToolProfile::Precision;
+    assert!(
+        tools
+            .definitions()
+            .iter()
+            .any(|t| t.definition.name == "code_project_check")
+    );
+    assert!(
+        !tools
+            .definitions()
+            .iter()
+            .any(|t| t.definition.name == "sandbox_check")
+    );
+    tools.profile = ToolProfile::Hybrid;
+    assert!(
+        tools
+            .definitions()
+            .iter()
+            .any(|t| t.definition.name == "sandbox_check")
+    );
+    assert!(
+        tools
+            .definitions()
+            .iter()
+            .any(|t| t.definition.name == "code_project_tests")
+    );
+    tools.profile = ToolProfile::Terminal;
+    fs::write(
+        f.source.join("main.py"),
+        "def double(x: int) -> int:\n    return x * 2\n",
+    )
+    .unwrap();
+    let before = f.repo().snapshot(&AtomicBool::new(false)).unwrap().digest;
+    let receipt = f
+        .call(&mut tools, "sandbox_check", json!({}), "sandbox-check")
+        .await;
+    assert!(receipt.success, "{}", receipt.content);
+    assert!(!receipt.artifact_refs.is_empty());
+    assert_eq!(
+        f.repo().snapshot(&AtomicBool::new(false)).unwrap().digest,
+        before
+    );
+    assert!(!receipt.requires_reconciliation);
+}
