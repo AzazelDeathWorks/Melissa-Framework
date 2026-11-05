@@ -12,9 +12,11 @@ Put `install.ps1`, the Windows ZIP and `SHA256SUMS.txt` from the same build in o
 
 The installer checks the ZIP and executable hashes, installs into `%LOCALAPPDATA%\Programs\Melissa`, and registers the command in the current and future PowerShell sessions for your account. During an update it keeps the previous executable under `previous` so you can reopen tasks tied to its exact binary.
 
-For a published version, download the installer from the matching GitHub Release and run `.\install.ps1 -Version 0.3.0-alpha.2` to download and verify its package.
+For a published version, download the installer from the matching GitHub Release and run `.\install.ps1 -Version 0.3.0-alpha.3` to download and verify its package.
 
 Open PowerShell in your project directory and run `melissa`. Type your task to prepare a plan locally. Use `/help` for the session commands. You can also use `melissa session --workspace C:\Projects\Example` to select a project explicitly.
+
+The interactive session shows a project panel and compact task cards. Use the left and right arrows to edit, the up and down arrows for this session's history, and Tab to complete an unambiguous slash command. Esc clears the input. Ctrl+C clears a nonempty input or exits from an empty prompt. History stays in memory. Terminal resizing keeps the input cursor visible. Set `NO_COLOR` to disable colors. Redirected input and output retain the plain session format. Use `/details` to see the complete recorded task scope.
 
 For a model-backed task, use `/config PATH` for private model settings and `/acceptance PATH` for an operator-authored recipe outside the project. Then type the task, review the draft, and use `/create` to see the exact scope and budget. `/approve` records approval and `/run` starts model-backed execution. Use `/status` and `/diff` to inspect the result. Use `/open TASK_ID` in the same project to reopen a saved task.
 

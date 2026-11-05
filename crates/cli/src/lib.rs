@@ -16,6 +16,7 @@ pub mod recipe;
 mod repository_signals;
 pub mod resources;
 pub mod session;
+mod session_ui;
 pub mod settings;
 pub mod views;
 pub type Result<T = ()> = std::result::Result<T, Error>;

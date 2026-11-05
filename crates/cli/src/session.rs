@@ -3,6 +3,7 @@ use crate::{
     app::{App, absolute, nonce, safe_path},
     display,
     recipe::Recipe,
+    session_ui::Ui,
 };
 use serde_json::Value;
 use std::{
@@ -16,6 +17,7 @@ const HELP: &str = "Bir görev yaz veya aşağıdaki komutları kullan.\n\
   /config DOSYA           Özel model ayarlarını içe aktar\n\
   /acceptance DOSYA       Proje dışındaki kabul tarifini seç\n\
   /plan                   Son hazırlığı veya görev planını göster\n\
+  /details                Kayda bağlı tam plan ve kapsamı göster\n\
   /create                 Hazır tarifi görev olarak kaydet ve onay kapsamını göster\n\
   /approve                Ekranda gösterilen kesin görev kapsamını onayla\n\
   /run                    Onaylı görevi çalıştır (API ücreti doğabilir)\n\
@@ -43,6 +45,7 @@ struct Session {
     acceptance: Option<PathBuf>,
     draft: Option<Draft>,
     task: Option<Task>,
+    ui: Ui,
 }
 
 pub async fn run(
@@ -63,23 +66,19 @@ pub async fn run(
         acceptance: None,
         draft: None,
         task: None,
+        ui: Ui::new(),
     };
-    writeln!(output, "Melissa terminal oturumu")?;
-    writeln!(
+    session.ui.welcome(
+        &session.workspace,
+        session.app.configuration().is_ok(),
         output,
-        "Proje: {}",
-        display::safe(&session.workspace.to_string_lossy())
     )?;
-    writeln!(
-        output,
-        "Görevini yaz. Komutlar için /help, çıkmak için /exit."
-    )?;
-    let mut line = String::new();
     loop {
-        write!(output, "melissa> ")?;
-        output.flush()?;
-        line.clear();
-        if input.read_line(&mut line)? == 0 || line.trim() == "/exit" {
+        let context = session.context();
+        let Some(line) = session.ui.read_line(input, output, context)? else {
+            return Ok(());
+        };
+        if line.trim() == "/exit" {
             return Ok(());
         }
         let line = line.trim();
@@ -87,12 +86,28 @@ pub async fn run(
             continue;
         }
         if let Err(error) = session.handle(line, output).await {
-            writeln!(output, "{error}")?;
+            session.ui.notice(&error.to_string(), output)?;
         }
     }
 }
 
 impl Session {
+    fn context(&self) -> &'static str {
+        if self
+            .task
+            .as_ref()
+            .is_some_and(|task| task.approval.is_some())
+        {
+            "ONAY BEKLİYOR  ·  /approve onayla  ·  /details tam kapsam"
+        } else if self.task.is_some() {
+            "GÖREV  ·  /run çalıştır  ·  /status durum  ·  /diff değişiklikler"
+        } else if self.draft.as_ref().is_some_and(|draft| draft.ready) {
+            "TARİF HAZIR  ·  /create görev oluştur  ·  /plan incele"
+        } else {
+            "YEREL PLANLAMA  ·  /help komutlar  ·  ↑↓ geçmiş  ·  Tab tamamla"
+        }
+    }
+
     async fn handle(&mut self, line: &str, output: &mut impl Write) -> Result {
         if !line.starts_with('/') {
             return self.prepare(line, output);
@@ -100,7 +115,7 @@ impl Session {
         let (command, argument) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
         let argument = argument.trim();
         let result = match (command, argument) {
-            ("/help", "") => return Ok(writeln!(output, "{HELP}")?),
+            ("/help", "") => return self.ui.help(HELP, output),
             ("/doctor", "") => crate::views::doctor()?,
             ("/config", path) => self.app.configure(&path_argument(path)?)?,
             ("/acceptance", path) => {
@@ -109,13 +124,26 @@ impl Session {
                 self.acceptance = Some(path);
                 self.draft = None;
                 self.task = None;
-                return Ok(writeln!(
-                    output,
-                    "Kabul tarifi seçildi. Görevin amacını yaz."
-                )?);
+                return self
+                    .ui
+                    .notice("Kabul tarifi seçildi. Görevin amacını yaz.", output);
             }
             ("/plan", "") if self.task.is_none() => return self.show_draft(output),
             ("/plan" | "/status", "") => self.app.progress(&self.task()?.id)?,
+            ("/details", "") if self.task.is_none() => {
+                let draft = self
+                    .draft
+                    .as_ref()
+                    .ok_or(Error::Usage("Önce bir amaç yaz."))?;
+                writeln!(output, "{}", display::json(&draft.plan)?)?;
+                return self
+                    .ui
+                    .notice(&format!("Plan kaydı {}", draft.path.display()), output);
+            }
+            ("/details", "") => {
+                let value = self.app.progress(&self.task()?.id)?;
+                return Ok(writeln!(output, "{}", display::human(&value)?)?);
+            }
             ("/create", "") => return self.create(output),
             ("/open", id) if !id.is_empty() => {
                 return self.select_task(&self.app.show(id)?, output);
@@ -127,23 +155,22 @@ impl Session {
                 ))?;
                 self.app.approve(&task.id, request, digest)?;
                 self.task.as_mut().ok_or(Error::Store)?.approval = None;
-                return Ok(writeln!(
-                    output,
-                    "Onay kaydedildi. Başlatmak için /run yaz."
-                )?);
+                return self
+                    .ui
+                    .notice("Onay kaydedildi. Başlatmak için /run yaz.", output);
             }
             ("/run" | "/resume", "") => {
                 let id = &self.task()?.id;
                 writeln!(output, "Yürütme isteği: {}", display::safe(id))?;
                 output.flush()?;
-                self.app.run_task(id, command == "/resume").await?
+                let run = Box::pin(self.app.run_task(id, command == "/resume"));
+                self.ui.working(run, output).await?
             }
             ("/diff", "") => self.app.diff(&self.task()?.id)?,
             ("/delivery", "") => self.app.delivery(&self.task()?.id, None)?,
             _ => return Err(Error::Usage("Oturum komutu geçersiz. /help yaz.")),
         };
-        writeln!(output, "{}", display::human(&result)?)?;
-        Ok(())
+        self.ui.result(&result, output)
     }
 
     fn task(&self) -> Result<&Task> {
@@ -176,19 +203,7 @@ impl Session {
             .draft
             .as_ref()
             .ok_or(Error::Usage("Önce bir amaç yaz."))?;
-        writeln!(output, "{}", display::json(&draft.plan)?)?;
-        writeln!(
-            output,
-            "Yerel plan: {}",
-            display::safe(&draft.path.to_string_lossy())
-        )?;
-        let next = if draft.ready {
-            "Tarifi incele, model ayarlarını /config ile yükle ve /create yaz."
-        } else {
-            "Yürütme için proje dışındaki kabul tarifini /acceptance DOSYA ile seç ve amacı tekrar yaz."
-        };
-        writeln!(output, "{next}")?;
-        Ok(())
+        self.ui.draft(&draft.plan, &draft.path, draft.ready, output)
     }
 
     fn create(&mut self, output: &mut impl Write) -> Result {
@@ -229,9 +244,10 @@ impl Session {
             } else {
                 None
             };
-        writeln!(output, "{}", display::human(value)?)?;
+        self.ui.result(value, output)?;
         if approval.is_some() {
-            writeln!(output, "Bu kapsamı onaylamak için /approve yaz.")?;
+            self.ui
+                .notice("Bu kapsamı onaylamak için /approve yaz.", output)?;
         }
         self.task = Some(Task { id, approval });
         Ok(())
