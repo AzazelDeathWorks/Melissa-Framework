@@ -102,11 +102,7 @@ pub struct Scheduler {
     cancelled: Arc<AtomicBool>,
 }
 fn parse<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T> {
-    let text = std::str::from_utf8(bytes)
-        .map_err(|_| error(Kind::Store, "non-UTF8 owned workflow record"))?;
-    Ok(serde_json::from_value(melissa_model_gateway::strict_json(
-        text,
-    )?)?)
+    Ok(melissa_model_gateway::checkpoint::decode(bytes)?)
 }
 fn cp(task: &str, workflow: &str, n: u64) -> String {
     format!("workflow:{task}:{workflow}:checkpoint:{n}")
@@ -201,8 +197,13 @@ impl Scheduler {
             refresh,
             cancelled,
         };
-        owner.fresh(&initial)?;
-        Self::write(&mut store, &initial)?;
+        let version = owner.fresh(&initial)?;
+        Self::write(
+            &mut store,
+            &initial,
+            version,
+            Some((&owner.cancelled, initial.deadline_ms)),
+        )?;
         Ok(Self { store, ..owner })
     }
     pub fn open(
@@ -280,8 +281,13 @@ impl Scheduler {
         }
         latest.ok_or_else(|| error(Kind::Store, "workflow checkpoint missing"))
     }
-    fn write(store: &mut LocalStore, state: &State) -> Result<()> {
-        let bytes = serde_json::to_vec(state)?;
+    fn write(
+        store: &mut LocalStore,
+        state: &State,
+        expected_task_version: u64,
+        active: Option<(&AtomicBool, u64)>,
+    ) -> Result<()> {
+        let bytes = melissa_model_gateway::checkpoint::encode(state)?;
         let h = digest(&bytes);
         let artifact = format!("workflow:{}:{}:state:{}", state.plan.task, state.plan.id, h);
         match store.artifact_metadata(&state.plan.task, &artifact) {
@@ -306,13 +312,19 @@ impl Scheduler {
             }
             Err(e) => return Err(e.into()),
         }
-        let version = store.journal().task(&state.plan.task)?.record.version;
+        if let Some((cancel, deadline)) = active {
+            require(
+                !cancel.load(Ordering::Acquire) && now()? < deadline,
+                Kind::Cancelled,
+                "workflow cancelled or lease expired before checkpoint admission",
+            )?;
+        }
         store
             .journal_mut()
             .append_checkpoint(
                 &cp(&state.plan.task, &state.plan.id, state.sequence),
                 &state.plan.task,
-                version,
+                expected_task_version,
                 &artifact,
                 json!({"workflow_digest":h}),
             )
@@ -324,7 +336,18 @@ impl Scheduler {
             })?;
         Ok(())
     }
-    fn commit(&mut self, old: &State, mut next: State, reason: &str) -> Result<State> {
+    fn commit(&mut self, old: &State, next: State, reason: &str) -> Result<State> {
+        let version = self.store.journal().task(&self.task)?.record.version;
+        self.commit_version(old, next, reason, version, false)
+    }
+    fn commit_version(
+        &mut self,
+        old: &State,
+        mut next: State,
+        reason: &str,
+        task_version: u64,
+        active: bool,
+    ) -> Result<State> {
         require(
             digest(&serde_json::to_vec(&self.state()?)?) == digest(&serde_json::to_vec(old)?),
             Kind::Conflict,
@@ -343,10 +366,25 @@ impl Scheduler {
         next.previous_digest = Some(digest(&serde_json::to_vec(old)?));
         next.last_clock_ms = clock;
         next.reason = reason.into();
-        Self::write(&mut self.store, &next)?;
+        let deadline = old
+            .slots
+            .iter()
+            .filter_map(|(id, slot)| {
+                (slot.phase == Phase::Leased
+                    && next.slots.get(id).is_some_and(|n| n.phase != Phase::Leased))
+                .then(|| slot.lease.as_ref().map(|l| l.expires_at_ms))
+                .flatten()
+            })
+            .fold(next.deadline_ms, u64::min);
+        Self::write(
+            &mut self.store,
+            &next,
+            task_version,
+            active.then_some((self.cancelled.as_ref(), deadline)),
+        )?;
         Ok(next)
     }
-    fn fresh(&self, state: &State) -> Result<()> {
+    fn fresh(&self, state: &State) -> Result<u64> {
         require(
             !self.cancelled.load(Ordering::Acquire) && !state.cancel_requested,
             Kind::Cancelled,
@@ -401,16 +439,17 @@ impl Scheduler {
             state.no_progress < state.plan.max_no_progress,
             Kind::Conflict,
             "workflow no-progress guard reached",
-        )
+        )?;
+        Ok(task.record.version)
     }
     pub fn check(&self, lease: &Lease) -> Result<()> {
         let s = self.state()?;
-        self.check_state(&s, lease)
+        self.check_state(&s, lease).map(|_| ())
     }
     /// Validates `lease` against one snapshot so a caller can commit against
     /// that same snapshot instead of re-reading state after the check.
-    fn check_state(&self, s: &State, lease: &Lease) -> Result<()> {
-        self.fresh(s)?;
+    fn check_state(&self, s: &State, lease: &Lease) -> Result<u64> {
+        let version = self.fresh(s)?;
         let slot = s
             .slots
             .get(&lease.node)
@@ -429,7 +468,8 @@ impl Scheduler {
             now()? < lease.expires_at_ms,
             Kind::Stale,
             "node lease expired; do not replay effects",
-        )
+        )?;
+        Ok(version)
     }
     pub fn resume_packet(&self, node: &str) -> Result<WorkPacket> {
         let state = self.state()?;
@@ -455,7 +495,7 @@ impl Scheduler {
     }
     pub fn acquire(&mut self, id: &str, worker: &str, lifetime_ms: u64) -> Result<WorkPacket> {
         let s = self.state()?;
-        self.fresh(&s)?;
+        let version = self.fresh(&s)?;
         require(
             identifier(worker) && lifetime_ms > 0,
             Kind::Invalid,
@@ -574,7 +614,13 @@ impl Scheduler {
         slot.phase = Phase::Leased;
         slot.generation = generation;
         slot.lease = Some(lease.clone());
-        self.commit(&s, next, "durable node lease/ownership admission")?;
+        self.commit_version(
+            &s,
+            next,
+            "durable node lease/ownership admission",
+            version,
+            true,
+        )?;
         Ok(WorkPacket {
             schema_version: "melissa.workflow-handoff/v1".into(),
             parent_task: task,
@@ -594,7 +640,7 @@ impl Scheduler {
         // Read once: a second read after the check could miss a concurrent
         // NeedsReconciliation/cancel and overwrite it as Candidate.
         let s = self.state()?;
-        self.check_state(&s, lease)?;
+        let version = self.check_state(&s, lease)?;
         let id = format!("model-run:{}:result", lease.run);
         let run: RunResult = parse(&self.store.get_artifact(&self.task, &id)?)?;
         require(
@@ -644,7 +690,13 @@ impl Scheduler {
             slot.phase = Phase::Failed;
         }
         next.no_progress = 0;
-        self.commit(&s, next, "authenticated native node result; candidate only")
+        self.commit_version(
+            &s,
+            next,
+            "authenticated native node result; candidate only",
+            version,
+            true,
+        )
     }
     pub fn outputs(&self) -> Result<BTreeMap<String, Value>> {
         let s = self.state()?;
@@ -683,7 +735,16 @@ impl Scheduler {
             Kind::Conflict,
             "active/uncertain lease cannot be replaced",
         )?;
-        plan.validate(&self.store.journal().task(&self.task)?.contract, catalog)?;
+        let parent = self.store.journal().task(&self.task)?;
+        require(
+            matches!(
+                parent.record.state,
+                TaskState::Running | TaskState::Repairing | TaskState::Verifying
+            ),
+            Kind::Cancelled,
+            "parent task is not active",
+        )?;
+        plan.validate(&parent.contract, catalog)?;
         require(
             plan.task == s.plan.task
                 && plan.id == s.plan.id
@@ -741,7 +802,13 @@ impl Scheduler {
         next.plan = plan;
         next.slots = slots;
         next.no_progress = 0;
-        self.commit(&s, next, "host-validated plan revision; no budget reset")
+        self.commit_version(
+            &s,
+            next,
+            "host-validated plan revision; no budget reset",
+            parent.record.version,
+            true,
+        )
     }
     pub fn no_progress(&mut self, reason: &str) -> Result<State> {
         require(
@@ -750,13 +817,13 @@ impl Scheduler {
             "progress reason required",
         )?;
         let s = self.state()?;
-        self.fresh(&s)?;
+        let version = self.fresh(&s)?;
         let mut next = s.clone();
         next.no_progress = next
             .no_progress
             .checked_add(1)
             .ok_or_else(|| error(Kind::Invalid, "progress overflow"))?;
-        self.commit(&s, next, reason)
+        self.commit_version(&s, next, reason, version, true)
     }
     pub fn mark_uncertain(&mut self, lease: &Lease, reason: &str) -> Result<State> {
         let s = self.state()?;

@@ -49,40 +49,37 @@ pub(crate) fn require(ok: bool, message: &str) -> Result<()> {
 pub fn digest(bytes: &[u8]) -> String {
     format!("blake3:{}", blake3::hash(bytes).to_hex())
 }
-pub const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
-/// Same bound for writing and restoring a checkpoint; abort serialization
-/// before an oversized allocation or irreversible CAS publication.
-pub fn encode_state<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
-    struct Bounded(Vec<u8>);
-    impl std::io::Write for Bounded {
+pub const MAX_STATE_BYTES: usize = melissa_model_gateway::checkpoint::MAX_CHECKPOINT_BYTES;
+/// Count escaped JSON bytes without allocating a serialized copy.
+pub(crate) fn encoded_len<T: serde::Serialize>(value: &T, limit: usize) -> Result<usize> {
+    struct Counter {
+        bytes: usize,
+        limit: usize,
+    }
+    impl std::io::Write for Counter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if bytes.len() > MAX_STATE_BYTES.saturating_sub(self.0.len()) {
-                return Err(std::io::Error::other(
-                    "context state exceeds restore envelope",
-                ));
+            if bytes.len() > self.limit.saturating_sub(self.bytes) {
+                return Err(std::io::Error::other("state envelope exceeded"));
             }
-            self.0.extend_from_slice(bytes);
+            self.bytes += bytes.len();
             Ok(bytes.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
     }
-    let mut output = Bounded(Vec::new());
-    serde_json::to_writer(&mut output, value)
-        .map_err(|_| Error("context state exceeds restore envelope or cannot serialize".into()))?;
-    Ok(output.0)
+    let mut count = Counter { bytes: 0, limit };
+    serde_json::to_writer(&mut count, value)
+        .map_err(|_| Error("context state exceeds envelope or cannot serialize".into()))?;
+    Ok(count.bytes)
+}
+/// Same bound for writing and restoring a checkpoint; abort serialization
+/// before an oversized allocation or irreversible CAS publication.
+pub fn encode_state<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
+    melissa_model_gateway::checkpoint::encode(value).map_err(|e| Error(e.to_string()))
 }
 pub(crate) fn json<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
-    #[derive(Deserialize)]
-    #[serde(transparent)]
-    struct Strict<T>(T);
-    impl<T> melissa_core_contracts::validation::Validate for Strict<T> {
-        fn validate(&self) -> melissa_core_contracts::validation::ContractResult {
-            Ok(())
-        }
-    }
-    Ok(melissa_core_contracts::json::parse_contract::<Strict<T>>(bytes, MAX_STATE_BYTES)?.0)
+    melissa_model_gateway::checkpoint::decode(bytes).map_err(|e| Error(e.to_string()))
 }
 
 /// Exact project/user/engagement boundary. None does not mean wildcard.

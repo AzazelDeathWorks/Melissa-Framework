@@ -174,6 +174,29 @@ fn real_rust_lsp_definition_and_symbols_are_source_bound() {
         assert!(plan.decode(&r, &report, &no()).is_err());
     }
 }
+
+#[test]
+fn real_lsp_worker_input_and_returned_locations_respect_source_visibility() {
+    let (d, original) = fixture();
+    let repo = Repository::open(
+        original.root_path(),
+        Limits::default(),
+        vec!["secret.txt".into()],
+    )
+    .unwrap();
+    let (plan, report) = run_plan(
+        d.path(),
+        &repo,
+        query(LspMethod::References, "src/alpha.rs", 0, 8),
+    );
+    assert!(!plan.snapshot.files.contains_key("secret.txt"));
+    assert!(plan.decode(&repo, &report, &no()).is_ok());
+    let mut forged = report;
+    let mut raw: serde_json::Value = serde_json::from_slice(&forged.stdout).unwrap();
+    raw["result"][0]["uri"] = "file:///work/secret.txt".into();
+    forged.stdout = serde_json::to_vec(&raw).unwrap();
+    assert!(plan.decode(&repo, &forged, &no()).is_err());
+}
 #[test]
 fn real_ripgrep_uses_discovered_sources_and_authenticates_match_bytes() {
     let (d, r) = fixture();

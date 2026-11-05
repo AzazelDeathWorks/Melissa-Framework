@@ -87,6 +87,144 @@ fn memory_proposals_reject_duplicate_and_oversized_sources_before_mutation() {
     );
     assert_eq!(book.records().len(), 1);
 }
+
+#[test]
+fn oversized_memory_review_leaves_proposal_and_superseded_fact_unchanged() {
+    use melissa_skill_context::retrieval::{Domain, SearchScope};
+    let s = source("src/a.rs", "evidence");
+    let scope = SearchScope {
+        namespace: namespace(),
+        domain: Domain::Code,
+        now_ms: s.observed_at_ms,
+        current: BTreeMap::from([(s.id.clone(), (s.version.clone(), s.digest.clone()))]),
+    };
+    let mut book = MemoryBook::default();
+    let old = book
+        .propose("old", namespace(), "key", "old claim", vec![s.clone()])
+        .unwrap();
+    book.review(
+        "old",
+        &old,
+        &scope,
+        true,
+        "evidence:review",
+        &BTreeSet::new(),
+    )
+    .unwrap();
+    let next = book
+        .propose("next", namespace(), "key", "new claim", vec![s])
+        .unwrap();
+    let before = encode_state(&book).unwrap();
+    let too_large = "x".repeat(MAX_STATE_BYTES);
+    assert!(
+        book.review(
+            "next",
+            &next,
+            &scope,
+            true,
+            &too_large,
+            &BTreeSet::from(["old".into()])
+        )
+        .is_err()
+    );
+    assert_eq!(encode_state(&book).unwrap(), before);
+}
+
+#[test]
+fn memory_record_and_book_limits_preflight_borrowed_metadata_and_restore() {
+    let s = source("src/a.rs", "evidence");
+    let mut book = MemoryBook::default();
+    book.propose("original", namespace(), "key", "claim", vec![s.clone()])
+        .unwrap();
+    let before = encode_state(&book).unwrap();
+    let mut oversized = s.clone();
+    oversized.namespace.project = "x".repeat(MAX_MEMORY_RECORD_BYTES);
+    assert!(
+        book.propose_borrowed(
+            "too-large",
+            oversized.namespace.clone(),
+            "key",
+            "claim",
+            &[&oversized]
+        )
+        .is_err()
+    );
+    assert_eq!(encode_state(&book).unwrap(), before);
+    let record = serde_json::to_value(&book.records()["original"]).unwrap();
+    let mut records = serde_json::Map::new();
+    for i in 0..MAX_MEMORY_RECORDS {
+        let id = format!("m{i}");
+        let mut copy = record.clone();
+        copy["id"] = serde_json::json!(id);
+        records.insert(id, copy);
+    }
+    let mut full: MemoryBook =
+        serde_json::from_value(serde_json::json!({"records":records})).unwrap();
+    let before = encode_state(&full).unwrap();
+    assert!(
+        full.propose_borrowed("overflow", namespace(), "key", "claim", &[&s])
+            .is_err()
+    );
+    assert_eq!(encode_state(&full).unwrap(), before);
+    let mut invalid = serde_json::to_value(&full).unwrap();
+    invalid["records"]["original"] = record;
+    assert!(serde_json::from_value::<MemoryBook>(invalid).is_err());
+}
+
+#[test]
+fn memory_restore_rejects_duplicate_sources_and_duplicate_record_keys() {
+    let s = source("src/a.rs", "evidence");
+    let mut book = MemoryBook::default();
+    book.propose("m", namespace(), "key", "claim", vec![s])
+        .unwrap();
+    let mut value = serde_json::to_value(&book).unwrap();
+    let source = value["records"]["m"]["sources"][0].clone();
+    value["records"]["m"]["sources"]
+        .as_array_mut()
+        .unwrap()
+        .push(source);
+    assert!(serde_json::from_value::<MemoryBook>(value).is_err());
+    let record = serde_json::to_string(&book.records()["m"]).unwrap();
+    let duplicate = format!("{{\"records\":{{\"m\":{record},\"m\":{record}}}}}");
+    assert!(serde_json::from_str::<MemoryBook>(&duplicate).is_err());
+}
+
+#[test]
+fn aggregate_escaped_memory_bytes_fail_before_inserting_any_record() {
+    let s = source("src/a.rs", "evidence");
+    let mut small = MemoryBook::default();
+    small
+        .propose(
+            "m",
+            namespace(),
+            "key",
+            &format!("x{}", "\n".repeat(65535)),
+            vec![s.clone()],
+        )
+        .unwrap();
+    let template = serde_json::to_value(&small.records()["m"]).unwrap();
+    let mut records = serde_json::Map::new();
+    for i in 0..127 {
+        let id = format!("m{i}");
+        let mut copy = template.clone();
+        copy["id"] = serde_json::json!(id);
+        records.insert(id, copy);
+    }
+    let mut book: MemoryBook =
+        serde_json::from_value(serde_json::json!({"records":records})).unwrap();
+    let before = encode_state(&book).unwrap();
+    assert!(
+        book.propose_borrowed(
+            "overflow",
+            namespace(),
+            "key",
+            &format!("x{}", "\n".repeat(65535)),
+            &[&s]
+        )
+        .is_err()
+    );
+    assert_eq!(encode_state(&book).unwrap(), before);
+}
 fn checkpoint() -> (Checkpoint, ResumeState, Registry, SkillPolicy) {
     let (reg, policy, pins) = setup();
     let mut r = request();

@@ -343,6 +343,51 @@ struct FakeTools {
     unsuccessful: bool,
     unknown: bool,
 }
+
+#[tokio::test]
+async fn rejected_local_wire_keeps_safe_checkpoint_and_never_reserves_or_dispatches() {
+    use melissa_model_gateway::{
+        RequestLimits,
+        continuation::{ContinuationStore, Phase, TurnCheckpoint},
+    };
+    struct Audit(Arc<Mutex<Vec<Phase>>>);
+    impl ContinuationStore for Audit {
+        fn begin(
+            &mut self,
+            _: &mut LocalStore,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<TurnCheckpoint>> {
+            Ok(None)
+        }
+        fn publish(&mut self, _: &mut LocalStore, c: &TurnCheckpoint) -> Result<()> {
+            self.0.lock().unwrap().push(c.phase);
+            Ok(())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let http = http_fixture(vec![]).await;
+    let phases = Arc::new(Mutex::new(vec![]));
+    let mut g = gateway(store(&dir.path().join("s"), 1_000_000), &http, policy())
+        .with_request_limits(RequestLimits {
+            max_history_bytes: 10,
+        })
+        .unwrap()
+        .with_continuation(Box::new(Audit(phases.clone())));
+    assert!(
+        g.run(
+            &spec("local-invalid-wire"),
+            &mut FakeTools::default(),
+            Arc::new(AtomicBool::new(false))
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(*phases.lock().unwrap(), vec![Phase::Safe]);
+    assert!(g.store().journal().model_requests(TASK).unwrap().is_empty());
+    assert_eq!(http.requests.load(Ordering::SeqCst), 0);
+}
 impl ToolDispatcher for FakeTools {
     fn definitions(&self) -> Vec<BoundTool> {
         vec![BoundTool {

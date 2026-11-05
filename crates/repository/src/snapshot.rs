@@ -95,16 +95,13 @@ pub struct WorkerInput {
 pub struct Repository {
     pub(crate) root: Pinned,
     pub(crate) limits: Limits,
-    excluded: Vec<String>,
+    visibility: crate::SourceVisibilityPolicy,
     package_capture: bool,
 }
 impl Repository {
     /// Host-selected workspace. Does not run Git, build scripts, hooks or tools.
     pub fn open(root: &Path, limits: Limits, excluded_prefixes: Vec<String>) -> Result<Self> {
         limits.validate()?;
-        for p in &excluded_prefixes {
-            paths::relative(p)?;
-        }
         let mut excluded = vec![
             ".git".into(),
             "target".into(),
@@ -115,7 +112,7 @@ impl Repository {
         Ok(Self {
             root: paths::pin_root(root)?,
             limits,
-            excluded,
+            visibility: crate::SourceVisibilityPolicy::new(excluded)?,
             package_capture: false,
         })
     }
@@ -132,7 +129,7 @@ impl Repository {
         Ok(Self {
             root,
             limits: self.limits.clone(),
-            excluded: self.excluded.clone(),
+            visibility: self.visibility.clone(),
             package_capture: self.package_capture,
         })
     }
@@ -144,7 +141,7 @@ impl Repository {
         Ok(Self {
             root: paths::pin_root(root)?,
             limits,
-            excluded: vec![".git".into()],
+            visibility: crate::SourceVisibilityPolicy::new(vec![".git".into()])?,
             package_capture: false,
         })
     }
@@ -156,7 +153,7 @@ impl Repository {
         Ok(Self {
             root: paths::pin_root(root)?,
             limits,
-            excluded: vec![],
+            visibility: crate::SourceVisibilityPolicy::new(vec![])?,
             package_capture: true,
         })
     }
@@ -167,17 +164,18 @@ impl Repository {
         &self.limits
     }
     pub(crate) fn check_path(&self, path: &str) -> Result {
-        paths::relative(path)?;
-        // Git internals are never source files, including nested repositories.
-        if path.split('/').any(|s| s.eq_ignore_ascii_case(".git")) {
-            return Err(Error::Denied("Git metadata is outside file capability"));
-        }
-        if self.excluded.iter().any(|p| paths::beneath(path, p)) {
-            return Err(Error::Denied(
-                "path is outside repository source visibility",
-            ));
-        }
-        Ok(())
+        self.visibility.check(path)
+    }
+    pub fn source_visibility(&self) -> &crate::SourceVisibilityPolicy {
+        &self.visibility
+    }
+    /// Binds historical model-visible results to the same root and policy.
+    pub fn source_visibility_digest(&self) -> Result<String> {
+        Ok(digest(&serde_json::to_vec(&(
+            "melissa.source-visibility/v1",
+            self.root_identity(),
+            self.visibility.excluded_prefixes(),
+        ))?))
     }
     pub(crate) fn lock(&self, path: &str, write: bool) -> Result<Pinned> {
         self.check_path(path)?;
@@ -227,7 +225,7 @@ impl Repository {
         let seal = digest(&serde_json::to_vec(&(
             self.root_identity(),
             &files,
-            &self.excluded,
+            self.visibility.excluded_prefixes(),
         ))?);
         Ok(RepositorySnapshot {
             schema_version: "melissa.repository-snapshot/v1".into(),
@@ -236,7 +234,7 @@ impl Repository {
             digest: seal,
             total_bytes: total,
             atomic_tree_snapshot: false,
-            excluded_prefixes: self.excluded.clone(),
+            excluded_prefixes: self.visibility.excluded_prefixes().to_vec(),
         })
     }
     fn visit(
@@ -278,7 +276,7 @@ impl Repository {
                 }
                 continue;
             }
-            if self.excluded.iter().any(|p| paths::beneath(&child, p)) {
+            if !self.visibility.allows(&child) {
                 continue;
             }
             if !seen.insert(paths::key(&child)) {

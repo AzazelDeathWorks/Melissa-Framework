@@ -37,7 +37,14 @@ jobs:
       - name: Continuation reservation boundary without Docker
         run: cargo +1.98.0 test --locked -p melissa-skill-context --test native_runtime durable_gateway_resume_reopens_encrypted_journal_without_repeating_a_settled_tool_or_budget -- --exact
       - name: Shared workflow continuation and checkpoint ownership
-        run: cargo +1.98.0 test --locked -p melissa-workflow --test workflow
+        run: cargo +1.98.0 test --locked -p melissa-workflow --test workflow --test complete_native_race
+      - name: Memory envelopes and native checkpoint bounds
+        run: |
+          cargo +1.98.0 test --locked -p melissa-skill-context --test context_state --test incremental_context
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +1.98.0 test --locked -p melissa-skill-context --test native_runtime oversized_native_checkpoint_preserves_previous_reopenable_checkpoint -- --exact
+      - name: Local request preflight and provider edge cases
+        run: cargo +1.98.0 test --locked -p melissa-model-gateway --test agent_loop
   portable-tests:
     # Test targets that need neither the Windows handle-pinned filesystem nor
     # Docker Desktop; without this job their crates are only compiled in CI.

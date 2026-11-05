@@ -365,6 +365,13 @@ async fn actual_unknown_patch_effect_is_inspected_and_reconciled_without_executi
 }
 #[tokio::test]
 async fn unknown_multi_file_patch_in_unsorted_order_reconciles_by_proposal_index() {
+    unsorted_reconciliation(false).await;
+}
+#[tokio::test]
+async fn mixed_multi_file_patch_stays_unknown_without_replaying_or_changing_files() {
+    unsorted_reconciliation(true).await;
+}
+async fn unsorted_reconciliation(mixed: bool) {
     // Proposal order (b.txt, a.txt) differs from the broker's path-sorted write
     // order; preimages must still be found by proposal index.
     let (d, repo, mut s, p) = support::fixture(&["a.txt", "b.txt"]);
@@ -416,6 +423,35 @@ async fn unknown_multi_file_patch_in_unsorted_order_reconciles_by_proposal_index
         .unwrap();
     assert!(outcome.requires_reconciliation);
     let repo = Repository::open_for_git(&d.path().join("repo"), Limits::default()).unwrap();
+    if mixed {
+        // Emulate only the first path-sorted write surviving an interruption.
+        std::fs::write(repo.root_path().join("b.txt"), b"old b\n").unwrap();
+        let before = s.journal().invocation("unordered").unwrap();
+        assert!(
+            melissa_recovery::reconcile::inspect_patch_effect(
+                &mut s,
+                &repo,
+                "task:code05-closeout",
+                "unordered"
+            )
+            .is_err()
+        );
+        assert_eq!(s.journal().invocation("unordered").unwrap(), before);
+        assert_eq!(
+            std::fs::read(repo.root_path().join("a.txt")).unwrap(),
+            b"new a\n"
+        );
+        assert_eq!(
+            std::fs::read(repo.root_path().join("b.txt")).unwrap(),
+            b"old b\n"
+        );
+        assert_eq!(
+            melissa_recovery::retry::inspect_retry(&s, "task:code05-closeout", "unordered")
+                .unwrap(),
+            melissa_recovery::retry::RetryDecision::ReconciliationRequired
+        );
+        return;
+    }
     let resolved = melissa_recovery::reconcile::inspect_patch_effect(
         &mut s,
         &repo,
