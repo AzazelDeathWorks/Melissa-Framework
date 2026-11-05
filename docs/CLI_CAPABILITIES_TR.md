@@ -9,6 +9,7 @@ Canlı AI kabulü bu çalışma kapsamında **NOT_RUN**; sağlayıcı çağrıs�
 
 | Alan | Davranış | Sınır |
 | --- | --- | --- |
+| Araç ön kontrolü ve sonuç kaydı | Host kaynak/ortam bağlamı, şema/argüman özetleri, ayrı `tool.preflight` ve `tool.receipt` kanıtları | Araç PASS sonucu görev kabulü değildir; çalışmayan veya belirsiz işlem başarı sayılmaz. [Ayrıntılar](TOOL_ADAPTERS_TR.md). |
 | Proje belleği | `memory_search` ve `memory_propose`; proje kimliğine bağlı şifreli kayıt, yeni oturumdan açma, kaynak yeniliği kontrolü | Öneriler operatör kabul edene kadar geri çağrılmaz. Başka proje bilgisi karışmaz; değişen kaynak eski bilgiyi geçersiz kılar. |
 | Skill ve bağlam | Pinin tamamını yükleme; kaynak arama, template/factory, gerçek izole Python helper, ortak scriptler | Model komut, interpreter, kök klasör veya yetki seçemez. Helper sonucu aday/gözlemdir. |
 | Anlamsal gezinti | `code_semantic`: gerçek rust-analyzer, TypeScript dil sunucusu veya Pyright üzerinden definition, references, symbols, hover, diagnostics | Dil sorgulanan dosyadan seçilir. Konumlar sıfır tabanlı UTF-16; build scriptleri kapalı. Eski `code_references` yalnız sözdizimsel aramadır. |

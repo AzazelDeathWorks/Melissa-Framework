@@ -1,5 +1,6 @@
 //! CODE-04 provider-independent, host-controlled model generation. Model output
 //! never creates tool authority or constitutes independent task acceptance.
+pub mod adapter;
 pub mod agent_loop;
 pub mod anthropic;
 pub mod checkpoint;

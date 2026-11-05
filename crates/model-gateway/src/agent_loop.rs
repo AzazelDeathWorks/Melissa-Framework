@@ -124,6 +124,7 @@ pub struct Gateway {
     transport: HttpTransport,
     json_object_output: bool,
     live_tool_projection: bool,
+    transient_retries: bool,
     output_capabilities: OutputCapabilityRegistry,
     unknown_permits: BTreeMap<String, OwnedSemaphorePermit>,
     continuation: Option<Box<dyn crate::continuation::ContinuationStore>>,
@@ -189,7 +190,63 @@ impl Drop for RunGuard {
         self.watcher.abort();
     }
 }
+fn tool_context(spec: &RunSpec, request_id: &str, call: &ToolCall) -> ToolContext {
+    let call_hash = blake3::hash(call.id.as_bytes()).to_hex().to_string();
+    let invocation_id = format!("model-tool:{}:{}", spec.run_id, &call_hash[..24]);
+    ToolContext {
+        task_id: spec.task_id.clone(),
+        profile_id: spec.profile_id.clone(),
+        run_id: spec.run_id.clone(),
+        request_id: request_id.into(),
+        invocation_id: invocation_id.clone(),
+        attempt_id: format!("{invocation_id}:attempt"),
+        generation: 1,
+    }
+}
 impl Gateway {
+    fn tool_receipt(
+        &mut self,
+        receipt: &crate::adapter::ToolReceipt,
+        refs: &mut Vec<String>,
+    ) -> Result<()> {
+        let raw = encoded(receipt)?;
+        self.tool_record(
+            &receipt.context.task_id,
+            &receipt.context.invocation_id,
+            "receipt",
+            &raw,
+            refs,
+        )
+    }
+    fn tool_record(
+        &mut self,
+        task: &str,
+        invocation: &str,
+        kind: &str,
+        raw: &[u8],
+        refs: &mut Vec<String>,
+    ) -> Result<()> {
+        let identity = blake3::hash(raw).to_hex().to_string();
+        let id = format!("{invocation}:{kind}:{}", &identity[..24]);
+        match self.store.artifact_metadata(task, &id) {
+            Ok(_) => {
+                if self.store.get_artifact(task, &id).map_err(store_error)? != raw {
+                    return Err(GatewayError::new(
+                        ErrorKind::Store,
+                        "Tool receipt identity collision.",
+                    ));
+                }
+                if !refs.contains(&id) {
+                    refs.push(id);
+                }
+                return Ok(());
+            }
+            Err(melissa_local_store::StoreError::NotFound(_)) => {}
+            Err(error) => return Err(store_error(error)),
+        }
+        self.artifact(task, &id, &format!("tool.{kind}"), raw, refs)?;
+        Ok(())
+    }
     pub fn new(
         store: LocalStore,
         catalog: Catalog,
@@ -228,6 +285,7 @@ impl Gateway {
             transport: HttpTransport::new(local_only)?,
             json_object_output: false,
             live_tool_projection: false,
+            transient_retries: false,
             output_capabilities: OutputCapabilityRegistry::default(),
             unknown_permits: BTreeMap::new(),
             continuation: None,
@@ -241,6 +299,12 @@ impl Gateway {
     /// A backend cannot introduce a new name, grant or altered schema mid-run.
     pub fn with_live_tool_projection(mut self) -> Self {
         self.live_tool_projection = true;
+        self
+    }
+    /// Retry only attempts for which the transport proves that nothing was sent.
+    /// This never enables provider/model fallback or retries unknown usage.
+    pub fn with_transient_retries(mut self) -> Self {
+        self.transient_retries = true;
         self
     }
     /// Opt-in host configuration; the legacy constructor keeps its 30-minute bound.
@@ -628,6 +692,13 @@ impl Gateway {
         };
         if self.continuation.is_some() && self.live_tool_projection {
             binding = digest(&encoded(&(binding, "live-tool-projection/v1"))?);
+        }
+        if self.continuation.is_some() && self.transient_retries {
+            binding = digest(&encoded(&(
+                binding,
+                "known-not-sent-retry/v1",
+                self.policy.max_backoff_ms,
+            ))?);
         }
         if self.continuation.is_some() {
             let image_details = self
@@ -1236,22 +1307,32 @@ impl Gateway {
                             return self.complete(result);
                         }
                     }
-                    let retry = recovery_retry
-                        || matches!(
-                            kind,
-                            ErrorKind::Timeout
-                                | ErrorKind::Transport
-                                | ErrorKind::RateLimited
-                                | ErrorKind::ProviderUnavailable
-                        ) && self.policy.allow_fallback;
+                    let retry = not_sent
+                        && (recovery_retry
+                            || matches!(
+                                kind,
+                                ErrorKind::Timeout
+                                    | ErrorKind::Transport
+                                    | ErrorKind::RateLimited
+                                    | ErrorKind::ProviderUnavailable
+                            ) && (self.policy.allow_fallback || self.transient_retries));
                     if !retry || attempt + 1 >= self.policy.max_requests {
                         result.status = RunStatus::ProviderFailed;
                         return self.complete(result);
                     }
-                    let delay = outcome
-                        .retry_after_ms
-                        .unwrap_or(10u64.saturating_mul(1u64 << attempt.min(12)))
-                        .min(self.policy.max_backoff_ms);
+                    let delay = outcome.retry_after_ms.unwrap_or_else(|| {
+                        let jitter =
+                            u64::from(blake3::hash(request_id.as_bytes()).as_bytes()[0] % 20);
+                        10u64
+                            .saturating_mul(1u64 << attempt.min(12))
+                            .saturating_add(jitter)
+                            .min(self.policy.max_backoff_ms)
+                    });
+                    // A provider delay is a minimum, never truncate it and retry early.
+                    if delay > self.policy.max_backoff_ms {
+                        result.status = RunStatus::ProviderFailed;
+                        return self.complete(result);
+                    }
                     tokio::select! {_=tokio::time::sleep(Duration::from_millis(delay))=>{},_=crate::transport::wait_cancelled(&combined)=>{}}
                 }
                 let Some((response, request_id, advertised)) = accepted else {
@@ -1375,7 +1456,7 @@ impl Gateway {
                 let mut preflight_diagnostics = Vec::new();
                 let mut authority_denied = false;
                 for call in &response.calls {
-                    if self.recovery.is_some() {
+                    {
                         if let Some(definition) =
                             advertised.iter().find(|d| d.definition.name == call.name)
                         {
@@ -1383,12 +1464,15 @@ impl Gateway {
                                 &definition.definition.parameters,
                                 &call.arguments,
                             ) {
+                                preflight_error = true;
                                 preflight_diagnostics.push(format!("{}: {}", call.name, e));
                             } else if let Err(e) = dispatcher.validate_call(call) {
+                                preflight_error = true;
                                 authority_denied |= e.kind == ErrorKind::Authorization;
                                 preflight_diagnostics.push(format!("{}: {}", call.name, e));
                             }
                         } else {
+                            preflight_error = true;
                             authority_denied = true;
                             preflight_diagnostics
                                 .push("requested tool is outside host bindings".into());
@@ -1412,25 +1496,54 @@ impl Gateway {
                     {
                         preflight_error = true;
                     }
-                    if !seen_calls.insert(call.id.clone())
-                        || advertised
-                            .iter()
-                            .find(|d| d.definition.name == call.name)
-                            .is_none_or(|d| {
-                                crate::schema::validate_output(
-                                    &d.definition.parameters,
-                                    &call.arguments,
-                                )
-                                .is_err()
-                            })
-                        || dispatcher.validate_call(call).is_err()
-                    {
+                    if !seen_calls.insert(call.id.clone()) {
                         preflight_error = true;
                     }
                 }
                 let calls = response.calls.clone();
                 self.artifact(&spec.task_id,&format!("{request_id}:tool-preflight"),"model.tool_preflight",&encoded(&json!({"schema_version":"melissa.model-tool-preflight/v1","request_id":request_id,"call_ids":calls.iter().map(|c|&c.id).collect::<Vec<_>>(),"batch_valid":!preflight_error,"executed":false,"task_accepted":false}))?,&mut result.artifact_refs)?;
+                if preflight_error {
+                    for call in &calls {
+                        let context = tool_context(spec, &request_id, call);
+                        let preflight = crate::adapter::ToolPreflight::new(
+                            call,
+                            &advertised
+                                .iter()
+                                .map(|binding| (*binding).clone())
+                                .collect::<Vec<_>>(),
+                            if authority_denied {
+                                crate::adapter::Status::Blocked
+                            } else {
+                                crate::adapter::Status::NotRun
+                            },
+                            crate::adapter::AdapterMetadata::default(),
+                        );
+                        let receipt = crate::adapter::ToolReceipt::not_run(
+                            &context,
+                            preflight,
+                            Some(if authority_denied {
+                                ErrorKind::Authorization
+                            } else {
+                                ErrorKind::Invalid
+                            }),
+                        );
+                        self.tool_receipt(&receipt, &mut result.artifact_refs)?;
+                    }
+                }
                 messages.push(Message::Assistant { response });
+                if authority_denied {
+                    self.recovery_failure(crate::recovery::RecoveryEvent {
+                        task: spec.task_id.clone(),
+                        run: spec.run_id.clone(),
+                        request: request_id.clone(),
+                        kind: crate::recovery::FailureKind::AuthorityDenied,
+                        calls: calls.clone(),
+                        diagnostic: preflight_diagnostics.join("\n"),
+                        evidence: result.artifact_refs.clone(),
+                    })?;
+                    result.status = RunStatus::NeedsAuthorization;
+                    return self.complete(result);
+                }
                 let repair = if preflight_error {
                     self.recovery_failure(crate::recovery::RecoveryEvent {
                     task: spec.task_id.clone(), run: spec.run_id.clone(), request: request_id.clone(),
@@ -1488,23 +1601,92 @@ impl Gateway {
                         result: &result,
                     })?;
                 }
-                let call_hash = blake3::hash(call.id.as_bytes()).to_hex().to_string();
-                let invocation_id = format!("model-tool:{}:{}", spec.run_id, &call_hash[..24]);
-                let context = ToolContext {
-                    task_id: spec.task_id.clone(),
-                    profile_id: spec.profile_id.clone(),
-                    run_id: spec.run_id.clone(),
-                    request_id: request_id.clone(),
-                    invocation_id: invocation_id.clone(),
-                    attempt_id: format!("{invocation_id}:attempt"),
-                    generation: 1,
+                let context = tool_context(spec, &request_id, &call);
+                let preflight_started = std::time::Instant::now();
+                let adapter = match dispatcher.adapter_metadata(&combined) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        let mut preflight = crate::adapter::ToolPreflight::new(
+                            &call,
+                            &dispatcher.definitions(),
+                            if error.kind == ErrorKind::Authorization {
+                                crate::adapter::Status::Blocked
+                            } else {
+                                crate::adapter::Status::NotRun
+                            },
+                            crate::adapter::AdapterMetadata::default(),
+                        );
+                        preflight.elapsed_ms = preflight_started
+                            .elapsed()
+                            .as_millis()
+                            .min(u64::MAX as u128)
+                            as u64;
+                        self.tool_receipt(
+                            &crate::adapter::ToolReceipt::not_run(
+                                &context,
+                                preflight,
+                                Some(error.kind),
+                            ),
+                            &mut result.artifact_refs,
+                        )?;
+                        result.status = if error.kind == ErrorKind::Authorization {
+                            RunStatus::NeedsAuthorization
+                        } else if error.kind == ErrorKind::Cancelled {
+                            RunStatus::Cancelled
+                        } else {
+                            RunStatus::NoAction
+                        };
+                        return self.complete(result);
+                    }
                 };
+                let mut preflight = crate::adapter::ToolPreflight::new(
+                    &call,
+                    &dispatcher.definitions(),
+                    crate::adapter::Status::NotRun,
+                    adapter,
+                );
+                preflight.elapsed_ms = preflight_started
+                    .elapsed()
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64;
+                self.tool_record(&context.task_id, &context.invocation_id, "preflight",
+                    &encoded(&json!({"context":crate::adapter::ReceiptContext::from(&context),"preflight":preflight,"task_accepted":false}))?,
+                    &mut result.artifact_refs)?;
+                if combined.load(Ordering::Acquire)
+                    || cancelled.load(Ordering::Acquire)
+                    || begin.elapsed().as_millis() >= wall as u128
+                {
+                    self.tool_receipt(
+                        &crate::adapter::ToolReceipt::not_run(
+                            &context,
+                            preflight,
+                            Some(ErrorKind::Cancelled),
+                        ),
+                        &mut result.artifact_refs,
+                    )?;
+                    result.status = if begin.elapsed().as_millis() >= wall as u128 {
+                        RunStatus::Deadline
+                    } else {
+                        RunStatus::Cancelled
+                    };
+                    return self.complete(result);
+                }
+                let tool_started = std::time::Instant::now();
                 let mut observation = match dispatcher
-                    .execute(call.clone(), context, Arc::clone(&combined))
+                    .execute(call.clone(), context.clone(), Arc::clone(&combined))
                     .await
                 {
                     Ok(v) => v,
                     Err(e) => {
+                        self.tool_receipt(
+                            &crate::adapter::ToolReceipt::dispatch_error(
+                                &context,
+                                preflight.clone(),
+                                e.kind,
+                                tool_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                            ),
+                            &mut result.artifact_refs,
+                        )?;
                         if self.recovery.is_some() {
                             self.recovery_failure(crate::recovery::RecoveryEvent {
                                 task: spec.task_id.clone(),
@@ -1529,6 +1711,13 @@ impl Gateway {
                         return self.complete(result);
                     }
                 };
+                let receipt = crate::adapter::ToolReceipt::completed(
+                    &context,
+                    preflight,
+                    &observation,
+                    tool_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                );
+                self.tool_receipt(&receipt, &mut result.artifact_refs)?;
                 result.tool_calls += 1;
                 if observation.success
                     && !observation.requires_reconciliation

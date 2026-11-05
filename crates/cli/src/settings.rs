@@ -190,6 +190,16 @@ impl Settings {
             "context_tokens":m.context_tokens,"max_output_tokens":m.max_output_tokens,"request_timeout_ms":m.request_timeout_ms,
             "json_object":m.json_object,"native_json_schema":m.native_json_schema,
             "capabilities":m.capabilities,
+            "compatibility":{
+                "basis":"configured_not_live_verified",
+                "protocol":m.protocol,"streaming":m.capabilities.streaming,
+                "tool_calling":m.capabilities.tool_calling,"vision":m.capabilities.vision,
+                "json_object":m.json_object,"native_json_schema":m.native_json_schema,
+                "continuation_scope":"same_provider_model_protocol",
+                "automatic_retry":"proven_not_sent_only",
+                "unknown_usage":"retain_reservation_and_reconcile",
+                "chat_completions_compatibility_implied":false
+            },
             "rate_card_digest":m.rate_card.digest(),
             "input_micro_usd_per_million":m.rate_card.input_micro_usd_per_million,
             "output_micro_usd_per_million":m.rate_card.output_micro_usd_per_million
@@ -319,6 +329,27 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn compatibility_summary_is_explicitly_configured_and_does_not_resolve_credentials() {
+        let settings: Settings = serde_json::from_slice(include_bytes!(
+            "../../../examples/cli/settings.template.json"
+        ))
+        .unwrap();
+        let summary = settings.model_summary();
+        assert_eq!(
+            summary[0]["compatibility"]["basis"],
+            "configured_not_live_verified"
+        );
+        assert_eq!(
+            summary[0]["compatibility"]["automatic_retry"],
+            "proven_not_sent_only"
+        );
+        assert_eq!(
+            summary[0]["compatibility"]["chat_completions_compatibility_implied"],
+            false
+        );
+        assert!(!summary.to_string().contains("credential"));
+    }
     #[test]
     fn lab_variant_changes_the_approved_settings_and_only_one_model_is_allowed() {
         let mut settings: Settings = serde_json::from_slice(include_bytes!(

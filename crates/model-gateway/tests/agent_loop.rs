@@ -345,11 +345,186 @@ fn spec(run: &str) -> RunSpec {
         required_tool_names: BTreeSet::new(),
     }
 }
+fn tool_receipts(
+    gateway: &Gateway,
+    refs: &[String],
+) -> Vec<melissa_model_gateway::adapter::ToolReceipt> {
+    refs.iter()
+        .filter(|id| id.starts_with("model-tool:") && id.contains(":receipt:"))
+        .map(|id| serde_json::from_slice(&gateway.store().get_artifact(TASK, id).unwrap()).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn adapter_receipts_bind_actual_dispatch_and_keep_arguments_out_of_receipts() {
+    use melissa_model_gateway::adapter::Status;
+    let dir = tempfile::tempdir().unwrap();
+    let http = http_fixture(vec![
+        HttpPlan::sse(tool_response(&[(
+            "receipt-call",
+            "process_exec",
+            r#"{"value":"private fixture argument"}"#,
+        )])),
+        HttpPlan::sse(text_response("Observed.", false, true)),
+    ])
+    .await;
+    let mut gateway = gateway(store(&dir.path().join("store"), 10_000), &http, policy());
+    let mut tools = FakeTools::default();
+    let result = gateway
+        .run(
+            &spec("receipts"),
+            &mut tools,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+    let receipts = tool_receipts(&gateway, &result.artifact_refs);
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].status, Status::Pass);
+    assert!(receipts[0].dispatch_started);
+    assert_eq!(
+        receipts[0].context.invocation_id,
+        tools.contexts.lock().unwrap()[0].invocation_id
+    );
+    assert_eq!(
+        receipts[0].preflight.canonical_id.as_deref(),
+        Some("process.exec")
+    );
+    assert_eq!(
+        receipts[0].preflight.adapter.source_before.as_deref(),
+        Some("fixture-source")
+    );
+    assert!(receipts[0].result_digest.is_some());
+    assert!(
+        result
+            .artifact_refs
+            .iter()
+            .any(|id| id.contains(":preflight:"))
+    );
+    assert!(
+        !serde_json::to_string(&receipts)
+            .unwrap()
+            .contains("private fixture argument")
+    );
+    assert!(receipts.iter().all(|receipt| !receipt.task_accepted));
+}
+
+#[tokio::test]
+async fn invalid_batch_has_only_not_run_or_blocked_receipts() {
+    use melissa_model_gateway::adapter::Status;
+    let dir = tempfile::tempdir().unwrap();
+    let http = http_fixture(vec![
+        HttpPlan::sse(tool_response(&[
+            ("good", "process_exec", r#"{"value":"ok"}"#),
+            ("bad", "process_exec", r#"{"value":7}"#),
+        ])),
+        HttpPlan::sse(text_response("No execution.", false, true)),
+    ])
+    .await;
+    let mut gateway = gateway(store(&dir.path().join("store"), 10_000), &http, policy());
+    let mut tools = FakeTools::default();
+    let result = gateway
+        .run(
+            &spec("receipt-batch"),
+            &mut tools,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+    let receipts = tool_receipts(&gateway, &result.artifact_refs);
+    assert_eq!(receipts.len(), 2);
+    assert!(
+        receipts
+            .iter()
+            .all(|r| matches!(r.status, Status::NotRun | Status::Blocked) && !r.dispatch_started)
+    );
+    assert_eq!(tools.executed.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn metadata_failure_or_cancellation_cannot_start_the_tool() {
+    use melissa_model_gateway::adapter::Status;
+    for cancel in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let http = http_fixture(vec![HttpPlan::sse(tool_response(&[(
+            "metadata",
+            "process_exec",
+            r#"{"value":"ok"}"#,
+        )]))])
+        .await;
+        let mut gateway = gateway(store(&dir.path().join("store"), 10_000), &http, policy());
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut tools = FakeTools {
+            metadata_failure: (!cancel).then_some(ErrorKind::Tool),
+            cancel_metadata: cancel.then(|| flag.clone()),
+            ..Default::default()
+        };
+        let result = gateway
+            .run(&spec("metadata"), &mut tools, flag)
+            .await
+            .unwrap();
+        assert_eq!(tools.executed.load(Ordering::SeqCst), 0);
+        let receipts = tool_receipts(&gateway, &result.artifact_refs);
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].status, Status::NotRun);
+        assert!(!receipts[0].dispatch_started);
+        assert!(!result.requires_reconciliation);
+        assert_eq!(
+            result.status,
+            if cancel {
+                RunStatus::Cancelled
+            } else {
+                RunStatus::NoAction
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn opted_in_transient_retry_only_retries_proven_not_sent_and_keeps_zero_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut http = http_fixture(vec![]).await;
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    http.url = format!("http://{}/responses", closed.local_addr().unwrap());
+    drop(closed);
+    let mut policy = policy();
+    policy.max_requests = 2;
+    policy.max_backoff_ms = 100;
+    let mut gateway =
+        gateway(store(&dir.path().join("store"), 10_000), &http, policy).with_transient_retries();
+    let result = gateway
+        .run(
+            &spec("known-retry"),
+            &mut FakeTools::default(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.request_ids.len(), 2);
+    assert_ne!(result.request_ids[0], result.request_ids[1]);
+    assert_eq!(http.requests.load(Ordering::SeqCst), 0);
+    assert!(!result.requires_reconciliation);
+    let budget = gateway.store().journal().model_budget(TASK).unwrap();
+    assert_eq!(budget.charged_cost_micro_usd, 0);
+    assert_eq!(budget.unknown_requests, 0);
+    assert!(
+        gateway
+            .store()
+            .journal()
+            .model_requests(TASK)
+            .unwrap()
+            .iter()
+            .all(|record| record.state == ModelRequestState::Failed)
+    );
+}
+
 #[derive(Default)]
 struct FakeTools {
     executed: Arc<AtomicUsize>,
     contexts: Arc<Mutex<Vec<ToolContext>>>,
     cancel_preflight: Option<Arc<AtomicBool>>,
+    cancel_metadata: Option<Arc<AtomicBool>>,
+    metadata_failure: Option<ErrorKind>,
     failure: Option<ErrorKind>,
     unsuccessful: bool,
     unknown: bool,
@@ -400,6 +575,24 @@ async fn rejected_local_wire_keeps_safe_checkpoint_and_never_reserves_or_dispatc
     assert_eq!(http.requests.load(Ordering::SeqCst), 0);
 }
 impl ToolDispatcher for FakeTools {
+    fn adapter_metadata(
+        &self,
+        _: &AtomicBool,
+    ) -> Result<melissa_model_gateway::adapter::AdapterMetadata> {
+        if let Some(kind) = self.metadata_failure {
+            return Err(GatewayError::new(kind, "fixture metadata unavailable"));
+        }
+        if let Some(flag) = &self.cancel_metadata {
+            flag.store(true, Ordering::Release);
+        }
+        Ok(melissa_model_gateway::adapter::AdapterMetadata {
+            adapter_id: Some("fixture-only".into()),
+            adapter_version: Some("1".into()),
+            environment_fingerprint: Some("fixture-environment".into()),
+            source_before: Some("fixture-source".into()),
+            visibility_digest: Some("fixture-policy".into()),
+        })
+    }
     fn definitions(&self) -> Vec<BoundTool> {
         vec![BoundTool {
             canonical_id: "process.exec".into(),
@@ -641,7 +834,7 @@ async fn malformed_or_duplicate_tool_batches_execute_nothing() {
             .unwrap();
         assert!(matches!(
             r.status,
-            RunStatus::NoAction | RunStatus::ProviderFailed
+            RunStatus::NoAction | RunStatus::ProviderFailed | RunStatus::NeedsAuthorization
         ));
         assert_eq!(tools.executed.load(Ordering::SeqCst), 0);
         assert_eq!(r.tool_calls, 0);
@@ -1113,7 +1306,7 @@ async fn tool_authority_denial_and_unknown_observations_are_explicit_terminal_st
 }
 
 #[tokio::test]
-async fn explicit_bounded_fallback_uses_new_ids_and_keeps_failed_attempt_unknown_charge() {
+async fn fallback_and_retry_cannot_redispatch_an_http_error_with_unknown_usage() {
     let dir = tempfile::tempdir().unwrap();
     let http = http_fixture(vec![
         HttpPlan {
@@ -1127,7 +1320,8 @@ async fn explicit_bounded_fallback_uses_new_ids_and_keeps_failed_attempt_unknown
     let mut p = policy();
     p.allow_fallback = true;
     p.max_requests = 2;
-    let mut g = gateway(store(&dir.path().join("store"), 10_000), &http, p);
+    let mut g =
+        gateway(store(&dir.path().join("store"), 10_000), &http, p).with_transient_retries();
     let mut tools = FakeTools::default();
     let r = g
         .run(
@@ -1137,10 +1331,9 @@ async fn explicit_bounded_fallback_uses_new_ids_and_keeps_failed_attempt_unknown
         )
         .await
         .unwrap();
-    assert_eq!(r.status, RunStatus::FinalCandidate);
-    assert_eq!(r.request_ids.len(), 2);
-    assert_ne!(r.request_ids[0], r.request_ids[1]);
-    assert_eq!(http.requests.load(Ordering::SeqCst), 2);
+    assert_eq!(r.status, RunStatus::ProviderFailed);
+    assert_eq!(r.request_ids.len(), 1);
+    assert_eq!(http.requests.load(Ordering::SeqCst), 1);
     assert!(r.requires_reconciliation);
     let first = g
         .store()
@@ -1148,12 +1341,6 @@ async fn explicit_bounded_fallback_uses_new_ids_and_keeps_failed_attempt_unknown
         .model_request(&r.request_ids[0])
         .unwrap();
     assert_eq!(first.state, ModelRequestState::OutcomeUnknown);
-    let second = g
-        .store()
-        .journal()
-        .model_request(&r.request_ids[1])
-        .unwrap();
-    assert_eq!(second.state, ModelRequestState::Succeeded);
     let budget = g.store().journal().model_budget(TASK).unwrap();
     assert_eq!(
         (
@@ -1161,7 +1348,7 @@ async fn explicit_bounded_fallback_uses_new_ids_and_keeps_failed_attempt_unknown
             budget.charged_input_tokens,
             budget.charged_cost_micro_usd
         ),
-        (1, 1036, 1168)
+        (1, 1024, 1152)
     );
     assert!(!r.task_accepted);
     g.store().integrity_check().unwrap();

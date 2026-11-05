@@ -18,6 +18,7 @@ pub mod resources;
 pub mod session;
 mod session_ui;
 pub mod settings;
+mod tool_adapter;
 pub mod views;
 pub type Result<T = ()> = std::result::Result<T, Error>;
 #[derive(Debug)]

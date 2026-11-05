@@ -1008,7 +1008,7 @@ fn gateway(
         max_wall_time_ms: e.recipe.wall_time_ms.min(1_800_000),
         expires_at_unix_ms: e.expires_at_ms,
         allow_fallback: false,
-        max_backoff_ms: 0,
+        max_backoff_ms: 30_000,
         decoder_limits: DecoderLimits {
             max_event_bytes: 8 * 1024 * 1024,
             max_total_bytes: 256 * 1024 * 1024,
@@ -1019,6 +1019,7 @@ fn gateway(
     };
     let mut g = Gateway::new(store, resources::catalog()?, vec![model], policy, false)
         .map_err(gw)?
+        .with_transient_retries()
         .with_host_run_limit(
             melissa_model_gateway::agent_loop::HostRunLimit::new(e.recipe.wall_time_ms)
                 .map_err(gw)?,
@@ -1896,6 +1897,17 @@ impl App {
                             error,
                         )
                     })?;
+            let dispatcher = crate::tool_adapter::TaskAdapter {
+                inner: Box::new(dispatcher),
+                repo: Arc::new(self.source(&workspace)?),
+                environment_fingerprint: digest(&bytes(&json!({
+                    "adapter_version":env!("CARGO_PKG_VERSION"),
+                    "os":std::env::consts::OS,"arch":std::env::consts::ARCH,
+                    "settings_digest":e.settings_digest,"recipe":e.recipe,
+                    "runtime_digest":e.runtime_digest,
+                    "basis":"reviewed_configuration_not_runtime_health_attestation"
+                }))?),
+            };
             let spec = RunSpec {
                 run_id: packet.lease.run.clone(),
                 task_id: t.task_id.clone(),

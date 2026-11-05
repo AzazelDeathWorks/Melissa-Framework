@@ -131,12 +131,31 @@ impl Repository {
         Ok(Self {
             root: paths::pin_root(root)?,
             limits,
-            visibility: crate::SourceVisibilityPolicy::new(excluded)?,
+            visibility: crate::SourceVisibilityPolicy::source(excluded, vec![])?,
             package_capture: false,
         })
     }
     pub fn root_path(&self) -> &Path {
         &self.root.canonical
+    }
+    /// Host-selected source policy; exceptions must be reviewed with the task.
+    pub fn open_with_source_policy(
+        root: &Path,
+        limits: Limits,
+        policy: crate::SourceVisibilityPolicy,
+    ) -> Result<Self> {
+        limits.validate()?;
+        if !policy.protects_sensitive_paths() {
+            return Err(Error::Invalid(
+                "source policy must enable sensitive defaults",
+            ));
+        }
+        Ok(Self {
+            root: paths::pin_root(root)?,
+            limits,
+            visibility: policy,
+            package_capture: false,
+        })
     }
     /// Independent handle with the exact same source visibility and envelope.
     /// A domain worker must not accidentally re-include operator exclusions.
@@ -165,7 +184,8 @@ impl Repository {
         })
     }
     /// Complete package file capture: generated/runtime directories are part
-    /// of the artifact. Git metadata is rejected instead of silently omitted.
+    /// of the artifact. Git metadata and sensitive paths are rejected instead
+    /// of silently omitting files and misrepresenting package integrity.
     /// Existing source/Git capture policies retain their original behavior.
     pub fn open_for_package(root: &Path, limits: Limits) -> Result<Self> {
         limits.validate()?;
@@ -191,9 +211,9 @@ impl Repository {
     /// Binds historical model-visible results to the same root and policy.
     pub fn source_visibility_digest(&self) -> Result<String> {
         Ok(digest(&serde_json::to_vec(&(
-            "melissa.source-visibility/v1",
+            "melissa.source-visibility/v2",
             self.root_identity(),
-            self.visibility.excluded_prefixes(),
+            self.visibility.policy_digest_material(),
         ))?))
     }
     pub(crate) fn lock(&self, path: &str, write: bool) -> Result<Pinned> {
@@ -467,19 +487,24 @@ impl Repository {
                 format!("{relative}/{name}")
             };
             paths::relative(&child)?;
+            if self.package_capture && crate::SourceVisibilityPolicy::sensitive_path(&child) {
+                return Err(Error::Denied("package contains a sensitive path"));
+            }
             if child.split('/').any(|s| s.eq_ignore_ascii_case(".git")) {
                 if self.package_capture {
                     return Err(Error::Denied("package contains Git metadata"));
                 }
                 continue;
             }
-            if !self.visibility.allows(&child) {
+            let kind = entry.file_type()?;
+            if !self.visibility.allows(&child)
+                && !(kind.is_dir() && self.visibility.permits_traversal(&child))
+            {
                 continue;
             }
             if !seen.insert(paths::key(&child)) {
                 return Err(Error::Denied("case-colliding paths"));
             }
-            let kind = entry.file_type()?;
             paths::with_read_child(parent, &name, kind.is_dir(), |pin| {
                 if kind.is_dir() {
                     self.visit(pin, &child, seen, entries, cancel, file)

@@ -65,6 +65,10 @@ impl std::fmt::Debug for ToolExecution {
 pub trait ToolDispatcher: Send {
     fn definitions(&self) -> Vec<BoundTool>;
     fn validate_call(&self, call: &ToolCall) -> Result<()>;
+    /// Host provenance only. Implementations must not derive this from arguments.
+    fn adapter_metadata(&self, _cancelled: &AtomicBool) -> Result<crate::adapter::AdapterMetadata> {
+        Ok(crate::adapter::AdapterMetadata::default())
+    }
     fn execute<'a>(
         &'a mut self,
         call: ToolCall,
