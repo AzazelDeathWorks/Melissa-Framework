@@ -249,7 +249,7 @@ fn strict_objects(schema: &Value) -> Result<()> {
     Ok(())
 }
 
-fn validate_history_response(response: &ModelResponse) -> Result<()> {
+pub(crate) fn validate_history_response(response: &ModelResponse) -> Result<()> {
     let mut calls = Vec::new();
     let mut text = String::new();
     let mut refusal = String::new();

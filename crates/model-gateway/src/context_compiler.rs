@@ -13,6 +13,13 @@ pub struct ContextCompiler {
     archived: std::collections::BTreeMap<(String, String, String), ArchivedObservation>,
     counter: Option<Box<dyn NativeTokenCounter>>,
     wire_tokenizer: Option<crate::local_tokenizer::LocalWireTokenizer>,
+    intelligence: Option<crate::context_intelligence::ContextPolicy>,
+    turn_state: Option<crate::context_intelligence::TurnState>,
+    source_scope: Option<String>,
+    milestone: Option<crate::context_intelligence::Milestone>,
+    origins: std::collections::BTreeMap<(String, String), String>,
+    reviewed_summaries:
+        std::collections::BTreeMap<String, crate::context_intelligence::ReviewedSummary>,
 }
 /// Trusted-host tokenizer adapter for the complete encoded native request,
 /// including protocol framing, schemas, opaque history and images when present.
@@ -45,6 +52,8 @@ pub struct ContextReport {
     pub capacity_check: String,
     pub has_opaque_continuation: bool,
     pub archived: Vec<ArchivedObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intelligence: Option<crate::context_intelligence::IntelligenceReport>,
 }
 fn failure(message: &str) -> GatewayError {
     GatewayError::new(ErrorKind::Invalid, message)
@@ -69,6 +78,24 @@ pub fn read_history(
     context: &crate::tools::ToolContext,
     arguments: &str,
     cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<crate::tools::ToolExecution> {
+    read_history_inner(store, context, arguments, cancelled, None)
+}
+pub fn read_history_scoped(
+    store: &LocalStore,
+    context: &crate::tools::ToolContext,
+    arguments: &str,
+    cancelled: &std::sync::atomic::AtomicBool,
+    source_scope: &str,
+) -> Result<crate::tools::ToolExecution> {
+    read_history_inner(store, context, arguments, cancelled, Some(source_scope))
+}
+fn read_history_inner(
+    store: &LocalStore,
+    context: &crate::tools::ToolContext,
+    arguments: &str,
+    cancelled: &std::sync::atomic::AtomicBool,
+    source_scope: Option<&str>,
 ) -> Result<crate::tools::ToolExecution> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -119,11 +146,23 @@ pub fn read_history(
     if !(1..=65536).contains(&page.max_bytes) {
         return Err(failure("history page limit"));
     }
+    let scope_id = format!("context-history-scope:{}", context.run_id);
+    match store.get_artifact(&context.task_id, &scope_id) {
+        Ok(bytes) if source_scope.is_some_and(|s| s.as_bytes() == bytes) => {}
+        Err(StoreError::NotFound(_)) if source_scope.is_none() => {}
+        _ => {
+            return Err(GatewayError::new(
+                ErrorKind::Authorization,
+                "history source visibility changed or was not bound; re-observe through current scoped tools",
+            ));
+        }
+    }
     let meta = store
         .artifact_metadata(&context.task_id, &page.artifact_ref)
         .map_err(store_error)?;
     if meta.logical_type != "context.archived-observation"
         || meta.digest.strip_prefix("blake3:") != scoped_digest
+        || source_scope.is_some_and(|scope| meta.schema_version != archive_schema(Some(scope)))
     {
         return Err(failure("not an archived observation"));
     }
@@ -146,18 +185,31 @@ pub fn read_history(
     }
     Ok(crate::tools::ToolExecution { content: json!({"artifact_ref":page.artifact_ref,"source_digest":meta.digest,"start_byte":page.start_byte,"end_byte":end,"total_bytes":text.len(),"content":&text[page.start_byte..end],"authority":"untrusted_data","historical":true}).to_string(), success:true, cancelled:false, requires_reconciliation:false, artifact_refs:vec![page.artifact_ref] })
 }
+fn archive_schema(scope: Option<&str>) -> String {
+    scope.map_or_else(
+        || "melissa.context-observation/v1".into(),
+        |s| {
+            format!(
+                "melissa.context-observation/v2:{}",
+                blake3::hash(s.as_bytes())
+            )
+        },
+    )
+}
 fn archive(
     store: &mut LocalStore,
     task: &str,
     run: &str,
     call: &str,
     content: &str,
+    source_scope: Option<&str>,
 ) -> Result<ArchivedObservation> {
     let hash = blake3::hash(content.as_bytes()).to_hex().to_string();
     let id = format!("{}{hash}", history_prefix(run));
     match store.artifact_metadata(task, &id) {
         Ok(meta) => {
             if meta.logical_type != "context.archived-observation"
+                || meta.schema_version != archive_schema(source_scope)
                 || store.get_artifact(task, &id).map_err(store_error)? != content.as_bytes()
             {
                 return Err(failure("context archive collision"));
@@ -171,7 +223,7 @@ fn archive(
                         task_id: task.into(),
                         content_type: "text/plain; charset=utf-8".into(),
                         logical_type: "context.archived-observation".into(),
-                        schema_version: "melissa.context-observation/v1".into(),
+                        schema_version: archive_schema(source_scope),
                         retain_until_ms: 0,
                         legal_hold: false,
                     },
@@ -189,6 +241,437 @@ fn archive(
     })
 }
 impl ContextCompiler {
+    fn prepare(
+        &mut self,
+        request: &mut TurnRequest,
+        endpoint: &ProviderEndpoint,
+        store: &mut LocalStore,
+        task: &str,
+        run: &str,
+        archived: &mut Vec<ArchivedObservation>,
+    ) -> Result<Option<crate::context_intelligence::IntelligenceReport>> {
+        use crate::context_intelligence::{
+            IntelligenceReport, Omission, call_names, reference, serialized_bytes,
+        };
+        let Some(policy) = self.intelligence.clone() else {
+            return Ok(None);
+        };
+        let mut seen = std::collections::BTreeMap::new();
+        for tool in &request.tools {
+            if let Some(previous) = seen.insert(tool.name.clone(), tool.clone())
+                && previous != *tool
+            {
+                return Err(failure("conflicting duplicate tool schemas"));
+            }
+        }
+        let mut names = std::collections::BTreeSet::new();
+        request.tools.retain(|t| names.insert(t.name.clone()));
+        request.validate_structure()?;
+        for message in &request.messages {
+            if let Message::Assistant { response } = message {
+                if response.continuation.is_empty()
+                    || !matches!(
+                        response.stop,
+                        crate::StopReason::EndTurn
+                            | crate::StopReason::ToolCalls
+                            | crate::StopReason::Refusal
+                    )
+                {
+                    return Err(failure("incomplete native history before compaction"));
+                }
+                match response.protocol {
+                    crate::Protocol::OpenAiResponses => {
+                        crate::openai::validate_history_response(response)?
+                    }
+                    crate::Protocol::AnthropicMessages => {
+                        crate::anthropic::validate_continuation(response)?
+                    }
+                }
+            }
+        }
+        let opaque = request
+            .messages
+            .iter()
+            .any(|m| matches!(m,Message::Assistant{response} if crate::context_intelligence::opaque_continuation(response)));
+        if request.messages.iter().any(|m|matches!(m,Message::Assistant{response}
+            if response.protocol!=endpoint.protocol || (!response.continuation.is_empty() && response.requested_model!=request.model))) {
+            return Err(GatewayError::protocol("continuation cannot cross protocol/model identity"));
+        }
+        if request
+            .messages
+            .iter()
+            .any(|m| matches!(m, Message::Assistant { .. }))
+        {
+            let origin = format!(
+                "{}|{}|{:?}|{}",
+                endpoint.provider_id, endpoint.url, endpoint.protocol, request.model
+            );
+            let key = (task.into(), run.into());
+            if self.origins.get(&key).is_some_and(|old| old != &origin) {
+                return Err(GatewayError::protocol(
+                    "opaque continuation cannot cross provider origin",
+                ));
+            }
+            self.origins.insert(key, origin);
+        }
+        if let Some(scope) = &self.source_scope {
+            let id = format!("context-history-scope:{run}");
+            match store.get_artifact(task, &id) {
+                Ok(bytes) if bytes == scope.as_bytes() => {}
+                Err(StoreError::NotFound(_)) => {
+                    store
+                        .put_artifact(
+                            &ArtifactRequest {
+                                artifact_id: id,
+                                task_id: task.into(),
+                                content_type: "text/plain".into(),
+                                logical_type: "context.source-scope".into(),
+                                schema_version: "melissa.context-source-scope/v1".into(),
+                                retain_until_ms: 0,
+                                legal_hold: false,
+                            },
+                            scope.as_bytes(),
+                        )
+                        .map_err(store_error)?;
+                }
+                _ => {
+                    return Err(GatewayError::new(
+                        ErrorKind::Authorization,
+                        "context source visibility changed on resume",
+                    ));
+                }
+            }
+        }
+        let mut report=IntelligenceReport { original_history_bytes:serialized_bytes(&request.messages)?,
+            original_messages:request.messages.len(), section_budget_semantics:"section ceilings share one input pool; complete native wire plus output reservation is separately checked".into(),
+            ..Default::default() };
+        report.stages = std::collections::BTreeMap::from([
+            (
+                "deterministic_filter".into(),
+                "enabled; old observations only".into(),
+            ),
+            (
+                "duplicate_observations".into(),
+                "enabled; exact digest only".into(),
+            ),
+            (
+                "typed_normalization".into(),
+                "enabled; known dispatcher formats only".into(),
+            ),
+            (
+                "milestone_checkpoint".into(),
+                if opaque {
+                    "preserve_native_continuation"
+                } else {
+                    "no_eligible_completed_prefix"
+                }
+                .into(),
+            ),
+            (
+                "model_assisted_summary".into(),
+                "not_configured; no inference dispatched".into(),
+            ),
+            (
+                "native_provider_compaction".into(),
+                "not_registered; opaque bytes preserved verbatim".into(),
+            ),
+        ]);
+        if !request.tools.iter().any(|t| t.name == "history_read") {
+            report.stages.insert(
+                "archiving".into(),
+                "disabled; scoped history reader unavailable".into(),
+            );
+        } else {
+            let call_names = call_names(&request.messages);
+            let hot = request.messages.len().saturating_sub(policy.hot_messages);
+            let cold = request.messages.len().saturating_sub(policy.warm_messages);
+            let mut latest = std::collections::BTreeMap::new();
+            for (i, m) in request.messages.iter().enumerate() {
+                if let Message::ToolResult { content, .. } = m {
+                    latest.insert(*blake3::hash(content.as_bytes()).as_bytes(), i);
+                }
+            }
+            for (i, message) in request.messages.iter_mut().enumerate() {
+                let Message::ToolResult {
+                    call_id, content, ..
+                } = message
+                else {
+                    continue;
+                };
+                if call_names.get(call_id).is_some_and(|n| n == "history_read") && i >= hot {
+                    continue;
+                }
+                let hash = *blake3::hash(content.as_bytes()).as_bytes();
+                let duplicate = i < hot && latest.get(&hash).is_some_and(|last| *last > i);
+                let normalized = crate::observations::normalize(
+                    call_names.get(call_id).map(String::as_str).unwrap_or(""),
+                    content,
+                );
+                let reason = if duplicate {
+                    "duplicate_observation"
+                } else if normalized.is_some() {
+                    "typed_observation"
+                } else if i < cold {
+                    "cold_observation"
+                } else if i < hot && content.len() > policy.observation_bytes {
+                    "warm_observation_budget"
+                } else {
+                    continue;
+                };
+                // Small observations cost less verbatim than their references.
+                if content.len() < 2048 {
+                    continue;
+                }
+                let record = archive(
+                    store,
+                    task,
+                    run,
+                    call_id,
+                    content,
+                    self.source_scope.as_deref(),
+                )?;
+                let mut replacement = reference(&record, reason);
+                if !duplicate && let Some(view) = normalized {
+                    replacement["observation"] = view;
+                    replacement["full_log_ref"] = json!(record.artifact_ref);
+                    replacement["diff_ref"] = json!(record.artifact_ref);
+                }
+                if i < hot
+                    && let Some(summary) = self.reviewed_summaries.get(&record.source_digest)
+                    && summary.task_id == task
+                    && summary.run_id == run
+                    && summary.call_id == *call_id
+                {
+                    summary.validate(content)?;
+                    let evidence = store
+                        .get_artifact(task, &summary.evidence_ref)
+                        .map_err(store_error)?;
+                    let review = store
+                        .get_artifact(task, &summary.review_ref)
+                        .map_err(store_error)?;
+                    let review: Value = crate::checkpoint::decode(&review)?;
+                    if evidence != content.as_bytes()
+                        || review["task_id"] != task
+                        || review["run_id"] != run
+                        || review["call_id"] != *call_id
+                        || review["approved"] != true
+                        || review["source_digest"] != summary.source_digest
+                        || review["summary_digest"]
+                            != format!("blake3:{}", blake3::hash(summary.summary.as_bytes()))
+                    {
+                        return Err(failure("summary evidence/review mismatch"));
+                    }
+                    replacement["reviewed_summary"] = json!({"text":summary.summary,"review_ref":summary.review_ref,"authority":"untrusted_data"});
+                    report.stages.insert(
+                        "model_assisted_summary".into(),
+                        "reviewed_external_summary; no inference dispatched by compiler".into(),
+                    );
+                }
+                let replacement = replacement.to_string();
+                if replacement.len() >= content.len()
+                    || replacement.len() > policy.observation_bytes
+                {
+                    continue;
+                }
+                report.omissions.push(Omission {
+                    call_id: call_id.clone(),
+                    reason: reason.into(),
+                    artifact_ref: record.artifact_ref.clone(),
+                    source_digest: record.source_digest.clone(),
+                    original_bytes: content.len(),
+                    working_bytes: replacement.len(),
+                });
+                *content = replacement;
+                archived.push(record);
+            }
+            self.checkpoint_completed(request, &policy, store, task, run, &mut report, archived)?;
+        }
+        if let Some(state) = &self.turn_state {
+            if state.task_id != task || state.run_id != run {
+                return Err(failure("current context task/run mismatch"));
+            }
+            request
+                .messages
+                .push(crate::context_intelligence::state_message(state)?);
+        }
+        Ok(Some(report))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn checkpoint_completed(
+        &self,
+        request: &mut TurnRequest,
+        policy: &crate::context_intelligence::ContextPolicy,
+        store: &mut LocalStore,
+        task: &str,
+        run: &str,
+        report: &mut crate::context_intelligence::IntelligenceReport,
+        archived: &mut Vec<ArchivedObservation>,
+    ) -> Result<()> {
+        // Native continuation may contain signatures, reasoning or provider
+        // function items. Never splice, translate or summarize those bytes.
+        if request
+            .messages
+            .iter()
+            .any(|m| matches!(m,Message::Assistant{response} if crate::context_intelligence::opaque_continuation(response)))
+        {
+            return Ok(());
+        }
+        let cutoff = request.messages.len().saturating_sub(policy.warm_messages);
+        let latest_tools: std::collections::BTreeMap<_, _> = request
+            .messages
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| {
+                if let Message::Assistant { response } = m {
+                    Some((i, response))
+                } else {
+                    None
+                }
+            })
+            .flat_map(|(i, r)| r.calls.iter().map(move |c| (c.name.clone(), i)))
+            .collect();
+        let mut groups = Vec::new();
+        let mut archive_bytes = 0u64;
+        let mut successful = std::collections::BTreeSet::new();
+        let mut i = 0;
+        while i < cutoff {
+            if let Message::Assistant { response } = &request.messages[i] {
+                let end = i + 1 + response.calls.len();
+                if !response.calls.is_empty()
+                    && response.text.is_empty()
+                    && response.refusal.is_none()
+                    && response.stop == crate::StopReason::ToolCalls
+                    && end <= cutoff
+                    && response
+                        .calls
+                        .iter()
+                        .all(|c| latest_tools.get(&c.name).is_some_and(|last| *last > i))
+                    && request.messages[i + 1..end].iter().all(|m| {
+                        matches!(
+                            m,
+                            Message::ToolResult {
+                                is_error: false,
+                                ..
+                            }
+                        )
+                    })
+                {
+                    let group_bytes =
+                        crate::context_intelligence::serialized_bytes(&request.messages[i..end])?;
+                    if archive_bytes.saturating_add(group_bytes) > 4 * 1024 * 1024 {
+                        break;
+                    }
+                    archive_bytes += group_bytes;
+                    successful.extend(response.calls.iter().map(|c| c.name.clone()));
+                    groups.push((i, end));
+                    i = end;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        if groups.len() < policy.checkpoint_min_turns {
+            return Ok(());
+        }
+        let raw=serde_json::to_string(&json!({"schema_version":"melissa.completed-turn-evidence/v1",
+            "view":"Working exchanges; any context_archive points to the exact original observation. The durable transcript is unchanged.",
+            "groups":groups.iter().map(|(s,e)|json!({"start_message":s,"end_message":e,"messages":&request.messages[*s..*e]})).collect::<Vec<_>>()
+        })).map_err(|_|failure("milestone archive serialization"))?;
+        let record = archive(
+            store,
+            task,
+            run,
+            "completed-milestone",
+            &raw,
+            self.source_scope.as_deref(),
+        )?;
+        let summary=Message::User{text:json!({"schema_version":"melissa.context-checkpoint/v1",
+            "context_archive":record,"completed_tool_turns":groups.len(),"successful_tools":successful,
+            "authority":"untrusted_data","task_accepted":false,
+            "summary":"Earlier completed tool-only exchanges moved to encrypted history. All user instructions, assistant decisions, failures and recent exchanges remain. Read history_read before relying on omitted results or arguments. Success here is tool execution only, not task acceptance."}).to_string()};
+        let mut next = Vec::new();
+        let mut groups = groups.into_iter().peekable();
+        let mut inserted = false;
+        for (index, message) in request.messages.drain(..).enumerate() {
+            while groups.peek().is_some_and(|(_, e)| index >= *e) {
+                groups.next();
+            }
+            if groups
+                .peek()
+                .is_some_and(|(s, e)| index >= *s && index < *e)
+            {
+                if !inserted {
+                    next.push(summary.clone());
+                    inserted = true;
+                }
+            } else {
+                next.push(message);
+            }
+        }
+        request.messages = next;
+        report.checkpoint_refs.push(record.artifact_ref.clone());
+        report
+            .omissions
+            .push(crate::context_intelligence::Omission {
+                call_id: record.call_id.clone(),
+                reason: "completed_tool_milestone".into(),
+                artifact_ref: record.artifact_ref.clone(),
+                source_digest: record.source_digest.clone(),
+                original_bytes: record.original_bytes,
+                working_bytes: crate::context_intelligence::serialized_bytes(&summary)? as usize,
+            });
+        report.stages.insert(
+            "milestone_checkpoint".into(),
+            "deterministic_completed_tool_turns".into(),
+        );
+        archived.push(record);
+        Ok(())
+    }
+    pub fn with_intelligence(
+        mut self,
+        policy: crate::context_intelligence::ContextPolicy,
+    ) -> Result<Self> {
+        policy.validate()?;
+        self.intelligence = Some(policy);
+        Ok(self)
+    }
+    pub fn intelligence_enabled(&self) -> bool {
+        self.intelligence.is_some()
+    }
+    pub fn milestone(&self) -> Option<crate::context_intelligence::Milestone> {
+        self.milestone.clone()
+    }
+    pub fn set_milestone(&mut self, id: String, goal: String) -> Result<()> {
+        if self.intelligence.is_none()
+            || id.trim().is_empty()
+            || id.len() > 256
+            || goal.trim().is_empty()
+            || goal.len() > 64 * 1024
+        {
+            return Err(failure("context milestone bounds"));
+        }
+        self.milestone = Some(crate::context_intelligence::Milestone { id, goal });
+        Ok(())
+    }
+    pub fn set_turn_state(&mut self, state: crate::context_intelligence::TurnState) {
+        self.turn_state = Some(state);
+    }
+    pub fn set_source_scope(&mut self, scope: String) -> Result<()> {
+        if self.intelligence.is_none() || scope.trim().is_empty() || scope.len() > 512 {
+            return Err(failure("source visibility identity"));
+        }
+        self.source_scope = Some(scope);
+        Ok(())
+    }
+    pub fn with_reviewed_summary(
+        mut self,
+        summary: crate::context_intelligence::ReviewedSummary,
+    ) -> Self {
+        self.reviewed_summaries
+            .insert(summary.source_digest.clone(), summary);
+        self
+    }
     pub fn with_wire_tokenizer(
         mut self,
         tokenizer: crate::local_tokenizer::LocalWireTokenizer,
@@ -204,12 +687,22 @@ impl ContextCompiler {
         Ok(self)
     }
     pub fn policy_id(&self) -> String {
-        let base = format!(
+        let mut base = format!(
             "native-context/v1:{}",
             self.counter
                 .as_ref()
                 .map_or("utf8-framing", |c| c.policy_id())
         );
+        if let Some(policy) = &self.intelligence {
+            let bytes = serde_json::to_vec(&(
+                policy,
+                &self.source_scope,
+                &self.reviewed_summaries,
+                &self.milestone,
+            ))
+            .expect("serializable context policy");
+            base = format!("{base}:intelligence/v2:{}", blake3::hash(&bytes));
+        }
         match &self.wire_tokenizer {
             Some(t) => format!("{base}:{}", t.policy_id()),
             None => base,
@@ -221,6 +714,9 @@ impl ContextCompiler {
         task: &str,
         run: &str,
     ) -> (Vec<Message>, Vec<ArchivedObservation>) {
+        if self.intelligence.is_some() {
+            return (messages.to_vec(), vec![]);
+        }
         let mut records = Vec::new();
         let working = messages
             .iter()
@@ -267,13 +763,21 @@ impl ContextCompiler {
         run: &str,
         mut archived: Vec<ArchivedObservation>,
     ) -> Result<(Value, ContextReport)> {
+        let started = std::time::Instant::now();
+        let mut intelligence = self.prepare(request, endpoint, store, task, run, &mut archived)?;
         request.validate_structure()?;
         let has_images = request
             .messages
             .iter()
             .any(|m| matches!(m, Message::UserImages { .. } | Message::ToolImages { .. }));
         let can_archive = request.tools.iter().any(|t| t.name == "history_read");
-        let protected_start = request.messages.len().saturating_sub(8);
+        let protected_start =
+            request
+                .messages
+                .len()
+                .saturating_sub(self.intelligence.as_ref().map_or(8, |p| {
+                    p.hot_messages + usize::from(self.turn_state.is_some())
+                }));
         let has_opaque = request.messages.iter().any(
             |m| matches!(m, Message::Assistant { response } if !response.continuation.is_empty()),
         );
@@ -293,6 +797,14 @@ impl ContextCompiler {
                 None
             };
             let Some(i) = candidate else {
+                // The conservative per-replacement saving can understate the
+                // actual saving. Recount before rejecting a now-fitting view.
+                let mut remaining = ByteCount(0);
+                serde_json::to_writer(&mut remaining, &request)
+                    .map_err(|_| failure("history byte recount"))?;
+                if remaining.0 <= transport.request_limits().max_history_bytes as u64 {
+                    break;
+                }
                 return Err(failure(
                     "required history exceeds wire byte envelope; no request dispatched",
                 ));
@@ -302,7 +814,14 @@ impl ContextCompiler {
                 call_id, content, ..
             } = &mut request.messages[i]
             {
-                let record = archive(store, task, run, call_id, content)?;
+                let record = archive(
+                    store,
+                    task,
+                    run,
+                    call_id,
+                    content,
+                    self.source_scope.as_deref(),
+                )?;
                 let replacement = placeholder(&record);
                 excess = excess.saturating_sub(
                     content
@@ -342,6 +861,35 @@ impl ContextCompiler {
                     .checked_add(request.max_output_tokens)
                     .is_some_and(|n| n <= capacity)
             {
+                if let Some(report) = intelligence.as_mut() {
+                    report.sections = crate::context_intelligence::sections(
+                        request,
+                        self.intelligence.as_ref().unwrap(),
+                        capacity,
+                        conservative_input_units,
+                    )?;
+                    report.working_history_bytes =
+                        crate::context_intelligence::serialized_bytes(&request.messages)?;
+                    report.working_messages = request.messages.len();
+                    report.build_microseconds =
+                        started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+                    for record in &archived {
+                        if !report.omissions.iter().any(|o| {
+                            o.call_id == record.call_id && o.artifact_ref == record.artifact_ref
+                        }) {
+                            report
+                                .omissions
+                                .push(crate::context_intelligence::Omission {
+                                    call_id: record.call_id.clone(),
+                                    reason: "capacity_pressure".into(),
+                                    artifact_ref: record.artifact_ref.clone(),
+                                    source_digest: record.source_digest.clone(),
+                                    original_bytes: record.original_bytes,
+                                    working_bytes: placeholder(record).len(),
+                                });
+                        }
+                    }
+                }
                 let mut wire_tokenizer_status = None;
                 let wire_token_measurement = if let Some(tokenizer) = &self.wire_tokenizer {
                     if has_images || has_opaque {
@@ -389,12 +937,14 @@ impl ContextCompiler {
                         .into(),
                         has_opaque_continuation: has_opaque,
                         archived,
+                        intelligence,
                     },
                 ));
             }
             let mut debt = input
                 .saturating_add(request.max_output_tokens)
                 .saturating_sub(capacity);
+            let batch_start = scanned;
             while debt > 0 {
                 let candidate = if can_archive {
                     (scanned..protected_start).find(|&i| matches!(&request.messages[i], Message::ToolResult { content, .. } if content.len() > 2048))
@@ -402,6 +952,9 @@ impl ContextCompiler {
                     None
                 };
                 let Some(i) = candidate else {
+                    if scanned > batch_start {
+                        break;
+                    }
                     return Err(failure(
                         "required/recent native context exceeds capacity; history preserved and no request dispatched",
                     ));
@@ -411,7 +964,14 @@ impl ContextCompiler {
                     call_id, content, ..
                 } = &mut request.messages[i]
                 {
-                    let record = archive(store, task, run, call_id, content)?;
+                    let record = archive(
+                        store,
+                        task,
+                        run,
+                        call_id,
+                        content,
+                        self.source_scope.as_deref(),
+                    )?;
                     let replacement = placeholder(&record);
                     debt = debt.saturating_sub(
                         content

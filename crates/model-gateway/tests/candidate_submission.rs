@@ -71,6 +71,136 @@ fn typed(run: &str) -> RunSpec {
     s.output_schema = Some(output());
     s
 }
+
+struct FixtureNativeCounter;
+impl melissa_model_gateway::context_compiler::NativeTokenCounter for FixtureNativeCounter {
+    fn policy_id(&self) -> &str {
+        "loopback-fixture-only-count/v1"
+    }
+    fn count(&self, _: &ProviderEndpoint, _: &str, _: &Value) -> Result<Option<u64>> {
+        Ok(Some(100))
+    }
+}
+struct ExactSink(Sink);
+impl ToolDispatcher for ExactSink {
+    fn definitions(&self) -> Vec<BoundTool> {
+        let mut definitions = self.0.definitions();
+        for d in &mut definitions {
+            if d.definition.name == "submit_result" {
+                d.definition.parameters = output();
+            }
+        }
+        definitions
+    }
+    fn validate_call(&self, c: &ToolCall) -> Result<()> {
+        self.0.validate_call(c)
+    }
+    fn execute<'a>(
+        &'a mut self,
+        c: ToolCall,
+        t: ToolContext,
+        f: Arc<AtomicBool>,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolExecution>> + Send + 'a>> {
+        self.0.execute(c, t, f)
+    }
+}
+#[tokio::test]
+async fn intelligent_native_loop_rebuilds_each_turn_and_sends_output_schema_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let http = http_fixture(vec![
+        HttpPlan::sse(tool_response(&[("s", "source", "{}")])),
+        HttpPlan::sse(tool_response(&[(
+            "done",
+            "submit_result",
+            "{\"value\":42}",
+        )])),
+    ])
+    .await;
+    let compiler = melissa_model_gateway::context_compiler::ContextCompiler::default()
+        .with_intelligence(Default::default())
+        .unwrap()
+        .with_counter(Box::new(FixtureNativeCounter))
+        .unwrap();
+    let mut g = gateway(store(&dir.path().join("store"), 1_000_000), &http, policy())
+        .with_native_context_compiler(compiler)
+        .with_candidate_submission_tool("submit_result")
+        .unwrap();
+    let mut sink = ExactSink(Sink::new());
+    let mut s = typed("smart-candidate");
+    s.required_tool_names = BTreeSet::from(["source".into(), "submit_result".into()]);
+    let result = g
+        .run(&s, &mut sink, Arc::new(AtomicBool::new(false)))
+        .await
+        .unwrap();
+    assert_eq!(result.status, RunStatus::FinalCandidate);
+    assert!(!result.task_accepted);
+    assert_eq!(result.answer.as_deref(), Some("{\"value\":42}"));
+    let bodies = http.bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2);
+    for (turn, body) in bodies.iter().enumerate() {
+        assert!(body.get("text").is_none());
+        assert_eq!(
+            body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|d| d["parameters"] == output())
+                .count(),
+            1
+        );
+        assert_eq!(body["max_output_tokens"], 128);
+        let input = body["input"].as_array().unwrap();
+        let current = input.last().unwrap();
+        let text = current["content"]
+            .as_str()
+            .or_else(|| current["content"][0]["text"].as_str())
+            .unwrap();
+        let state: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(state["current_goal_and_milestone"]["turn"], turn);
+        assert_eq!(
+            state["current_goal_and_milestone"]["successful_tools"]
+                .as_array()
+                .unwrap()
+                .len(),
+            turn
+        );
+        let evidence = g
+            .store()
+            .get_artifact(TASK, &format!("{}:request", result.request_ids[turn]))
+            .unwrap();
+        let envelope: Value = serde_json::from_slice(&evidence).unwrap();
+        assert!(envelope["context_report"]["intelligence"]["sections"].is_array());
+    }
+    assert_eq!(
+        *sink.0.effects.lock().unwrap(),
+        vec!["source", "submit_result"]
+    );
+}
+
+#[tokio::test]
+async fn intelligent_schema_mismatch_rejects_before_http_and_budget_reservation() {
+    let dir = tempfile::tempdir().unwrap();
+    let http = http_fixture(vec![]).await;
+    let mut g = gateway(store(&dir.path().join("s"), 1_000_000), &http, policy())
+        .with_native_context_compiler(
+            melissa_model_gateway::context_compiler::ContextCompiler::default()
+                .with_intelligence(Default::default())
+                .unwrap(),
+        )
+        .with_candidate_submission_tool("submit_result")
+        .unwrap();
+    assert!(
+        g.run(
+            &typed("mismatch"),
+            &mut Sink::new(),
+            Arc::new(AtomicBool::new(false))
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(http.requests.load(Ordering::SeqCst), 0);
+    assert!(g.store().journal().model_requests(TASK).unwrap().is_empty());
+}
 #[tokio::test]
 async fn typed_submission_finishes_after_one_owned_call_preserving_original_arguments() {
     let dir = tempfile::tempdir().unwrap();

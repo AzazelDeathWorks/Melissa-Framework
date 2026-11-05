@@ -162,7 +162,7 @@ fn flush_results(
     Ok(())
 }
 
-fn validate_continuation(response: &ModelResponse) -> Result<()> {
+pub(crate) fn validate_continuation(response: &ModelResponse) -> Result<()> {
     // Only replayable end-turn/tool-call responses reach this function. The
     // decoder assigns refusal metadata solely to non-replayable refusal stops.
     if response.refusal.is_some() {

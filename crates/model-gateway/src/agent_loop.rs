@@ -214,6 +214,20 @@ impl Gateway {
         self.context_compiler = Some(crate::context_compiler::ContextCompiler::default());
         self
     }
+    pub fn with_context_source_scope(mut self, scope: String) -> Result<Self> {
+        self.context_compiler
+            .as_mut()
+            .ok_or_else(|| GatewayError::invalid("context compiler not configured"))?
+            .set_source_scope(scope)?;
+        Ok(self)
+    }
+    pub fn with_context_milestone(mut self, id: String, goal: String) -> Result<Self> {
+        self.context_compiler
+            .as_mut()
+            .ok_or_else(|| GatewayError::invalid("context compiler not configured"))?
+            .set_milestone(id, goal)?;
+        Ok(self)
+    }
     pub fn with_native_context_compiler(
         mut self,
         compiler: crate::context_compiler::ContextCompiler,
@@ -392,6 +406,10 @@ impl Gateway {
         {
             return Err(GatewayError::invalid("run identity/input bounds"));
         }
+        let intelligent_context = self
+            .context_compiler
+            .as_ref()
+            .is_some_and(|c| c.intelligence_enabled());
         if let Some(schema) = &spec.output_schema {
             crate::schema::validate_schema(schema)?;
         }
@@ -421,6 +439,18 @@ impl Gateway {
             ));
         }
         let definitions = dispatcher.definitions();
+        let typed_schema = intelligent_context
+            && self.candidate_submission_tool.as_ref().is_some_and(|name| {
+                definitions.iter().any(|d| {
+                    &d.definition.name == name
+                        && Some(&d.definition.parameters) == spec.output_schema.as_ref()
+                })
+            });
+        if intelligent_context && self.candidate_submission_tool.is_some() && !typed_schema {
+            return Err(GatewayError::invalid(
+                "typed candidate schema differs from final contract",
+            ));
+        }
         let mut wire_names = BTreeSet::new();
         for tool in &definitions {
             if !profile.tool_ids.contains(&tool.canonical_id)
@@ -512,7 +542,15 @@ impl Gateway {
         );
         if let Some(schema) = &spec.output_schema {
             system.push_str("\n\nFINAL OUTPUT CONTRACT: Your entire final answer must be exactly one JSON object satisfying this host schema. No prose, Markdown fences, comments or extra fields. Put evidence/limits only in fields allowed by the schema. Derive values from actual observations. JSON string escapes must decode to the observed bytes: a source LF is one newline character, not literal backslash+n. This contract changes no tool authority or independent acceptance. Schema: ");
-            system.push_str(&schema.to_string());
+            if intelligent_context && (typed_schema || !self.json_object_output) {
+                system.push_str(if typed_schema {
+                    "The exact schema is supplied once in the typed candidate tool parameters."
+                } else {
+                    "The exact schema is supplied once in the native structured-output channel."
+                });
+            } else {
+                system.push_str(&schema.to_string());
+            }
         }
         if let Some(name) = &self.candidate_submission_tool {
             // The legacy None path retains its original system/binding bytes.
@@ -687,9 +725,37 @@ impl Gateway {
                     messages: working_messages,
                     tools: definitions.iter().map(|v| v.definition.clone()).collect(),
                     max_output_tokens: spec.max_output_tokens.min(model.max_output_tokens),
-                    output_schema: spec.output_schema.clone(),
+                    output_schema: if typed_schema {
+                        None
+                    } else {
+                        spec.output_schema.clone()
+                    },
                 };
                 let (wire, context_report) = if let Some(compiler) = &mut self.context_compiler {
+                    if intelligent_context {
+                        let current = self
+                            .store
+                            .journal()
+                            .task(&spec.task_id)
+                            .map_err(store_error)?;
+                        compiler.set_turn_state(crate::context_intelligence::TurnState {
+                            task_id: spec.task_id.clone(),
+                            run_id: spec.run_id.clone(),
+                            profile_id: spec.profile_id.clone(),
+                            goal: current.contract.goal.clone(),
+                            task_version: current.record.version,
+                            task_state: format!("{:?}", current.record.state),
+                            turn,
+                            successful_tools: successful.clone(),
+                            remaining_required_tools: spec
+                                .required_tool_names
+                                .difference(&successful)
+                                .cloned()
+                                .collect(),
+                            milestone:compiler.milestone(),
+                            budget:json!({"limits":current.contract.limits,"spent":self.store.journal().model_budget(&spec.task_id).map_err(store_error)?,"authority":"live host ledger; does not alter model output or reasoning settings"}),
+                        });
+                    }
                     let (wire, report) = compiler.compile(
                         &mut request,
                         &self.transport,

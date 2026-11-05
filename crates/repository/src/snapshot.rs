@@ -79,6 +79,10 @@ pub struct SearchHit {
     pub digest: String,
     pub byte_offset: usize,
     pub line: usize,
+    pub end_line: usize,
+    pub match_excerpt: Option<String>,
+    pub excerpt_start_byte: Option<usize>,
+    pub excerpt_end_byte: Option<usize>,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchResult {
@@ -351,12 +355,14 @@ impl Repository {
         // Linear-time substring search; comparing every window cost
         // file size x needle length (up to 64 KiB) with no cancel point.
         let finder = memchr::memmem::Finder::new(needle);
+        let match_lines = memchr::memchr_iter(b'\n', needle).count();
         for observed in &snapshot.files {
             check_cancel(cancel)?;
             let (version, bytes) = self.read(&observed.path)?;
             if version != *observed {
                 return Err(Error::Stale("search file changed"));
             }
+            let text = std::str::from_utf8(&bytes).ok();
             let (mut start, mut line, mut counted) = (0, 1, 0);
             // Restart one byte past each hit so overlapping matches are kept.
             while let Some(pos) = find_chunked(&bytes, start, &finder, needle.len(), cancel)? {
@@ -367,11 +373,26 @@ impl Repository {
                 }
                 line += memchr::memchr_iter(b'\n', &bytes[counted..pos]).count();
                 counted = pos;
+                let excerpt = text.map(|text| {
+                    let mut from = pos.saturating_sub(96);
+                    while !text.is_char_boundary(from) {
+                        from += 1;
+                    }
+                    let mut end = (from + 512).min(text.len());
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    (from, end, text[from..end].to_owned())
+                });
                 hits.push(SearchHit {
                     path: version.path.clone(),
                     digest: version.digest.clone(),
                     byte_offset: pos,
                     line,
+                    end_line: line + match_lines,
+                    excerpt_start_byte: excerpt.as_ref().map(|e| e.0),
+                    excerpt_end_byte: excerpt.as_ref().map(|e| e.1),
+                    match_excerpt: excerpt.map(|e| e.2),
                 });
                 start = pos + 1;
             }

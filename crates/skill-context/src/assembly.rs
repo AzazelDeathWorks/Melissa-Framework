@@ -157,7 +157,9 @@ impl Assembly<'_> {
             self.namespace.clone(),
             Section::SystemContract,
             serde_json::to_vec(
-                &json!({"native_system_profile":profile.system_prompt_tr,"complete_native_tool_schemas":defs}),
+                &json!({"native_system_profile_ref":{"profile_id":profile.id,"digest":digest(profile.system_prompt_tr.as_bytes())},
+                    "native_tool_schemas_ref":{"digest":definitions_digest,"tools":definitions.iter().map(|d|json!({"canonical_id":d.canonical_id,"name":d.definition.name})).collect::<Vec<_>>()},
+                    "delivery":"Full specialist contract and exact tool schemas are supplied once through native system/tools channels. References do not grant authority."}),
             )?,
             "host:profile-and-tools",
             "v1",
@@ -197,7 +199,10 @@ impl Assembly<'_> {
                 "output",
                 self.namespace.clone(),
                 Section::OutputSchema,
-                serde_json::to_vec(&schema)?,
+                serde_json::to_vec(
+                    &json!({"output_schema_ref":digest(&serde_json::to_vec(&schema)?),
+                    "delivery":"Exact schema is supplied by the host final-output contract or typed candidate tool. Independent acceptance remains separate."}),
+                )?,
                 "host:output",
                 "v1",
                 true,

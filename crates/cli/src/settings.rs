@@ -166,7 +166,9 @@ impl Settings {
     pub(crate) fn context_compiler(
         &self,
     ) -> Result<melissa_model_gateway::context_compiler::ContextCompiler> {
-        let compiler = melissa_model_gateway::context_compiler::ContextCompiler::default();
+        let compiler = melissa_model_gateway::context_compiler::ContextCompiler::default()
+            .with_intelligence(Default::default())
+            .map_err(|_| Error::Store)?;
         match &self.local_tokenizer {
             Some(config) => Ok(compiler.with_wire_tokenizer(
                 melissa_model_gateway::local_tokenizer::LocalWireTokenizer::load(
@@ -242,9 +244,11 @@ mod tests {
                 .get("local_tokenizer")
                 .is_none()
         );
-        assert_eq!(
-            s.context_compiler().unwrap().policy_id(),
-            "native-context/v1:utf8-framing"
+        assert!(
+            s.context_compiler()
+                .unwrap()
+                .policy_id()
+                .starts_with("native-context/v1:utf8-framing:intelligence/v2:")
         );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tokenizer.json");

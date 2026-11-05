@@ -138,9 +138,51 @@ fn monorepo_snapshot_search_hashes_and_stale_additions_are_explicit() {
     for h in &hits.hits {
         assert_eq!(h.digest, r.read(&h.path).unwrap().0.digest);
         assert_eq!(h.line, 2);
+        assert_eq!(h.end_line, 2);
+        assert!(h.match_excerpt.as_deref().unwrap().contains("needle"));
+        let bytes = r.read(&h.path).unwrap().1;
+        assert_eq!(
+            h.match_excerpt.as_ref().unwrap().as_bytes(),
+            &bytes[h.excerpt_start_byte.unwrap()..h.excerpt_end_byte.unwrap()]
+        );
     }
     fs::write(r.root_path().join("new.txt"), b"user work").unwrap();
     assert!(r.search(&s, b"needle", &c).is_err());
+}
+
+#[test]
+fn search_excerpts_preserve_unicode_ranges_and_binary_unknowns() {
+    let (_temp, r) = root();
+    let cancel = AtomicBool::new(false);
+    let text = format!(
+        "{}\r\nneedle\nnext 中文{}",
+        "ö漢".repeat(160),
+        "尾".repeat(300)
+    );
+    fs::write(r.root_path().join("unicode.txt"), text.as_bytes()).unwrap();
+    fs::write(r.root_path().join("binary.dat"), b"\xffneedle\x00").unwrap();
+    let source = r.snapshot(&cancel).unwrap();
+    let result = r.search(&source, b"needle", &cancel).unwrap();
+    let unicode = result
+        .hits
+        .iter()
+        .find(|h| h.path == "unicode.txt")
+        .unwrap();
+    let excerpt = unicode.match_excerpt.as_ref().unwrap();
+    assert!(excerpt.len() <= 512);
+    assert!(excerpt.contains("needle"));
+    assert_eq!(
+        excerpt.as_bytes(),
+        &text.as_bytes()[unicode.excerpt_start_byte.unwrap()..unicode.excerpt_end_byte.unwrap()]
+    );
+    assert_eq!(unicode.line, 2);
+    assert_eq!(unicode.end_line, 2);
+    let binary = result.hits.iter().find(|h| h.path == "binary.dat").unwrap();
+    assert!(binary.match_excerpt.is_none());
+    assert!(binary.excerpt_start_byte.is_none());
+    let multiline = r.search(&source, b"needle\nnext", &cancel).unwrap();
+    assert_eq!(multiline.hits[0].line, 2);
+    assert_eq!(multiline.hits[0].end_line, 3);
 }
 #[test]
 fn a_preserved_snapshot_digest_cannot_authenticate_modified_snapshot_fields() {
