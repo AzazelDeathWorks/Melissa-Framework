@@ -19,7 +19,7 @@ use melissa_core_contracts::{CompletionEvidence, TaskState, wire::TaskContractV1
 use melissa_local_store::LocalStore;
 use melissa_model_gateway::{
     DecoderLimits, ErrorKind, GatewayError, ToolCall, ToolDefinition,
-    agent_loop::{Gateway, GatewayPolicy, RunSpec, RunStatus},
+    agent_loop::{Gateway, GatewayPolicy, RunSpec},
     continuation::{ContinuationStore, Phase as TurnPhase, TurnCheckpoint},
     routing::RouteRequirements,
     tools::{BoundTool, ToolContext, ToolDispatcher, ToolExecution},
@@ -224,6 +224,13 @@ impl ToolDispatcher for TaskTools {
         if self.tests {
             d.push(BoundTool{canonical_id:"code.tests".into(),definition:ToolDefinition{name:"code_tests".into(),description:"Build current source through the isolated SDK and run the approved development suite with an immutable negative control. V2 recipes expose ONLY public development checks; private final tests run after the model stops. Arbitrary commands cannot be selected. Failed observations remain evidence; inspect actual source before repair.".into(),parameters:json!({"type":"object","properties":{},"required":[],"additionalProperties":false}),strict:false}});
         }
+        if self.tests && self.execution.recipe.development_checks.len() > 2 {
+            d.push(BoundTool{canonical_id:"code.tests".into(),definition:ToolDefinition{
+                name:"code_targeted_tests".into(),
+                description:"Run only the specified distinct approved public development case IDs. Choose at least two so the independent negative control remains meaningful. This is a targeted check, not final acceptance.".into(),
+                parameters:json!({"type":"object","properties":{"case_ids":{"type":"array","items":{"type":"string","enum":self.execution.recipe.development_checks.iter().map(|case|&case.id).collect::<Vec<_>>()},"minItems":2,"maxItems":self.execution.recipe.development_checks.len(),"uniqueItems":true}},"required":["case_ids"],"additionalProperties":false}),strict:false
+            }});
+        }
         if self.build {
             d.push(BoundTool {canonical_id:"code.build".into(), definition:ToolDefinition{name:"code_build".into(),description:"Build only the host-selected current program in the isolated SDK. Returns candidate package/source digests, never acceptance.".into(),parameters:json!({"type":"object","properties":{},"required":[],"additionalProperties":false}),strict:false}});
         }
@@ -281,6 +288,13 @@ impl ToolDispatcher for TaskTools {
                     .values()
                     .chain(ledger.failed_attempts.values())
                     .chain(ledger.observation_refs.values())
+                    .chain(
+                        ledger
+                            .repairs
+                            .iter()
+                            .map(|repair| &repair.diagnostic.evidence_ref),
+                    )
+                    .chain(ledger.last_patch.iter())
                     .any(|id| id == artifact)
                 {
                     return Err(GatewayError::new(
@@ -394,11 +408,40 @@ impl ToolDispatcher for TaskTools {
                     cancel,
                 );
             }
+            let selected_ids = if call.name == "code_targeted_tests" {
+                let arguments = melissa_model_gateway::strict_json(&call.arguments)?;
+                let ids = arguments["case_ids"]
+                    .as_array()
+                    .ok_or_else(|| GatewayError::invalid("public case list required"))?;
+                let unique = ids
+                    .iter()
+                    .filter_map(|id| id.as_str().map(str::to_owned))
+                    .collect::<BTreeSet<_>>();
+                if unique.len() != ids.len() {
+                    return Err(GatewayError::invalid("public case IDs must be distinct"));
+                }
+                Some(unique)
+            } else {
+                None
+            };
             let result = tokio::task::block_in_place(|| -> melissa_code_quality::Result<Value> {
                 let source = FrozenSource::capture(&self.repo, &cancel)?;
-                let development = self.execution.recipe.development_suite().map_err(|_| {
-                    melissa_code_quality::Error::Denied("public development contract")
-                })?;
+                let development = if call.name == "code_build" {
+                    None
+                } else {
+                    Some(
+                        self.execution
+                            .recipe
+                            .development_selection(selected_ids.as_ref())
+                            .map_err(|_| {
+                                melissa_code_quality::Error::Denied("public development contract")
+                            })?,
+                    )
+                };
+                let suite_digest = match &development {
+                    Some(suite) => suite.digest().to_owned(),
+                    None => self.root_contract.acceptance_contract_digest.clone(),
+                };
                 let mut q = qa_for_suite(
                     self.store.connect()?,
                     &self.root_contract,
@@ -409,7 +452,7 @@ impl ToolDispatcher for TaskTools {
                             .map_err(|_| melissa_code_quality::Error::Denied("host entropy"))?
                     ),
                     &source.snapshot().digest,
-                    development.digest(),
+                    &suite_digest,
                 )
                 .map_err(|_| melissa_code_quality::Error::Denied("QA host scope preparation"))?;
                 let observed = (|| -> melissa_code_quality::Result<Value> {
@@ -425,7 +468,11 @@ impl ToolDispatcher for TaskTools {
                             json!({"status":"built","source_digest":program.source_digest(),"package_digest":program.package_digest()?,"task_accepted":false}),
                         );
                     }
-                    let suite = &development;
+                    let suite = development
+                        .as_ref()
+                        .ok_or(melissa_code_quality::Error::Denied(
+                            "public development contract",
+                        ))?;
                     let receipt = q.verify(
                         &source,
                         &self.repo,
@@ -439,7 +486,7 @@ impl ToolDispatcher for TaskTools {
                         &cancel,
                     )?;
                     Ok(
-                        json!({"status":"passed","source_digest":receipt.source_digest(),"passed":receipt.passed(),"total":receipt.total(),"protected_acceptance":false,"task_accepted":false}),
+                        json!({"status":"passed","source_digest":receipt.source_digest(),"passed":receipt.passed(),"total":receipt.total(),"targeted_case_ids":selected_ids,"protected_acceptance":false,"task_accepted":false}),
                     )
                 })();
                 mirror_qa(&mut self.store, &self.task, &q)
@@ -461,10 +508,18 @@ impl ToolDispatcher for TaskTools {
                             | melissa_code_quality::Error::Stale(_)
                             | melissa_code_quality::Error::Cancelled
                             | melissa_code_quality::Error::Denied(
-                                "protected QA positive or negative control failed"
+                                "protected QA positive cases failed"
+                                    | "protected QA negative control unexpectedly passed"
                             )
                     );
-                    Ok(ToolExecution{content:json!({"status":if known{"protected_check_failed"}else{"requires_inspection"},"expected_answers_disclosed":false,"task_accepted":false,"automatic_retry":false,"detail":"Inspect actual source and native build/test evidence; no host fallback or changed oracle is permitted."}).to_string(),success:false,cancelled:cancel.load(Ordering::Acquire),requires_reconciliation:!known,artifact_refs:vec![]})
+                    let repairable = matches!(
+                        error,
+                        melissa_code_quality::Error::Denied("protected QA positive cases failed")
+                            | melissa_code_quality::Error::Invalid(
+                                "native project build failed" | "native build failed"
+                            )
+                    );
+                    Ok(ToolExecution{content:json!({"status":if repairable{"failed"}else if known{"protected_check_failed"}else{"requires_inspection"},"targeted_case_ids":selected_ids,"expected_answers_disclosed":false,"task_accepted":false,"automatic_retry":false,"detail":"Inspect actual source and native build/test evidence; no host fallback or changed oracle is permitted."}).to_string(),success:false,cancelled:cancel.load(Ordering::Acquire),requires_reconciliation:!known,artifact_refs:vec![]})
                 }
             }
         })
@@ -492,9 +547,29 @@ impl ToolDispatcher for AdaptiveChecks {
     ) -> Pin<Box<dyn Future<Output = melissa_model_gateway::Result<ToolExecution>> + Send + 'a>>
     {
         Box::pin(async move {
+            let name = call.name.clone();
+            let evidence_name = if name == "code_targeted_tests" {
+                let arguments = melissa_model_gateway::strict_json(&call.arguments)?;
+                let ids = arguments["case_ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect::<BTreeSet<_>>();
+                format!(
+                    "{name}:{}",
+                    digest(
+                        &serde_json::to_vec(&ids)
+                            .map_err(|_| GatewayError::invalid("case identity"))?
+                    )
+                )
+            } else {
+                name.clone()
+            };
             let check = matches!(
-                call.name.as_str(),
+                name.as_str(),
                 "code_tests"
+                    | "code_targeted_tests"
                     | "code_build"
                     | "code_project_check"
                     | "code_project_tests"
@@ -502,32 +577,88 @@ impl ToolDispatcher for AdaptiveChecks {
                     | "code_project_build"
                     | "code_project_e2e"
                     | "code_project_doctests"
+                    | "code_format_check"
             );
-            let name = call.name.clone();
-            let before = if check {
-                Some(
-                    self.repo
-                        .snapshot(&cancel)
-                        .map_err(|_| GatewayError::invalid("check source unavailable"))?
-                        .digest,
-                )
-            } else {
-                None
-            };
-            let output = self.inner.execute(call, ctx, cancel.clone()).await?;
-            if let Some(source) = before
-                && !output.requires_reconciliation
-                && !output.cancelled
-                && self
+            let reusable = matches!(
+                name.as_str(),
+                "code_tests"
+                    | "code_project_check"
+                    | "code_project_tests"
+                    | "code_project_lint"
+                    | "code_project_e2e"
+                    | "code_project_doctests"
+                    | "code_format_check"
+            );
+            let mut before = None;
+            if check {
+                self.inner.validate_call(&call)?;
+                let source = self
                     .repo
                     .snapshot(&cancel)
-                    .is_ok_and(|s| s.digest == source)
-            {
-                self.scheduler
+                    .map_err(|_| GatewayError::invalid("check source unavailable"))?
+                    .digest;
+                let prior = self
+                    .scheduler
                     .lock()
                     .map_err(|_| GatewayError::invalid("check scheduler lock"))?
-                    .observe_check(&self.lease, &name, &source, output.success, &output.content)
+                    .check_evidence(&self.lease, &evidence_name, &source)
                     .map_err(|e| GatewayError::invalid(e.to_string()))?;
+                if reusable
+                    && let Some(reference) = prior
+                    && self
+                        .repo
+                        .snapshot(&cancel)
+                        .is_ok_and(|snapshot| snapshot.digest == source)
+                    && !cancel.load(Ordering::Acquire)
+                {
+                    return Ok(ToolExecution{
+                        content:json!({"status":"passed","source_digest":source,"evidence_ref":reference,
+                            "reused":true,"native_execution_performed":false,"task_accepted":false}).to_string(),
+                        success:true,cancelled:false,requires_reconciliation:false,artifact_refs:vec![reference],
+                    });
+                }
+                before = Some(source);
+            }
+            let output = self.inner.execute(call, ctx, cancel.clone()).await?;
+            if !output.requires_reconciliation
+                && !output.cancelled
+                && !cancel.load(Ordering::Acquire)
+            {
+                let after = serde_json::from_str::<Value>(&output.content)
+                    .ok()
+                    .filter(|v| v["mutation_applied"] == true);
+                let repo_error = !output.success
+                    && (name.starts_with("fs_") || name == "code_git")
+                    && after.is_none();
+                if (check || after.is_some() || repo_error)
+                    && let Ok(snapshot) = self.repo.snapshot(&cancel)
+                {
+                    let observed = if let Some(after) = &after {
+                        (after["after_edit"]["source_digest"] == snapshot.digest
+                            && matches!(
+                                after["after_edit"]["status"].as_str(),
+                                Some("PASS" | "FAIL")
+                            ))
+                        .then_some(("after_edit", after["after_edit"]["status"] == "PASS"))
+                    } else if before.as_ref() == Some(&snapshot.digest) || repo_error {
+                        Some((evidence_name.as_str(), output.success))
+                    } else {
+                        None
+                    };
+                    if let Some((tool, success)) = observed {
+                        self.scheduler
+                            .lock()
+                            .map_err(|_| GatewayError::invalid("check scheduler lock"))?
+                            .observe_check(
+                                &self.lease,
+                                tool,
+                                &snapshot.digest,
+                                success,
+                                &output.content,
+                            )
+                            .map_err(|e| GatewayError::invalid(e.to_string()))?;
+                    }
+                }
             }
             Ok(output)
         })
@@ -540,7 +671,6 @@ struct Boundary {
     run: String,
     pause: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
-    sequence: u64,
 }
 impl ContinuationStore for Boundary {
     fn begin(
@@ -551,26 +681,43 @@ impl ContinuationStore for Boundary {
         run: &str,
     ) -> melissa_model_gateway::Result<Option<TurnCheckpoint>> {
         let saved = self.inner.begin(store, binding, task, run)?;
-        let (sequence, checkpoint) = store
-            .journal()
-            .latest_checkpoint_in_series(&self.task, &format!("cli-boundary:{}:", self.run))
-            .map_err(|_| GatewayError::invalid("boundary unavailable"))?;
-        self.sequence = sequence;
-        let last = checkpoint
-            .map(|p| {
-                let raw = store
-                    .get_artifact(&self.task, &p.artifact_id)
-                    .map_err(|_| GatewayError::invalid("boundary unavailable"))?;
-                if p.data["digest"] != digest(&raw) {
-                    return Err(GatewayError::invalid("boundary digest mismatch"));
-                }
-                Ok(raw)
-            })
-            .transpose()?;
         if saved.is_some() {
-            let snapshot: melissa_repository::RepositorySnapshot =
-                decode(&last.ok_or_else(|| GatewayError::invalid("missing source boundary"))?)
-                    .map_err(|_| GatewayError::invalid("invalid source boundary"))?;
+            let (_, checkpoint) = store
+                .journal()
+                .latest_checkpoint_in_series(&self.task, &format!("workflow-turn:{}:", self.run))
+                .map_err(|_| GatewayError::invalid("native boundary unavailable"))?;
+            let checkpoint =
+                checkpoint.ok_or_else(|| GatewayError::invalid("missing safe boundary"))?;
+            let boundary = &checkpoint.data["host_boundary"];
+            let reference = boundary["snapshot_ref"]
+                .as_str()
+                .ok_or_else(|| GatewayError::invalid("missing source boundary"))?;
+            let raw = store
+                .get_artifact(&self.task, reference)
+                .map_err(|_| GatewayError::invalid("source boundary unavailable"))?;
+            let task_version = store
+                .journal()
+                .task(&self.task)
+                .map_err(|_| GatewayError::invalid("task boundary unavailable"))?
+                .record
+                .version;
+            let budget = store
+                .journal()
+                .model_budget(&self.task)
+                .map_err(|_| GatewayError::invalid("budget boundary unavailable"))?;
+            if boundary["snapshot_digest"] != digest(&raw)
+                || checkpoint.task_version != task_version
+                || boundary["budget"]
+                    != serde_json::to_value(&budget)
+                        .map_err(|_| GatewayError::invalid("budget boundary invalid"))?
+            {
+                return Err(GatewayError::new(
+                    ErrorKind::Authorization,
+                    "source, task version or accounting boundary changed",
+                ));
+            }
+            let snapshot =
+                decode(&raw).map_err(|_| GatewayError::invalid("invalid source boundary"))?;
             self.repo
                 .validate_snapshot(&snapshot, &AtomicBool::new(false))
                 .map_err(|_| {
@@ -597,27 +744,24 @@ impl ContinuationStore for Boundary {
         store: &mut LocalStore,
         state: &melissa_model_gateway::continuation::TurnCheckpointView<'_>,
     ) -> melissa_model_gateway::Result<()> {
-        self.inner.publish_view(store, state)?;
         if state.phase == TurnPhase::Safe {
-            let published = (|| -> Result<()> {
+            let metadata = (|| -> Result<Value> {
                 let snapshot = self.repo.snapshot(&AtomicBool::new(false))?;
-                let id = format!("cli-boundary:{}:{}", self.run, self.sequence);
                 let payload = bytes(&snapshot)?;
-                put(store, &self.task, &id, "boundary", &payload)?;
-                let version = store.journal().task(&self.task)?.record.version;
-                store.append_checkpoint(
-                    &id,
-                    &self.task,
-                    version,
-                    &id,
-                    json!({"digest":digest(&payload)}),
-                )?;
-                self.sequence += 1;
-                Ok(())
-            })();
-            published.map_err(|_| {
-                GatewayError::new(ErrorKind::Store, "CLI boundary publication failed")
-            })?;
+                let hash = digest(&payload);
+                let id = format!("cli:turn-source:{}:{hash}", self.run);
+                match store.get_artifact(&self.task, &id) {
+                    Ok(existing) if existing == payload => {}
+                    Err(melissa_local_store::StoreError::NotFound(_)) => {
+                        put(store, &self.task, &id, "boundary", &payload)?
+                    }
+                    _ => return Err(Error::Store),
+                }
+                Ok(json!({"snapshot_ref":id,"snapshot_digest":hash,
+                    "budget":store.journal().model_budget(&self.task)?}))
+            })()
+            .map_err(|_| GatewayError::new(ErrorKind::Store, "CLI boundary publication failed"))?;
+            self.inner.publish_with_metadata(store, state, metadata)?;
             if self.pause.load(Ordering::Acquire) && state.result.answer.is_none() {
                 self.paused.store(true, Ordering::Release);
                 return Err(GatewayError::new(
@@ -625,6 +769,8 @@ impl ContinuationStore for Boundary {
                     "CLI paused at authenticated safe boundary",
                 ));
             }
+        } else {
+            self.inner.publish_view(store, state)?;
         }
         Ok(())
     }
@@ -700,6 +846,8 @@ pub(crate) fn plan(task: &TaskContractV1, e: &Execution) -> Result<Plan> {
             "debug":"code_debug_start requires executable source breakpoints and uses the host-selected entry. Always close the returned DAP session; do not patch while it is active.",
             "replan":"Report a needed plan revision with evidence. The operator can pause and use task replan for pending steps within original authority; active/completed steps, acceptance and shared accounting remain fixed."
         });
+        nodes.last_mut().ok_or(Error::Store)?.literal_input["verification_policy"] =
+            crate::verification::Policy::for_recipe(&e.recipe).plan(&e.recipe);
         previous = Some(id);
     }
     let p = Plan {
@@ -838,6 +986,13 @@ pub(crate) fn native_workers(store: &LocalStore, parent: &str) -> Result<Vec<Val
     Ok(workers)
 }
 pub(crate) fn native_stop_proven(store: &LocalStore, parent: &str) -> Result<bool> {
+    let protected_image = |id: &str| {
+        matches!(
+            id,
+            melissa_code_quality::protected::SDK_IMAGE
+                | melissa_code_quality::security::SEMGREP_IMAGE
+        )
+    };
     for child in qa_children(store, parent)? {
         let mut owned = BTreeSet::new();
         let mut stopped = BTreeSet::new();
@@ -905,7 +1060,8 @@ pub(crate) fn native_stop_proven(store: &LocalStore, parent: &str) -> Result<boo
                     && report.tree_confirmed_stopped
                     // Descendants observed before cancellation cleanup remain
                     // in the report; confirmed namespace removal proves stop.
-                    && report.image_id == melissa_code_quality::protected::SDK_IMAGE
+                    && protected_image(&report.image_id)
+                    && report.execution_contract == melissa_container_executor::EXECUTION_CONTRACT
                     && report.policy_verified
                     && !report.docker_client_identity.is_empty()
                 {
@@ -917,7 +1073,7 @@ pub(crate) fn native_stop_proven(store: &LocalStore, parent: &str) -> Result<boo
                 if v["workload_started"] != false
                     || v["cleanup_confirmed"] != true
                     || v["tree_confirmed_stopped"] != true
-                    || v["image_id"] != melissa_code_quality::protected::SDK_IMAGE
+                    || !v["image_id"].as_str().is_some_and(protected_image)
                     || v["execution_contract"] != melissa_container_executor::EXECUTION_CONTRACT
                 {
                     return Ok(false);
@@ -996,24 +1152,41 @@ impl App {
         }
         let w = self.workspace(&store, id)?;
         let repo = self.source(&w)?;
+        let mut resume_milestone = false;
         if resume {
             let previous = self.live(id).map_err(|_| {
                 Error::Conflict("Yeniden yürütme için doğrulanmış güvenli pause kaydı gerekli.")
             })?;
-            if previous.phase != "paused" {
-                return Err(Error::Conflict(
-                    "Kesinti güvenli pause sınırında değil; etkiler incelenmeden tekrar çalıştırılmaz.",
-                ));
+            if previous.phase == "paused" {
+                if previous.task["version"] != task.record.version
+                    || previous.model_budget
+                        != serde_json::to_value(&budget).map_err(|_| Error::Store)?
+                    || !native_stop_proven(&store, id)?
+                {
+                    return Err(Error::Conflict(
+                        "Paused task version, budget or worker state changed.",
+                    ));
+                }
+                let frame: melissa_repository::RepositorySnapshot = decode(
+                    &store.get_artifact(id, &format!("cli:paused-source:{}", previous.session))?,
+                )?;
+                repo.validate_snapshot(&frame, &AtomicBool::new(false))
+                    .map_err(|_| {
+                        Error::Conflict(
+                            "Pause sonrasında kaynak değişti; eski checkpoint sürdürülemez.",
+                        )
+                    })?;
+            } else {
+                if previous.owner.alive()
+                    || !matches!(previous.phase.as_str(), "agent" | "preparing")
+                    || !native_stop_proven(&store, id)?
+                {
+                    return Err(Error::Conflict(
+                        "Settled milestone and confirmed previous owner stop are required.",
+                    ));
+                }
+                resume_milestone = true;
             }
-            let frame: melissa_repository::RepositorySnapshot = decode(
-                &store.get_artifact(id, &format!("cli:paused-source:{}", previous.session))?,
-            )?;
-            repo.validate_snapshot(&frame, &AtomicBool::new(false))
-                .map_err(|_| {
-                    Error::Conflict(
-                        "Pause sonrasında kaynak değişti; eski checkpoint sürdürülemez.",
-                    )
-                })?;
         }
         if !resume {
             if task.record.state != TaskState::Queued {
@@ -1050,6 +1223,13 @@ impl App {
                 "İzole SDK/image hazır değil; doctor ile kontrol edin. Model çağrısı yapılmadı.",
             ));
         }
+        if crate::verification::Policy::for_recipe(&e.recipe).require_static_security
+            && !crate::views::image_present(melissa_code_quality::security::SEMGREP_IMAGE)
+        {
+            return Err(Error::Unavailable(
+                "Zorunlu izole güvenlik taraması imajı hazır değil.",
+            ));
+        }
         if !resume {
             let t = store.transition_task(id, task.record.version, TaskState::Leased, None)?;
             store.transition_task(id, t.record.version, TaskState::Running, None)?;
@@ -1058,7 +1238,6 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         let pause = Arc::new(AtomicBool::new(false));
         let control = Control::new(self, id, cancel.clone(), pause.clone())?;
-        publish(&control, &store, id, None, "preparing")?;
         let work = self
             .home
             .join("tasks")
@@ -1088,23 +1267,39 @@ impl App {
             )
             .map_err(gw)?
         } else {
-            Scheduler::create(
+            Scheduler::create_until(
                 store.connect()?,
                 p.clone(),
                 &resources::catalog()?,
                 refresh,
                 cancel.clone(),
+                e.expires_at_ms,
             )
             .map_err(gw)?
         }));
+        if resume_milestone {
+            let snapshot = repo.snapshot(&cancel)?;
+            lock(&scheduler)?
+                .validate_milestone(&snapshot.digest)
+                .map_err(gw)?;
+        }
+        publish(&control, &store, id, Some(&scheduler), "preparing")?;
         let watched = store.connect()?;
         let watched_id = id.to_owned();
         let watched_control = control.clone();
         let watched_scheduler = scheduler.clone();
         let control_failed = Arc::new(AtomicBool::new(false));
         let failed = control_failed.clone();
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let deadline_flag = timed_out.clone();
+        let expires_at_ms = e.expires_at_ms;
         let watch = tokio::spawn(async move {
             loop {
+                if now().is_ok_and(|time| time >= expires_at_ms) {
+                    deadline_flag.store(true, Ordering::Release);
+                    watched_control.cancel.store(true, Ordering::Release);
+                    break;
+                }
                 if watched_control
                     .poll()
                     .and_then(|_| {
@@ -1163,9 +1358,16 @@ impl App {
         } else {
             result
         };
-        if paused.load(Ordering::Acquire)
-            || (pause.load(Ordering::Acquire) && result.as_ref().is_ok_and(|v| v["paused"] == true))
-        {
+        let deadline_elapsed = timed_out.load(Ordering::Acquire) || now()? >= e.expires_at_ms;
+        let wants_pause = paused.load(Ordering::Acquire)
+            || (pause.load(Ordering::Acquire)
+                && result.as_ref().is_ok_and(|v| v["paused"] == true));
+        let result = if deadline_elapsed && wants_pause {
+            Err(Error::Conflict("Approved total task deadline elapsed."))
+        } else {
+            result
+        };
+        if wants_pause && !deadline_elapsed {
             let frame = repo.snapshot(&AtomicBool::new(false))?;
             put(
                 &mut store,
@@ -1181,6 +1383,11 @@ impl App {
         }
         let b = store.journal().model_budget(id)?;
         if let Err(error) = result {
+            let error = if deadline_elapsed && !matches!(error, Error::Reconciliation(_)) {
+                Error::Conflict("Approved total task deadline elapsed.")
+            } else {
+                error
+            };
             let t = store.journal().task(id)?;
             let workers_stopped = native_stop_proven(&store, id)?;
             let uncertain = !workers_stopped
@@ -1191,7 +1398,7 @@ impl App {
             if t.record.state == TaskState::Running && t.record.unknown_invocation_id.is_none() {
                 let next = if uncertain {
                     TaskState::Blocked
-                } else if cancel.load(Ordering::Acquire) {
+                } else if cancel.load(Ordering::Acquire) && !deadline_elapsed {
                     TaskState::Cancelled
                 } else {
                     TaskState::Failed
@@ -1200,6 +1407,8 @@ impl App {
             }
             let phase = if uncertain {
                 "blocked"
+            } else if deadline_elapsed {
+                "deadline"
             } else if cancel.load(Ordering::Acquire) {
                 "cancelled"
             } else {
@@ -1215,7 +1424,7 @@ impl App {
                 )?,
             )?;
             publish(&control, &store, id, Some(&scheduler), phase)?;
-            if cancel.load(Ordering::Acquire) && !uncertain {
+            if cancel.load(Ordering::Acquire) && !uncertain && !deadline_elapsed {
                 return Ok(
                     json!({"command":"task run","task_id":id,"state":"cancelled","task_accepted":false,"owned_workers_confirmed_stopped":workers_stopped,"model_budget":b}),
                 );
@@ -1283,6 +1492,13 @@ impl App {
                 lock(scheduler)?
                     .apply_proposal(&snapshot.digest, &resources::catalog()?)
                     .map_err(gw)?;
+                {
+                    let mut owner = lock(scheduler)?;
+                    owner
+                        .repair_from_diagnostics(&resources::catalog()?)
+                        .map_err(gw)?;
+                    owner.checkpoint_milestone().map_err(gw)?;
+                }
                 let decision = lock(scheduler)?.supervisor().map_err(gw)?;
                 if matches!(
                     decision["decision"].as_str(),
@@ -1315,19 +1531,9 @@ impl App {
                     )
                     .is_ok()
                 {
-                    let done = lock(scheduler)?
+                    lock(scheduler)?
                         .complete_native(&packet.lease)
                         .map_err(gw)?;
-                    if done.slots[&node.id].phase != Phase::Candidate
-                        && done
-                            .adaptive
-                            .as_ref()
-                            .is_none_or(|l| l.pending_proposal.is_none())
-                    {
-                        return Err(Error::Conflict(
-                            "Kayıtlı uzman başarısız; otomatik tekrar yok.",
-                        ));
-                    }
                     continue;
                 }
             }
@@ -1379,7 +1585,9 @@ impl App {
             } else {
                 repo_tool
             };
-            let negative = if e.recipe.domain.is_none() {
+            let public_tests = node.tools.contains("code.tests")
+                && (e.recipe.domain.is_some() || !e.recipe.development_checks.is_empty());
+            let negative = if e.recipe.domain.is_none() && public_tests {
                 let mut q = qa(
                     store.connect()?,
                     t,
@@ -1410,7 +1618,7 @@ impl App {
                 task: t.task_id.clone(),
                 run: packet.lease.run.clone(),
                 profile: node.profile.clone(),
-                tests: node.tools.contains("code.tests"),
+                tests: public_tests,
                 build: e.recipe.domain.is_none() && node.tools.contains("code.build"),
                 history_read: node.tools.contains("fs.read"),
                 adaptive: (state.plan.mode == Mode::AdaptiveSerial)
@@ -1542,7 +1750,16 @@ impl App {
                 route,
                 max_output_tokens: selected.max_output_tokens,
                 output_schema: Some(e.recipe.output_schema()),
-                required_tool_names: BTreeSet::from(["submit_candidate".into()]),
+                required_tool_names: if crate::verification::Policy::for_recipe(&e.recipe)
+                    .require_full_public_suite
+                    && public_tests
+                    && node.profile == "melissa.code.test-engineer"
+                    && !node.effects.contains("workspace.apply_patch_scoped")
+                {
+                    BTreeSet::from(["submit_candidate".into(), "code_tests".into()])
+                } else {
+                    BTreeSet::from(["submit_candidate".into()])
+                },
             };
             if spec.route.vision {
                 gateway = gateway
@@ -1577,7 +1794,6 @@ impl App {
                 run: packet.lease.run.clone(),
                 pause: control.pause.clone(),
                 paused: paused.clone(),
-                sequence: 0,
             }));
             record_handoff(gateway.store_mut(), &packet)?;
             let recovery_repo = Arc::new(self.source(&self.workspace(store, &t.task_id)?)?);
@@ -1660,19 +1876,9 @@ impl App {
                     "Araç etkisi inceleme/uzlaştırma gerektiriyor; otomatik tekrar durduruldu.",
                 ));
             }
-            let done = lock(scheduler)?
+            lock(scheduler)?
                 .complete_native(&packet.lease)
                 .map_err(gw)?;
-            if run.status != RunStatus::FinalCandidate
-                && done
-                    .adaptive
-                    .as_ref()
-                    .is_none_or(|l| l.pending_proposal.is_none())
-            {
-                return Err(Error::Conflict(
-                    "Specialist failed; inspect recorded evidence before replanning.",
-                ));
-            }
         }
         if control.pause.load(Ordering::Acquire) {
             return Ok(json!({"paused":true}));
@@ -1712,6 +1918,38 @@ impl App {
                 "Aday raporu özel son kabul sözleşmesini karşılamadı; modele gizli cevaplar verilmez.",
             ));
         }
+        let verification = crate::verification::Policy::for_recipe(&e.recipe);
+        if verification.require_full_public_suite
+            && lock(scheduler)?
+                .state()
+                .map_err(gw)?
+                .adaptive
+                .as_ref()
+                .is_none_or(|ledger| {
+                    ledger.verified_facts.get("successful_check:code_tests")
+                        != Some(&final_source.snapshot().digest)
+                })
+        {
+            return Err(Error::Denied(
+                "The current source needs a successful full public suite before protected QA.",
+            ));
+        }
+        let mut layers = verification.plan(&e.recipe);
+        if verification.require_static_security {
+            let mut security = qa_for_suite(
+                store.connect()?,
+                t,
+                e,
+                &format!("security-{}", control.session),
+                &final_source.snapshot().digest,
+                &t.acceptance_contract_digest,
+            )?;
+            let observed = tokio::task::block_in_place(|| {
+                security.scan_static(&final_source, repo, &control.cancel)
+            });
+            mirror_qa(store, &t.task_id, &security)?;
+            layers["static_security"] = json!({"status":"PASS","receipt_digest":observed.map_err(gw)?.digest().map_err(gw)?});
+        }
         // Final proof is produced after the agent has stopped and has no
         // reference to oracle bytes or the verifier's private session key.
         if e.recipe.domain.is_some() {
@@ -1738,6 +1976,7 @@ impl App {
                 &verified.package,
                 &verified.package_digest,
                 &verified.receipt,
+                &layers,
                 &outputs,
                 work,
                 &control.session,
@@ -1800,6 +2039,7 @@ impl App {
             program.package(),
             &program.package_digest().map_err(gw)?,
             &serde_json::to_value(&receipt).map_err(|_| Error::Store)?,
+            &layers,
             &outputs,
             work,
             &control.session,
@@ -1815,14 +2055,20 @@ fn complete_delivery(
     package: &BTreeMap<String, Vec<u8>>,
     package_digest: &str,
     receipt: &Value,
+    verification_layers: &Value,
     outputs: &BTreeMap<String, Value>,
     work: &Path,
     session: &str,
 ) -> Result<Value> {
+    if now()? >= lock(scheduler)?.state().map_err(gw)?.deadline_ms {
+        return Err(Error::Conflict(
+            "Approved total task deadline elapsed before delivery.",
+        ));
+    }
     let directory = work.join("delivery");
     write_tree(&directory, package)?;
     let payload = bytes(
-        &json!({"schema_version":"melissa.cli-task-delivery/v1","task_id":t.task_id,"source_digest":source.snapshot().digest,"package_digest":package_digest,"package":package,"receipt":receipt,"workflow_outputs":outputs,"protected_checks_passed":true,"release_security_license_acceptance":false,"environment":"existing_CODE03_immutable_SDK"}),
+        &json!({"schema_version":"melissa.cli-task-delivery/v1","task_id":t.task_id,"source_digest":source.snapshot().digest,"package_digest":package_digest,"package":package,"receipt":receipt,"verification_layers":verification_layers,"workflow_outputs":outputs,"protected_checks_passed":true,"release_security_license_acceptance":false,"environment":"existing_CODE03_immutable_SDK"}),
     )?;
     let artifact = format!("cli:delivery:{session}");
     let final_artifact = store.put_artifact(
@@ -1837,6 +2083,11 @@ fn complete_delivery(
         },
         &payload,
     )?;
+    if now()? >= lock(scheduler)?.state().map_err(gw)?.deadline_ms {
+        return Err(Error::Conflict(
+            "Approved task deadline elapsed before final acceptance.",
+        ));
+    }
     let record = store.journal().task(&t.task_id)?;
     let final_record = store.set_final_artifact(&t.task_id, record.record.version, &artifact)?;
     let awaiting = store.transition_task(
@@ -2324,7 +2575,7 @@ mod tests {
             if native {
                 "fn main() { println!(\"0\"); }\n"
             } else {
-                "print(0)\n"
+                "import sys\nprint(int(sys.argv[1]))\n"
             },
         )
         .unwrap();
@@ -2359,7 +2610,7 @@ mod tests {
             {"profile":"melissa.code.implementer","goal":"Repair only main.py","write":true},
             {"profile":"melissa.code.test-engineer","goal":"Test final source","write":false},
             {"profile":"melissa.code.reviewer","goal":"Review final source","write":false}
-        ],"writable_paths":[entry],"protected_paths":[],"language":if native{"rust"}else{"python"},"entry":entry,"negative_workspace":temp.path().join("negative"),"checks":[{"id":"a","input":1,"expected":1},{"id":"b","input":2,"expected":2}],"development_checks":[{"id":"public-a","input":1,"expected":1},{"id":"public-b","input":2,"expected":2}],"max_cost_micro_usd":5000000,"wall_time_ms":1800000})).unwrap();
+        ],"writable_paths":[entry],"protected_paths":[],"language":if native{"rust"}else{"python"},"entry":entry,"negative_workspace":temp.path().join("negative"),"checks":[{"id":"a","input":1,"expected":1},{"id":"b","input":2,"expected":2}],"development_checks":[{"id":"public-a","input":1,"expected":1},{"id":"public-b","input":2,"expected":2},{"id":"public-c","input":3,"expected":3}],"max_cost_micro_usd":5000000,"wall_time_ms":1800000})).unwrap();
         let execution = Execution {
             recipe,
             settings_digest: digest(b"test settings"),
@@ -2739,6 +2990,195 @@ mod tests {
                 .model_requests(&packet.parent_task.task_id)
                 .unwrap()
                 .is_empty()
+        );
+    }
+    #[test]
+    fn safe_turn_atomically_binds_source_and_refuses_changed_worktree() {
+        let AdaptiveTest {
+            _temp,
+            mut tools,
+            scheduler,
+            packet,
+            ..
+        } = adaptive_test(false);
+        let source = _temp.path().join("source");
+        let make = || Boundary {
+            inner: WorkflowContinuation::new(scheduler.clone(), packet.clone()),
+            repo: Repository::open(&source, Limits::default(), vec![]).unwrap(),
+            task: packet.parent_task.task_id.clone(),
+            run: packet.lease.run.clone(),
+            pause: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
+        };
+        let state = TurnCheckpoint {
+            schema_version: "melissa.turn-checkpoint/v1".into(),
+            binding_digest: digest(b"fixture exact continuation"),
+            phase: TurnPhase::Safe,
+            next_turn: 0,
+            messages: vec![],
+            seen_calls: BTreeSet::new(),
+            successful: BTreeSet::new(),
+            selected_model: None,
+            result: melissa_model_gateway::agent_loop::RunResult {
+                schema_version: "melissa.agent-run-result/v1".into(),
+                task_id: packet.parent_task.task_id.clone(),
+                run_id: packet.lease.run.clone(),
+                status: melissa_model_gateway::agent_loop::RunStatus::TurnLimit,
+                answer: None,
+                request_ids: vec![],
+                tool_calls: 0,
+                artifact_refs: vec![],
+                requires_reconciliation: false,
+                task_accepted: false,
+            },
+        };
+        make().publish(&mut tools.store, &state).unwrap();
+        let (_, cp) = tools
+            .store
+            .journal()
+            .latest_checkpoint_in_series(
+                &packet.parent_task.task_id,
+                &format!("workflow-turn:{}:", packet.lease.run),
+            )
+            .unwrap();
+        assert!(cp.unwrap().data["host_boundary"]["snapshot_ref"].is_string());
+        assert!(
+            make()
+                .begin(
+                    &mut tools.store,
+                    &state.binding_digest,
+                    &packet.parent_task.task_id,
+                    &packet.lease.run
+                )
+                .unwrap()
+                .is_some()
+        );
+        fs::write(source.join("main.py"), "print(99)\n").unwrap();
+        assert!(
+            make()
+                .begin(
+                    &mut tools.store,
+                    &state.binding_digest,
+                    &packet.parent_task.task_id,
+                    &packet.lease.run
+                )
+                .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "isolated native SDK controls; no external provider"]
+    async fn targeted_development_cases_execute_only_approved_subset() {
+        let AdaptiveTest {
+            _temp,
+            mut tools,
+            ctx,
+            ..
+        } = adaptive_test(false);
+        let path = _temp.path().join("negative");
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("main.py"), "print(0)\n").unwrap();
+        let repo = Repository::open(&path, Limits::default(), vec![]).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let snapshot = FrozenSource::capture(&repo, &cancel).unwrap();
+        let mut q = qa(
+            tools.store.connect().unwrap(),
+            &tools.root_contract,
+            &tools.execution,
+            "negative-targeted-fixture",
+            &snapshot.snapshot().digest,
+        )
+        .unwrap();
+        tools.negative = Some(
+            build_program(&mut q, &snapshot, &repo, &tools.execution.recipe, &cancel).unwrap(),
+        );
+        tools.tests = true;
+        let call = |ids: Value| ToolCall {
+            id: "subset".into(),
+            name: "code_targeted_tests".into(),
+            arguments: json!({"case_ids":ids}).to_string(),
+        };
+        assert!(
+            tools
+                .validate_call(&call(json!(["a", "public-c"])))
+                .is_err()
+        );
+        assert!(
+            tools
+                .validate_call(&call(json!(["public-a", "public-a"])))
+                .is_err()
+        );
+        let observation = tools
+            .execute(call(json!(["public-a", "public-c"])), ctx, cancel)
+            .await
+            .unwrap();
+        assert!(observation.success, "{}", observation.content);
+        let result: Value = serde_json::from_str(&observation.content).unwrap();
+        assert_eq!(result["total"], 2);
+        assert_eq!(result["targeted_case_ids"], json!(["public-a", "public-c"]));
+        assert_eq!(result["task_accepted"], false);
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "isolated native static scanner; no external provider"]
+    async fn high_risk_static_check_retains_real_protected_source_receipt() {
+        let AdaptiveTest {
+            _temp,
+            mut tools,
+            packet,
+            ..
+        } = adaptive_test(false);
+        let mut recipe = tools.execution.recipe.clone();
+        recipe.agents.push(crate::recipe::Step {
+            profile: "melissa.code.security-reviewer".into(),
+            goal: "Inspect source safety".into(),
+            write: false,
+        });
+        let policy = crate::verification::Policy::for_recipe(&recipe);
+        assert!(policy.require_static_security && policy.require_full_public_suite);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let source = FrozenSource::capture(&tools.repo, &cancel).unwrap();
+        let mut q = qa_for_suite(
+            tools.store.connect().unwrap(),
+            &tools.root_contract,
+            &tools.execution,
+            "security-fixture",
+            &source.snapshot().digest,
+            &tools.root_contract.acceptance_contract_digest,
+        )
+        .unwrap();
+        let scanned = q.scan_static(&source, &tools.repo, &cancel);
+        mirror_qa(&mut tools.store, &packet.parent_task.task_id, &q).unwrap();
+        if scanned.is_err() {
+            for child in qa_children(&tools.store, &packet.parent_task.task_id).unwrap() {
+                for meta in tools.store.list_artifacts(&child).unwrap() {
+                    if meta.logical_type.ends_with("raw_execution") {
+                        let raw: Value =
+                            decode(&tools.store.get_artifact(&child, &meta.artifact_id).unwrap())
+                                .unwrap();
+                        if let Ok(stdout) = serde_json::from_value::<Vec<u8>>(raw["stdout"].clone())
+                        {
+                            eprintln!(
+                                "Native scanner fixture report: {}",
+                                String::from_utf8_lossy(&stdout)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let receipt = scanned.unwrap();
+        assert_eq!(receipt.source_digest(), source.snapshot().digest);
+        assert!(receipt.digest().unwrap().starts_with("blake3:"));
+        assert!(native_stop_proven(&tools.store, &packet.parent_task.task_id).unwrap());
+        assert_eq!(
+            tools
+                .store
+                .journal()
+                .task(&packet.parent_task.task_id)
+                .unwrap()
+                .record
+                .state,
+            TaskState::Running
         );
     }
 }

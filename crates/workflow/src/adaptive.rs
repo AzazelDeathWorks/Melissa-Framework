@@ -143,6 +143,23 @@ pub struct Milestone {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct MilestoneCheckpoint {
+    pub source_digest: String,
+    pub plan_digest: String,
+    pub task_version: u64,
+    pub budget: ModelBudgetSnapshot,
+    pub completed: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Repair {
+    pub diagnostic: crate::diagnostics::Diagnostic,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Ledger {
     pub schema_version: String,
     pub goal: String,
@@ -166,6 +183,14 @@ pub struct Ledger {
     pub revision_count: u32,
     pub repeated_failures: BTreeMap<String, u32>,
     pub observation_refs: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub diagnostics: BTreeMap<String, crate::diagnostics::Diagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_patch: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repairs: Vec<Repair>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub milestone_checkpoint: Option<MilestoneCheckpoint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,6 +221,10 @@ pub struct Handoff {
     pub evidence_refs: BTreeMap<String, String>,
     pub artifact_refs: Vec<String>,
     pub observation_refs: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub diagnostics: BTreeMap<String, crate::diagnostics::Diagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair: Option<Repair>,
     pub next_action: String,
     pub usage: ModelBudgetSnapshot,
     pub remaining_cost_micro_usd: u64,
@@ -233,6 +262,10 @@ impl Ledger {
             revision_count: 0,
             repeated_failures: BTreeMap::new(),
             observation_refs: BTreeMap::new(),
+            diagnostics: BTreeMap::new(),
+            last_patch: None,
+            repairs: Vec::new(),
+            milestone_checkpoint: None,
         }
     }
     pub fn refresh_budget(&mut self, budget: ModelBudgetSnapshot, maximum: u64) {
@@ -299,6 +332,8 @@ impl Ledger {
             evidence_refs: self.candidate_artifacts.clone(),
             artifact_refs: self.accepted_artifacts.clone(),
             observation_refs: self.observation_refs.clone(),
+            diagnostics: self.diagnostics.clone(),
+            repair: self.repairs.last().cloned(),
             next_action: node.goal.clone(),
             usage: self.usage.clone(),
             remaining_cost_micro_usd: self.remaining_cost_micro_usd,

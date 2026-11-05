@@ -116,7 +116,11 @@ fn cp(task: &str, workflow: &str, n: u64) -> String {
 fn idle(store: &LocalStore, task: &str) -> Result<()> {
     let b = store.journal().model_budget(task)?;
     require(
-        b.active_requests == 0 && b.unknown_requests == 0,
+        b.active_requests == 0
+            && b.unknown_requests == 0
+            && b.unknown_input_requests == 0
+            && b.unknown_output_requests == 0
+            && b.unknown_cost_requests == 0,
         Kind::Uncertain,
         "active/unknown provider effects retain workflow ownership",
     )?;
@@ -140,11 +144,22 @@ fn idle(store: &LocalStore, task: &str) -> Result<()> {
 }
 impl Scheduler {
     pub fn create(
+        store: LocalStore,
+        plan: Plan,
+        catalog: &Catalog,
+        refresh: Refresh,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        Self::create_until(store, plan, catalog, refresh, cancelled, u64::MAX)
+    }
+
+    pub fn create_until(
         mut store: LocalStore,
         plan: Plan,
         catalog: &Catalog,
         refresh: Refresh,
         cancelled: Arc<AtomicBool>,
+        expires_at_ms: u64,
     ) -> Result<Self> {
         let parent = store.journal().task(&plan.task)?;
         plan.validate(&parent.contract, catalog)?;
@@ -156,7 +171,13 @@ impl Scheduler {
         let started = now()?;
         let deadline = started
             .checked_add(parent.contract.limits.max_wall_time_ms)
-            .ok_or_else(|| error(Kind::Invalid, "root deadline overflow"))?;
+            .ok_or_else(|| error(Kind::Invalid, "root deadline overflow"))?
+            .min(expires_at_ms);
+        require(
+            deadline > started,
+            Kind::Cancelled,
+            "approved root deadline elapsed",
+        )?;
         let initial = State {
             schema_version: "melissa.workflow-state/v1".into(),
             sequence: 0,
@@ -801,6 +822,15 @@ impl Scheduler {
             .collect()
     }
     pub fn revise(&mut self, plan: Plan, catalog: &Catalog) -> Result<State> {
+        self.revise_inner(plan, catalog, None)
+    }
+
+    fn revise_inner(
+        &mut self,
+        plan: Plan,
+        catalog: &Catalog,
+        repair: Option<crate::adaptive::Repair>,
+    ) -> Result<State> {
         let s = self.state()?;
         require(
             !s.cancel_requested && !self.cancelled.load(Ordering::Acquire),
@@ -926,6 +956,9 @@ impl Scheduler {
         next.active_handoff = None;
         if let Some(ledger) = &mut next.adaptive {
             ledger.revision_count += 1;
+            if let Some(repair) = repair {
+                ledger.repairs.push(repair);
+            }
             if let Some(proposal) = ledger.pending_proposal.take() {
                 ledger
                     .applied_proposals
@@ -981,6 +1014,17 @@ impl Scheduler {
         ledger
             .verified_facts
             .retain(|key, value| !key.starts_with("successful_check:") || value == &source);
+        ledger.diagnostics.retain(|_, d| d.source_digest == source);
+        if ledger.source_version != source {
+            let current = ledger
+                .observation_refs
+                .keys()
+                .map(|tool| digest(format!("{tool}:{source}").as_bytes()))
+                .collect::<std::collections::BTreeSet<_>>();
+            ledger
+                .repeated_failures
+                .retain(|key, _| current.contains(key));
+        }
         ledger.source_version = source.clone();
         ledger.changed_files = changed;
         ledger
@@ -1013,8 +1057,16 @@ impl Scheduler {
             return Ok(());
         }
         let artifact = format!("workflow-check:{}:{}", lease.run, state.sequence);
+        let previous = state.adaptive.as_ref().expect("checked");
+        let patch = if tool == "after_edit" {
+            Some(artifact.clone())
+        } else {
+            previous.last_patch.clone()
+        };
+        let diagnostic = (!success)
+            .then(|| crate::diagnostics::classify(tool, source, &artifact, patch.clone(), content));
         let receipt = serde_json::to_vec(
-            &json!({"tool":tool,"run":lease.run,"source_digest":source,"success":success,"content":content,"task_accepted":false}),
+            &json!({"tool":tool,"run":lease.run,"source_digest":source,"success":success,"diagnostic":diagnostic,"content":content,"task_accepted":false}),
         )?;
         self.store.put_artifact(
             &ArtifactRequest {
@@ -1042,7 +1094,19 @@ impl Scheduler {
             "{tool}: {}; source={source}; evidence={artifact}",
             if success { "PASS" } else { "FAIL" }
         )];
+        ledger.last_patch = patch;
+        let signature = digest(format!("{tool}:{source}").as_bytes());
         if success {
+            ledger.diagnostics.remove(tool);
+            if tool == "code_tests" {
+                ledger.diagnostics.retain(|name, diagnostic| {
+                    !name.starts_with("code_targeted_tests:") || diagnostic.source_digest != source
+                });
+                ledger.open_questions.retain(|question| {
+                    !question.starts_with("Resolve failed check: code_targeted_tests:")
+                });
+            }
+            ledger.repeated_failures.remove(&signature);
             ledger
                 .verified_facts
                 .insert(format!("successful_check:{tool}"), source.into());
@@ -1050,7 +1114,12 @@ impl Scheduler {
                 .open_questions
                 .retain(|q| q != &format!("Resolve failed check: {tool}"));
         } else {
-            let signature = digest(format!("{tool}:{source}").as_bytes());
+            ledger
+                .verified_facts
+                .remove(&format!("successful_check:{tool}"));
+            if let Some(diagnostic) = diagnostic {
+                ledger.diagnostics.insert(tool.into(), diagnostic);
+            }
             require(
                 ledger.repeated_failures.len() < 256
                     || ledger.repeated_failures.contains_key(&signature),
@@ -1072,6 +1141,242 @@ impl Scheduler {
             true,
         )?;
         Ok(())
+    }
+
+    /// Reuse only explicit successful native evidence at the exact source.
+    /// The caller is responsible for checking the operation identity/arguments.
+    pub fn check_evidence(
+        &self,
+        lease: &Lease,
+        tool: &str,
+        source: &str,
+    ) -> Result<Option<String>> {
+        let state = self.state()?;
+        self.check_state(&state, lease)?;
+        let Some(ledger) = &state.adaptive else {
+            return Ok(None);
+        };
+        let signature = digest(format!("{tool}:{source}").as_bytes());
+        require(
+            ledger
+                .repeated_failures
+                .get(&signature)
+                .copied()
+                .unwrap_or(0)
+                < state.plan.max_no_progress,
+            Kind::Conflict,
+            "unchanged check already exhausted the retry allowance",
+        )?;
+        Ok(ledger
+            .verified_facts
+            .get(&format!("successful_check:{tool}"))
+            .filter(|observed| *observed == source)
+            .and_then(|_| ledger.observation_refs.get(tool))
+            .cloned())
+    }
+
+    /// Publish a recovery point after a settled milestone and its source
+    /// observation. This receipt lives in the authenticated workflow state.
+    pub fn checkpoint_milestone(&mut self) -> Result<()> {
+        let state = self.state()?;
+        let version = self.fresh(&state)?;
+        idle(&self.store, &self.task)?;
+        require(
+            state.active_handoff.is_none()
+                && state.slots.values().all(|s| s.phase != Phase::Leased),
+            Kind::Conflict,
+            "milestone checkpoint requires settled leases",
+        )?;
+        let Some(ledger) = &state.adaptive else {
+            return Ok(());
+        };
+        if ledger.completed_milestones.is_empty() {
+            return Ok(());
+        }
+        let plan = state.plan.digest()?;
+        let budget = self.store.journal().model_budget(&self.task)?;
+        if ledger.milestone_checkpoint.as_ref().is_some_and(|m| {
+            m.source_digest == ledger.source_version
+                && m.plan_digest == plan
+                && m.task_version == version
+                && m.budget == budget
+                && m.completed == ledger.completed_milestones
+        }) {
+            return Ok(());
+        }
+        let mut next = state.clone();
+        let ledger = next.adaptive.as_mut().expect("checked");
+        ledger.milestone_checkpoint = Some(crate::adaptive::MilestoneCheckpoint {
+            source_digest: ledger.source_version.clone(),
+            plan_digest: plan,
+            task_version: version,
+            budget,
+            completed: ledger.completed_milestones.clone(),
+        });
+        self.commit_version(
+            &state,
+            next,
+            "authenticated settled milestone",
+            version,
+            true,
+        )?;
+        Ok(())
+    }
+
+    pub fn validate_milestone(&self, source: &str) -> Result<()> {
+        let state = self.state()?;
+        let version = self.fresh(&state)?;
+        idle(&self.store, &self.task)?;
+        let ledger = state
+            .adaptive
+            .as_ref()
+            .ok_or_else(|| error(Kind::Stale, "missing adaptive milestone"))?;
+        let checkpoint = ledger
+            .milestone_checkpoint
+            .as_ref()
+            .ok_or_else(|| error(Kind::Stale, "missing settled milestone"))?;
+        let budget = self.store.journal().model_budget(&self.task)?;
+        require(
+            state.active_handoff.is_none()
+                && state.slots.values().all(|s| s.phase != Phase::Leased)
+                && checkpoint.source_digest == source
+                && ledger.source_version == source
+                && checkpoint.task_version == version
+                && checkpoint.plan_digest == state.plan.digest()?
+                && checkpoint.budget == budget
+                && checkpoint.completed == ledger.completed_milestones,
+            Kind::Stale,
+            "source, task version, budget or milestone changed after checkpoint",
+        )
+    }
+
+    /// Schedule a scoped repair only before final review, or after a
+    /// diagnostically explained specialist failure. Prior results stay durable.
+    pub fn repair_from_diagnostics(&mut self, catalog: &Catalog) -> Result<bool> {
+        let state = self.state()?;
+        let Some(ledger) = &state.adaptive else {
+            return Ok(false);
+        };
+        let next = state
+            .plan
+            .nodes
+            .iter()
+            .find(|n| state.slots[&n.id].phase != Phase::Candidate);
+        if next.is_some_and(|n| {
+            n.profile != "melissa.code.reviewer" && state.slots[&n.id].phase != Phase::Failed
+        }) {
+            return Ok(false);
+        }
+        self.fresh(&state)?;
+        idle(&self.store, &self.task)?;
+        require(
+            state.active_handoff.is_none()
+                && state.slots.values().all(|s| s.phase != Phase::Leased),
+            Kind::Conflict,
+            "repair requires a settled specialist boundary",
+        )?;
+        let candidate = ledger
+            .diagnostics
+            .values()
+            .find(|d| d.source_digest == ledger.source_version && d.repairable);
+        let Some(diagnostic) = candidate else {
+            for last in &ledger.repairs {
+                let key = format!("successful_check:{}", last.diagnostic.tool);
+                let grammar_fix = last.diagnostic.tool == "after_edit"
+                    && ledger
+                        .verified_facts
+                        .get("successful_check:code_project_check")
+                        == Some(&ledger.source_version);
+                let full_public_suite = last.diagnostic.tool.starts_with("code_targeted_tests:")
+                    && ledger.verified_facts.get("successful_check:code_tests")
+                        == Some(&ledger.source_version);
+                require(
+                    grammar_fix
+                        || full_public_suite
+                        || ledger.verified_facts.get(&key) == Some(&ledger.source_version),
+                    Kind::Conflict,
+                    "repair needs an actual passing re-test on current source",
+                )?;
+            }
+            return Ok(false);
+        };
+        require(
+            !ledger
+                .repairs
+                .iter()
+                .any(|r| r.diagnostic.fingerprint == diagnostic.fingerprint),
+            Kind::Conflict,
+            "unchanged diagnostic persists after a bounded repair",
+        )?;
+        // Use the same initial writer and final verification templates as the
+        // approved plan. Read-only tasks never obtain a writer here.
+        let writer = ledger.templates.iter().find(|(_, n)| {
+            n.effects.contains("workspace.apply_patch_scoped")
+                && n.claims
+                    .iter()
+                    .any(|claim| claim.access == crate::plan::Access::Write)
+        });
+        let tester = ledger.templates.iter().rev().find(|(_, n)| {
+            n.profile == "melissa.code.test-engineer"
+                && !n.effects.contains("workspace.apply_patch_scoped")
+        });
+        let reviewer = ledger.templates.iter().rev().find(|(_, n)| {
+            n.profile == "melissa.code.reviewer"
+                && !n.effects.contains("workspace.apply_patch_scoped")
+        });
+        let (Some((writer, _)), Some((tester, test)), Some((reviewer, review))) =
+            (writer, tester, reviewer)
+        else {
+            return Err(error(
+                Kind::Authority,
+                "repair requires already approved writer and independent verifier templates",
+            ));
+        };
+        let tool = diagnostic
+            .tool
+            .split(':')
+            .next()
+            .unwrap_or(&diagnostic.tool);
+        let cases = if diagnostic.targeted_case_ids.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " Exact approved case IDs: {}.",
+                serde_json::to_string(&diagnostic.targeted_case_ids)?
+            )
+        };
+        let proposal = crate::adaptive::Proposal {
+            expected_plan_digest: state.plan.digest()?,
+            source_version: ledger.source_version.clone(),
+            reason: "Host observed a source-bound development failure".into(),
+            remaining_steps: vec![
+                crate::adaptive::StepProposal {
+                    template: writer.clone(),
+                    goal: format!(
+                        "Repair the cause documented by {} within the existing file scope. Use the structured diagnostic in the handoff. Repeat {tool} on current source and retain the result.{cases} For an after-edit failure, verify syntax/type. Refresh any outstanding earlier repair checks on this source.",
+                        diagnostic.evidence_ref
+                    ),
+                },
+                crate::adaptive::StepProposal {
+                    template: tester.clone(),
+                    goal: format!(
+                        "{} Confirm the repair with current-source tests and retain evidence.",
+                        test.goal
+                    ),
+                },
+                crate::adaptive::StepProposal {
+                    template: reviewer.clone(),
+                    goal: review.goal.clone(),
+                },
+            ],
+        };
+        let revised = crate::adaptive::revise(&state, &proposal)?;
+        let repair = crate::adaptive::Repair {
+            diagnostic: diagnostic.clone(),
+            revision: revised.revision,
+        };
+        self.revise_inner(revised, catalog, Some(repair))?;
+        Ok(true)
     }
 
     pub fn propose(&mut self, lease: &Lease, proposal: crate::adaptive::Proposal) -> Result<State> {

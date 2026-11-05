@@ -169,11 +169,11 @@ impl App {
                 .create_new(true)
                 .write(true)
                 .open(manifest)?;
-            f.write_all(&serde_json::to_vec_pretty(&json!({"task_id":id,"source_digest":value["source_digest"],"package_digest":value["package_digest"],"receipt":value["receipt"],"files":package.iter().map(|(p,b)|(p,digest(b))).collect::<BTreeMap<_,_>>(),"release_security_license_acceptance":false})).map_err(|_|Error::Store)?)?;
+            f.write_all(&serde_json::to_vec_pretty(&json!({"task_id":id,"source_digest":value["source_digest"],"package_digest":value["package_digest"],"receipt":value["receipt"],"verification_layers":value["verification_layers"],"files":package.iter().map(|(p,b)|(p,digest(b))).collect::<BTreeMap<_,_>>(),"release_security_license_acceptance":false})).map_err(|_|Error::Store)?)?;
             f.sync_all()?;
         }
         Ok(
-            json!({"command":"task delivery","task_id":id,"artifact_id":a.artifact_id,"source_digest":value["source_digest"],"package_digest":value["package_digest"],"receipt":value["receipt"],"files":package.keys().collect::<Vec<_>>(),"task_accepted":true,"release_security_license_acceptance":false,"exported_to":out,"preview_command":"task preview ID [--out NEW_DIRECTORY]"}),
+            json!({"command":"task delivery","task_id":id,"artifact_id":a.artifact_id,"source_digest":value["source_digest"],"package_digest":value["package_digest"],"receipt":value["receipt"],"verification_layers":value["verification_layers"],"files":package.keys().collect::<Vec<_>>(),"task_accepted":true,"release_security_license_acceptance":false,"exported_to":out,"preview_command":"task preview ID [--out NEW_DIRECTORY]"}),
         )
     }
     /// Export only source-bound PNGs produced after protected acceptance, never

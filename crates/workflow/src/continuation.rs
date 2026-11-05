@@ -212,6 +212,17 @@ impl ContinuationStore for WorkflowContinuation {
         store: &mut LocalStore,
         state: &TurnCheckpointView<'_>,
     ) -> melissa_model_gateway::Result<()> {
+        self.publish_with_metadata(store, state, serde_json::Value::Null)
+    }
+}
+impl WorkflowContinuation {
+    /// The host source receipt and native safe turn are admitted by one journal append.
+    pub fn publish_with_metadata(
+        &mut self,
+        store: &mut LocalStore,
+        state: &TurnCheckpointView<'_>,
+        metadata: serde_json::Value,
+    ) -> melissa_model_gateway::Result<()> {
         (|| -> Result<_> {
             let pending = (state.phase == Phase::InferencePending).then(|| {
                 format!(
@@ -273,7 +284,11 @@ impl ContinuationStore for WorkflowContinuation {
                 task,
                 version,
                 &artifact,
-                json!({"digest":digest(&bytes),"phase":state.phase}),
+                if metadata.is_null() {
+                    json!({"digest":digest(&bytes),"phase":state.phase})
+                } else {
+                    json!({"digest":digest(&bytes),"phase":state.phase,"host_boundary":metadata})
+                },
             )?;
             self.sequence += 1;
             Ok(())
