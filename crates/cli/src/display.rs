@@ -103,6 +103,7 @@ pub fn human(v: &Value) -> Result<String> {
             || v.get("receipt").is_some()
             || v.get("plan").is_some()
             || v.get("preparation").is_some()
+            || v.get("metrics").is_some()
         {
             out.push_str(&json(v)?);
         }

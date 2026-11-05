@@ -57,6 +57,7 @@ async fn run(options: &args::Options) -> Result<Value> {
         Command::ConfigShow => app.configuration(),
         Command::List => app.list(),
         Command::Show(id) => app.show(id),
+        Command::Metrics(id) => app.metrics(id),
         Command::Diff(id) => app.diff(id),
         Command::Events(id) => app.events(id),
         Command::Cancel(id) => app.cancel(id),
@@ -94,6 +95,7 @@ async fn main() {
         println!("{}", args::EXECUTION_HELP);
         println!("{}", args::DOMAIN_HELP);
         println!("{}", args::CAPABILITIES_HELP);
+        println!("{}", args::METRICS_HELP);
         return;
     }
     if matches!(options.command, Command::Version) {

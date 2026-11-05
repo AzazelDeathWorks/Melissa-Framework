@@ -20,7 +20,7 @@ use melissa_local_store::LocalStore;
 use melissa_model_gateway::{
     DecoderLimits, ErrorKind, GatewayError, ToolCall, ToolDefinition,
     agent_loop::{Gateway, GatewayPolicy, RunSpec},
-    continuation::{ContinuationStore, Phase as TurnPhase, TurnCheckpoint},
+    continuation::{ContinuationStore, TurnCheckpoint},
     routing::RouteRequirements,
     tools::{BoundTool, ToolContext, ToolDispatcher, ToolExecution},
 };
@@ -50,6 +50,33 @@ use std::{
 };
 fn gw(_: impl std::fmt::Display) -> Error {
     Error::Unavailable("Yürütme katmanı durdu; kalıcı progress ve kanıt kaydını inceleyin.")
+}
+fn setup_failure(
+    store: &mut LocalStore,
+    packet: &WorkPacket,
+    stage: &'static str,
+    detail: impl std::fmt::Display,
+) -> Error {
+    let task = &packet.parent_task.task_id;
+    let diagnostic = json!({
+        "stage": stage,
+        "profile": packet.node.profile,
+        "detail": detail.to_string().chars().take(512).collect::<String>(),
+        "provider_dispatched_by_stage": false
+    });
+    let recorded = bytes(&diagnostic).and_then(|raw| {
+        put(
+            store,
+            task,
+            &format!("cli:setup-error:{}", packet.lease.run),
+            "cli.specialist_setup_error",
+            &raw,
+        )
+    });
+    if let Err(error) = recorded {
+        return error;
+    }
+    Error::Unavailable(stage)
 }
 fn lock(s: &SharedScheduler) -> Result<std::sync::MutexGuard<'_, Scheduler>> {
     s.lock().map_err(|_| Error::Store)
@@ -188,11 +215,62 @@ struct TaskTools {
     domain_authorized: bool,
     history_read: bool,
     adaptive: Option<(SharedScheduler, melissa_workflow::scheduler::Lease)>,
+    allow_replanning: bool,
+}
+impl TaskTools {
+    fn authorize_evidence(&self, artifact: &str) -> melissa_model_gateway::Result<()> {
+        let (scheduler, lease) = self
+            .adaptive
+            .as_ref()
+            .ok_or_else(|| GatewayError::invalid("adaptive ledger unavailable"))?;
+        let owner = scheduler
+            .lock()
+            .map_err(|_| GatewayError::invalid("ledger lock"))?;
+        owner
+            .check(lease)
+            .map_err(|e| GatewayError::invalid(e.to_string()))?;
+        let state = owner
+            .state()
+            .map_err(|e| GatewayError::invalid(e.to_string()))?;
+        let ledger = state
+            .adaptive
+            .as_ref()
+            .ok_or_else(|| GatewayError::invalid("ledger absent"))?;
+        if !ledger
+            .candidate_artifacts
+            .values()
+            .chain(ledger.failed_attempts.values())
+            .chain(ledger.observation_refs.values())
+            .chain(
+                ledger
+                    .repairs
+                    .iter()
+                    .map(|repair| &repair.diagnostic.evidence_ref),
+            )
+            .chain(ledger.last_patch.iter())
+            .any(|id| id == artifact)
+        {
+            return Err(GatewayError::new(
+                ErrorKind::Authorization,
+                "artifact is not a public task-ledger reference",
+            ));
+        }
+        match self.store.artifact_metadata(&self.task, artifact) {
+            Ok(_) => Ok(()),
+            Err(melissa_local_store::StoreError::NotFound(_)) => Err(GatewayError::invalid(
+                "authorized evidence has no readable artifact",
+            )),
+            Err(_) => Err(GatewayError::new(
+                ErrorKind::Store,
+                "evidence metadata authentication failed",
+            )),
+        }
+    }
 }
 impl ToolDispatcher for TaskTools {
     fn definitions(&self) -> Vec<BoundTool> {
         let mut d=vec![BoundTool{canonical_id:"evidence.attach".into(),definition:ToolDefinition{name:"submit_candidate".into(),description:"Submit the complete candidate summary and exact current source digest, obtained from fs_snapshot. This does not accept a task; protected host QA decides independently.".into(),parameters:self.execution.recipe.output_schema(),strict:false}}];
-        if self.adaptive.is_some() {
+        if self.allow_replanning && self.adaptive.is_some() {
             d.push(BoundTool { canonical_id:"evidence.attach".into(), definition:ToolDefinition {
                 name:"task_plan_propose".into(),
                 description:"Propose remaining serial milestones using only allowed_templates from the handoff. Supply the current fs_snapshot source digest and plan_digest. Host validates the proposal at a settled specialist boundary. End the current milestone with submit_candidate. Repeated proposals and authority expansion are rejected.".into(),
@@ -243,6 +321,39 @@ impl ToolDispatcher for TaskTools {
             .find(|d| d.definition.name == call.name)
             .ok_or_else(|| GatewayError::invalid("unbound CLI route"))?;
         melissa_model_gateway::schema::validate_output(&d.definition.parameters, &call.arguments)?;
+        if call.name == "task_evidence_read" {
+            let args = melissa_model_gateway::strict_json(&call.arguments)?;
+            self.authorize_evidence(args["artifact_id"].as_str().ok_or_else(|| {
+                GatewayError::invalid("task evidence requires an exact artifact identifier")
+            })?)?;
+        }
+        if call.name == "history_read" {
+            let arguments = melissa_model_gateway::strict_json(&call.arguments)?;
+            let reference = arguments["artifact_ref"].as_str().ok_or_else(|| {
+                GatewayError::invalid("history requires an exact reference from this specialist")
+            })?;
+            if melissa_model_gateway::context_compiler::scoped_history_digest(&self.run, reference)
+                .is_none()
+            {
+                return Err(GatewayError::invalid(
+                    "history_read uses only current specialist archives; use task_evidence_read for exact authorized handoff evidence",
+                ));
+            }
+            match self.store.artifact_metadata(&self.task, reference) {
+                Ok(_) => {}
+                Err(melissa_local_store::StoreError::NotFound(_)) => {
+                    return Err(GatewayError::invalid(
+                        "current history reference is missing",
+                    ));
+                }
+                Err(_) => {
+                    return Err(GatewayError::new(
+                        ErrorKind::Store,
+                        "history metadata could not be authenticated",
+                    ));
+                }
+            }
+        }
         Ok(())
     }
     fn execute<'a>(
@@ -266,42 +377,6 @@ impl ToolDispatcher for TaskTools {
                 let artifact = args["artifact_id"]
                     .as_str()
                     .ok_or_else(|| GatewayError::invalid("evidence reference"))?;
-                let (scheduler, lease) = self
-                    .adaptive
-                    .as_ref()
-                    .ok_or_else(|| GatewayError::invalid("adaptive ledger unavailable"))?;
-                let owner = scheduler
-                    .lock()
-                    .map_err(|_| GatewayError::invalid("ledger lock"))?;
-                owner
-                    .check(lease)
-                    .map_err(|e| GatewayError::invalid(e.to_string()))?;
-                let state = owner
-                    .state()
-                    .map_err(|e| GatewayError::invalid(e.to_string()))?;
-                let ledger = state
-                    .adaptive
-                    .as_ref()
-                    .ok_or_else(|| GatewayError::invalid("ledger absent"))?;
-                if !ledger
-                    .candidate_artifacts
-                    .values()
-                    .chain(ledger.failed_attempts.values())
-                    .chain(ledger.observation_refs.values())
-                    .chain(
-                        ledger
-                            .repairs
-                            .iter()
-                            .map(|repair| &repair.diagnostic.evidence_ref),
-                    )
-                    .chain(ledger.last_patch.iter())
-                    .any(|id| id == artifact)
-                {
-                    return Err(GatewayError::new(
-                        ErrorKind::Authorization,
-                        "artifact is not a public task-ledger reference",
-                    ));
-                }
                 let raw = self
                     .store
                     .get_artifact(&self.task, artifact)
@@ -339,6 +414,9 @@ impl ToolDispatcher for TaskTools {
                 });
             }
             if call.name == "task_plan_propose" {
+                if !self.allow_replanning {
+                    return Err(GatewayError::invalid("adaptive planning unavailable"));
+                }
                 let proposal: melissa_workflow::adaptive::Proposal =
                     serde_json::from_value(melissa_model_gateway::strict_json(&call.arguments)?)
                         .map_err(|_| GatewayError::invalid("invalid adaptive proposal"))?;
@@ -611,15 +689,23 @@ impl ToolDispatcher for AdaptiveChecks {
                         .is_ok_and(|snapshot| snapshot.digest == source)
                     && !cancel.load(Ordering::Acquire)
                 {
-                    return Ok(ToolExecution{
+                    let mut output = ToolExecution{
                         content:json!({"status":"passed","source_digest":source,"evidence_ref":reference,
                             "reused":true,"native_execution_performed":false,"task_accepted":false}).to_string(),
-                        success:true,cancelled:false,requires_reconciliation:false,artifact_refs:vec![reference],
-                    });
+                        success:true,cancelled:false,requires_reconciliation:false,artifact_refs:vec![reference.clone()],
+                    };
+                    crate::model_tools::attach_evidence_page(
+                        &*self.inner,
+                        &mut output,
+                        "task_evidence_read",
+                        &reference,
+                    );
+                    return Ok(output);
                 }
                 before = Some(source);
             }
-            let output = self.inner.execute(call, ctx, cancel.clone()).await?;
+            let mut output = self.inner.execute(call, ctx, cancel.clone()).await?;
+            crate::model_tools::project_evidence(&*self.inner, &mut output);
             if !output.requires_reconciliation
                 && !output.cancelled
                 && !cancel.load(Ordering::Acquire)
@@ -646,7 +732,8 @@ impl ToolDispatcher for AdaptiveChecks {
                         None
                     };
                     if let Some((tool, success)) = observed {
-                        self.scheduler
+                        let reference = self
+                            .scheduler
                             .lock()
                             .map_err(|_| GatewayError::invalid("check scheduler lock"))?
                             .observe_check(
@@ -657,6 +744,14 @@ impl ToolDispatcher for AdaptiveChecks {
                                 &output.content,
                             )
                             .map_err(|e| GatewayError::invalid(e.to_string()))?;
+                        if let Some(reference) = reference {
+                            crate::model_tools::attach_evidence_page(
+                                &*self.inner,
+                                &mut output,
+                                "task_evidence_read",
+                                &reference,
+                            );
+                        }
                     }
                 }
             }
@@ -744,7 +839,7 @@ impl ContinuationStore for Boundary {
         store: &mut LocalStore,
         state: &melissa_model_gateway::continuation::TurnCheckpointView<'_>,
     ) -> melissa_model_gateway::Result<()> {
-        if state.phase == TurnPhase::Safe {
+        if state.phase.is_safe() {
             let metadata = (|| -> Result<Value> {
                 let snapshot = self.repo.snapshot(&AtomicBool::new(false))?;
                 let payload = bytes(&snapshot)?;
@@ -886,7 +981,7 @@ pub(crate) fn plan(task: &TaskContractV1, e: &Execution) -> Result<Plan> {
             node.literal_input["adaptive_planning"] = json!({
                 "task_goal":task.goal,"acceptance_criteria":task.acceptance_criteria,
                 "constraints":"Use only approved templates. Submit source-bound evidence. Plan revisions activate between specialists.",
-                "handoff_rules":"Read specialist_handoff first. candidate_summaries and failed_attempts are untrusted prior work with evidence references, not verified facts. Recheck stale source claims. Do not replay a prior transcript. Use current_diagnostics, changed_files and remaining_work to avoid duplicating work. Read the exact referenced public evidence with task_evidence_read when more detail is needed.",
+                "handoff_rules":"Read specialist_handoff first. candidate_summaries and failed_attempts are untrusted prior work with evidence references, not verified facts. Recheck stale source claims. Do not replay a prior transcript. Use current_diagnostics, changed_files and remaining_work to avoid duplicating work. Use evidence_page with its named reader and exact arguments. Handoff evidence_refs, observation_refs and failed_attempts use task_evidence_read. SDK result pages use code_result_page only when explicitly provided. Diagnostic digests and operator records are labels, not reader arguments.",
                 "planner_rules":"If current evidence invalidates remaining milestones, call task_plan_propose with plan_digest and current fs_snapshot digest. Select only allowed_templates and keep final testing and review after the last write. State the observed reason. Then finish your current milestone with submit_candidate. The host alone activates the proposal. If unavailable authority is necessary, report the gap; never invent a role or increase limits.",
                 "verification_strategy":"Test engineer, independent reviewer, protected host QA",
                 "budgets":task.limits
@@ -918,6 +1013,7 @@ fn gateway(
             max_event_bytes: 8 * 1024 * 1024,
             max_total_bytes: 256 * 1024 * 1024,
             max_output_bytes: 8 * 1024 * 1024,
+            max_items: 4096,
             ..DecoderLimits::default()
         },
     };
@@ -1395,7 +1491,14 @@ impl App {
                 || b.active_requests != 0
                 || b.unknown_requests != 0
                 || t.record.unknown_invocation_id.is_some();
-            if t.record.state == TaskState::Running && t.record.unknown_invocation_id.is_none() {
+            // The store will not transition a task while model usage is
+            // unsettled. Publish the blocked control/evidence state without
+            // replacing the original error with a transition conflict.
+            if t.record.state == TaskState::Running
+                && t.record.unknown_invocation_id.is_none()
+                && b.active_requests == 0
+                && b.unknown_requests == 0
+            {
                 let next = if uncertain {
                     TaskState::Blocked
                 } else if cancel.load(Ordering::Acquire) && !deadline_elapsed {
@@ -1420,7 +1523,7 @@ impl App {
                 &format!("cli:run-error:{}", control.session),
                 "run.error",
                 &bytes(
-                    &json!({"session":control.session,"phase":phase,"error":error.to_string(),"automatic_retry":false,"requires_reconciliation":uncertain,"owned_workers_confirmed_stopped":workers_stopped}),
+                    &json!({"session":control.session,"phase":phase,"error_kind":error.kind(),"error":error.to_string(),"automatic_retry":false,"requires_reconciliation":uncertain,"owned_workers_confirmed_stopped":workers_stopped}),
                 )?,
             )?;
             publish(&control, &store, id, Some(&scheduler), phase)?;
@@ -1496,7 +1599,15 @@ impl App {
                     let mut owner = lock(scheduler)?;
                     owner
                         .repair_from_diagnostics(&resources::catalog()?)
-                        .map_err(gw)?;
+                        .map_err(|error| {
+                            if error.kind == melissa_workflow::Kind::RepairEvidence {
+                                Error::Conflict(
+                                    "Onarım sonrası aynı teşhis sürüyor veya güncel kaynakta başarılı yeniden test kanıtı eksik.",
+                                )
+                            } else {
+                                gw(error)
+                            }
+                        })?;
                     owner.checkpoint_milestone().map_err(gw)?;
                 }
                 let decision = lock(scheduler)?.supervisor().map_err(gw)?;
@@ -1609,6 +1720,8 @@ impl App {
             } else {
                 None
             };
+            let lab = s.lab_variant;
+            let allow_replanning = lab != crate::settings::LabVariant::AdaptiveReplanningOff;
             let task_tools = TaskTools {
                 repo: self.source(&self.workspace(store, &t.task_id)?)?,
                 store: store.connect()?,
@@ -1623,19 +1736,26 @@ impl App {
                 history_read: node.tools.contains("fs.read"),
                 adaptive: (state.plan.mode == Mode::AdaptiveSerial)
                     .then(|| (scheduler.clone(), packet.lease.clone())),
+                allow_replanning,
                 domain_authorized: e
                     .recipe
                     .domain
                     .as_ref()
                     .is_some_and(|d| node.effects.contains(d.kind.effect())),
             };
+            let mut context_tools = node.tools.clone();
+            if lab == crate::settings::LabVariant::ProjectMemoryOff {
+                context_tools.remove("memory.search");
+                context_tools.remove("memory.propose");
+            }
             let context = crate::context_bridge::runtime(
                 self,
                 store,
                 t,
                 &node.profile,
                 e.expires_at_ms,
-                &node.tools,
+                &context_tools,
+                lab != crate::settings::LabVariant::RepositoryIndexCacheOff,
             )?;
             let development = crate::development::DevelopmentTools::new(
                 self,
@@ -1670,7 +1790,9 @@ impl App {
                 Box::new(context),
                 Box::new(development),
             ])
-            .map_err(gw)?;
+            .map_err(|error| {
+                setup_failure(store, &packet, "Specialist tool routing failed.", error)
+            })?;
             let checked = crate::development::CheckedEdits {
                 inner: Box::new(router),
                 repo: Arc::new(self.source(&self.workspace(store, &t.task_id)?)?),
@@ -1692,7 +1814,32 @@ impl App {
             };
             let catalog = resources::catalog()?;
             let profile = &catalog.profiles[&node.profile];
-            let user_message = serde_json::to_string(&packet).map_err(|_| Error::Store)?;
+            let mut prompt = packet.clone();
+            if let Some(planning) = prompt.node.literal_input["adaptive_planning"].as_object_mut() {
+                if !allow_replanning {
+                    planning.remove("planner_rules");
+                }
+                if let Some(handoff) = &packet.specialist_handoff {
+                    let references = handoff
+                        .evidence_refs
+                        .values()
+                        .chain(handoff.observation_refs.values())
+                        .chain(handoff.failed_attempts.values())
+                        .collect::<BTreeSet<_>>();
+                    let pages = references
+                        .into_iter()
+                        .filter_map(|reference| {
+                            crate::model_tools::authorized_evidence_page(
+                                &*checked,
+                                "task_evidence_read",
+                                reference,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    planning.insert("evidence_pages".into(), json!(pages));
+                }
+            }
+            let user_message = serde_json::to_string(&prompt).map_err(|_| Error::Store)?;
             let needs_image = profile.model_policy.required_capabilities.contains(
                 &melissa_core_contracts::catalog_models::ModelCapability::ImageUnderstanding,
             );
@@ -1741,7 +1888,14 @@ impl App {
             };
             let dispatcher =
                 NodeDispatcher::new(scheduler.clone(), packet.clone(), Box::new(projected))
-                    .map_err(gw)?;
+                    .map_err(|error| {
+                        setup_failure(
+                            store,
+                            &packet,
+                            "Specialist authority binding failed.",
+                            error,
+                        )
+                    })?;
             let spec = RunSpec {
                 run_id: packet.lease.run.clone(),
                 task_id: t.task_id.clone(),
@@ -1786,7 +1940,9 @@ impl App {
             };
             let spec = assembly
                 .bind(gateway.store_mut(), &spec, &dispatcher.definitions())
-                .map_err(gw)?;
+                .map_err(|error| {
+                    setup_failure(store, &packet, "Specialist context assembly failed.", error)
+                })?;
             gateway = gateway.with_continuation(Box::new(Boundary {
                 inner: WorkflowContinuation::new(scheduler.clone(), packet.clone()),
                 repo: self.source(&self.workspace(store, &t.task_id)?)?,
@@ -1864,7 +2020,41 @@ impl App {
             if paused.load(Ordering::Acquire) {
                 return Ok(json!({"paused":true}));
             }
-            let run = run.map_err(gw)?;
+            let run = match run {
+                Ok(run) => run,
+                Err(error) => {
+                    put(
+                        store,
+                        &t.task_id,
+                        &format!("cli:native-run-error:{}", packet.lease.run),
+                        "native-run-error",
+                        &bytes(&json!({"stage":"gateway_run","profile":node.profile,
+                            "kind":error.kind,"diagnostic":error.message.chars().take(512).collect::<String>(),
+                            "task_accepted":false}))?,
+                    )?;
+                    return Err(if error.kind == ErrorKind::Store {
+                        Error::Store
+                    } else {
+                        Error::Unavailable(
+                            "Uzmanın model yürütmesi durdu; uzman ve sağlayıcı kayıtlarını inceleyin.",
+                        )
+                    });
+                }
+            };
+            let model_error = if run.requires_reconciliation
+                || run.status == melissa_model_gateway::agent_loop::RunStatus::ProviderFailed
+            {
+                if let Some(request) = run.request_ids.last() {
+                    let raw = store.get_artifact(&t.task_id, &format!("{request}:receipt"))?;
+                    let receipt: Value = decode(&raw)?;
+                    serde_json::from_value::<Option<ErrorKind>>(receipt["error_kind"].clone())
+                        .map_err(|_| Error::Store)?
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             if run.requires_reconciliation {
                 lock(scheduler)?
                     .mark_uncertain(
@@ -1872,13 +2062,19 @@ impl App {
                         "native outcome requires owned-effect inspection",
                     )
                     .map_err(gw)?;
-                return Err(Error::Reconciliation(
-                    "Araç etkisi inceleme/uzlaştırma gerektiriyor; otomatik tekrar durduruldu.",
+                return Err(model_error.map_or(
+                    Error::Reconciliation(
+                        "Araç etkisi inceleme/uzlaştırma gerektiriyor; otomatik tekrar durduruldu.",
+                    ),
+                    Error::Model,
                 ));
             }
             lock(scheduler)?
                 .complete_native(&packet.lease)
                 .map_err(gw)?;
+            if let Some(error) = model_error {
+                return Err(Error::Model(error));
+            }
         }
         if control.pause.load(Ordering::Acquire) {
             return Ok(json!({"paused":true}));
@@ -2005,14 +2201,14 @@ impl App {
                 &control.cancel,
             )
         })
-        .map_err(gw)?;
+        .map_err(|_| Error::Verification("Son doğrulama için negatif örnek derlenemedi."))?;
         mirror_qa(store, &t.task_id, &negative_q)?;
         let program = tokio::task::block_in_place(|| {
             build_program(&mut q, &final_source, repo, &e.recipe, &control.cancel)
         })
-        .map_err(gw)?;
+        .map_err(|_| Error::Verification("Son doğrulama için güncel aday derlenemedi."))?;
         let suite = e.recipe.suite()?;
-        let receipt = tokio::task::block_in_place(|| {
+        let verification = tokio::task::block_in_place(|| {
             q.verify(
                 &final_source,
                 repo,
@@ -2021,10 +2217,19 @@ impl App {
                 &suite,
                 &control.cancel,
             )
-        })
-        .map_err(gw)?;
-        q.validate_receipt(&receipt).map_err(gw)?;
+        });
         mirror_qa(store, &t.task_id, &q)?;
+        let receipt = verification.map_err(|error| match error {
+            melissa_code_quality::Error::Denied("protected QA positive cases failed") => {
+                Error::Verification("Bağımsız son testler adayda başarısız oldu.")
+            }
+            melissa_code_quality::Error::Denied(
+                "protected QA negative control unexpectedly passed",
+            ) => Error::Verification("Bağımsız son test negatif örneği ayırt edemedi."),
+            _ => Error::Unavailable("Bağımsız son test yürütmesi veya kanıtı tamamlanamadı."),
+        })?;
+        q.validate_receipt(&receipt)
+            .map_err(|_| Error::Unavailable("Son test kanıtı doğrulanamadı."))?;
         if !native_stop_proven(store, &t.task_id)? {
             return Err(Error::Reconciliation(
                 "Doğrulama süreçlerinin durduğu kanıtlanamadı.",
@@ -2566,19 +2771,52 @@ mod tests {
         ctx: ToolContext,
     }
     fn adaptive_test(native: bool) -> AdaptiveTest {
+        use melissa_code_quality::protected::Language;
+        adaptive_test_for(if native {
+            Language::Rust
+        } else {
+            Language::Python
+        })
+    }
+    fn adaptive_test_for(language: melissa_code_quality::protected::Language) -> AdaptiveTest {
+        use melissa_code_quality::protected::Language;
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
         fs::create_dir(&source).unwrap();
-        let entry = if native { "main.rs" } else { "main.py" };
-        fs::write(
-            source.join(entry),
-            if native {
-                "fn main() { println!(\"0\"); }\n"
-            } else {
-                "import sys\nprint(int(sys.argv[1]))\n"
-            },
-        )
-        .unwrap();
+        let (entry, writable) = match language {
+            Language::RustCargo => {
+                fs::create_dir(source.join("src")).unwrap();
+                fs::write(
+                    source.join("Cargo.toml"),
+                    "[package]\nname = \"lab-app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                )
+                .unwrap();
+                fs::write(
+                    source.join("Cargo.lock"),
+                    "version = 3\n\n[[package]]\nname = \"lab-app\"\nversion = \"0.1.0\"\n",
+                )
+                .unwrap();
+                fs::write(
+                    source.join("src/main.rs"),
+                    "fn main() { println!(\"0\"); }\n",
+                )
+                .unwrap();
+                ("lab-app", "src/main.rs")
+            }
+            Language::Rust => {
+                fs::write(source.join("main.rs"), "fn main() { println!(\"0\"); }\n").unwrap();
+                ("main.rs", "main.rs")
+            }
+            Language::Python => {
+                fs::write(
+                    source.join("main.py"),
+                    "import sys\nprint(int(sys.argv[1]))\n",
+                )
+                .unwrap();
+                ("main.py", "main.py")
+            }
+            _ => unreachable!("unsupported adaptive fixture language"),
+        };
         let repo = Repository::open(&source, Limits::default(), vec![]).unwrap();
         let snapshot = repo.snapshot(&AtomicBool::new(false)).unwrap();
         let mut contract: TaskContractV1 = serde_json::from_slice(include_bytes!(
@@ -2610,7 +2848,7 @@ mod tests {
             {"profile":"melissa.code.implementer","goal":"Repair only main.py","write":true},
             {"profile":"melissa.code.test-engineer","goal":"Test final source","write":false},
             {"profile":"melissa.code.reviewer","goal":"Review final source","write":false}
-        ],"writable_paths":[entry],"protected_paths":[],"language":if native{"rust"}else{"python"},"entry":entry,"negative_workspace":temp.path().join("negative"),"checks":[{"id":"a","input":1,"expected":1},{"id":"b","input":2,"expected":2}],"development_checks":[{"id":"public-a","input":1,"expected":1},{"id":"public-b","input":2,"expected":2},{"id":"public-c","input":3,"expected":3}],"max_cost_micro_usd":5000000,"wall_time_ms":1800000})).unwrap();
+        ],"writable_paths":[writable],"protected_paths":[],"language":language,"entry":entry,"negative_workspace":temp.path().join("negative"),"checks":[{"id":"a","input":1,"expected":1},{"id":"b","input":2,"expected":2}],"development_checks":[{"id":"public-a","input":1,"expected":1},{"id":"public-b","input":2,"expected":2},{"id":"public-c","input":3,"expected":3}],"max_cost_micro_usd":5000000,"wall_time_ms":1800000})).unwrap();
         let execution = Execution {
             recipe,
             settings_digest: digest(b"test settings"),
@@ -2684,6 +2922,7 @@ mod tests {
             history_read: false,
             domain_authorized: false,
             adaptive: Some((scheduler.clone(), packet.lease.clone())),
+            allow_replanning: true,
         };
         let ctx = ToolContext {
             task_id: contract.task_id,
@@ -2810,6 +3049,120 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "isolated Docker build with adaptive native CLI observation; no AI/provider"]
     async fn adaptive_native_build_records_real_source_bound_check_without_accepting_task() {
+        assert_native_build(adaptive_test(true)).await;
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "isolated Docker Cargo build; no AI/provider"]
+    async fn cargo_project_build_resolves_binary_without_a_source_file_named_after_it() {
+        assert_native_build(adaptive_test_for(
+            melissa_code_quality::protected::Language::RustCargo,
+        ))
+        .await;
+    }
+
+    #[test]
+    #[ignore = "requires locally generated cohort fixtures and the pinned SDK image; network disabled"]
+    fn protected_final_acceptance_of_offline_cohort_fixtures() {
+        let root = std::env::var_os("MELISSA_OFFLINE_FIXTURE_ROOT")
+            .map(std::path::PathBuf::from)
+            .expect("offline fixture root");
+        let fixture = adaptive_test(false);
+        let cancel = AtomicBool::new(false);
+        for name in ["small", "repository", "long-horizon", "large-rust"] {
+            let dir = root.join(format!("{name}-00"));
+            let recipe: crate::recipe::Recipe =
+                serde_json::from_slice(&fs::read(dir.join("recipe.private.json")).unwrap())
+                    .unwrap();
+            let repo = Repository::open(&dir.join("candidate"), Limits::default(), vec![]).unwrap();
+            let negative_repo =
+                Repository::open(&dir.join("negative"), Limits::default(), vec![]).unwrap();
+            let source = FrozenSource::capture(&repo, &cancel).unwrap();
+            let negative_source = FrozenSource::capture(&negative_repo, &cancel).unwrap();
+            let mut task = fixture.tools.root_contract.clone();
+            task.task_id = format!("task:offline-{name}");
+            task.input_snapshot_digest = source.snapshot().digest.clone();
+            task.acceptance_contract_digest = recipe.acceptance_digest().unwrap();
+            let execution = Execution {
+                recipe,
+                settings_digest: digest(b"offline validation"),
+                expires_at_ms: now().unwrap() + 300_000,
+                negative_files: BTreeMap::new(),
+                runtime_digest: None,
+            };
+            let mut store = fixture.tools.store.connect().unwrap();
+            store.journal_mut().create_task(&task).unwrap();
+            for state in [
+                TaskState::Planned,
+                TaskState::Queued,
+                TaskState::Leased,
+                TaskState::Running,
+            ] {
+                let version = store.journal().task(&task.task_id).unwrap().record.version;
+                store
+                    .transition_task(&task.task_id, version, state, None)
+                    .unwrap();
+            }
+            let mut negative_qa = qa(
+                store.connect().unwrap(),
+                &task,
+                &execution,
+                &format!("offline-negative-{name}"),
+                &negative_source.snapshot().digest,
+            )
+            .unwrap();
+            let negative = build_program(
+                &mut negative_qa,
+                &negative_source,
+                &negative_repo,
+                &execution.recipe,
+                &cancel,
+            )
+            .unwrap_or_else(|error| panic!("{name} negative build: {error}"));
+            let public = execution.recipe.development_selection(None).unwrap();
+            let mut public_qa = qa_for_suite(
+                store.connect().unwrap(),
+                &task,
+                &execution,
+                &format!("offline-public-{name}"),
+                &source.snapshot().digest,
+                public.digest(),
+            )
+            .unwrap();
+            let candidate =
+                build_program(&mut public_qa, &source, &repo, &execution.recipe, &cancel)
+                    .unwrap_or_else(|error| panic!("{name} candidate build: {error}"));
+            let public_receipt = public_qa
+                .verify(&source, &repo, &candidate, &negative, &public, &cancel)
+                .unwrap_or_else(|error| panic!("{name} public QA: {error}"));
+            public_qa.validate_receipt(&public_receipt).unwrap();
+
+            let final_suite = execution.recipe.suite().unwrap();
+            let mut final_qa = qa(
+                store.connect().unwrap(),
+                &task,
+                &execution,
+                &format!("offline-final-{name}"),
+                &source.snapshot().digest,
+            )
+            .unwrap();
+            let final_receipt = final_qa
+                .verify(&source, &repo, &candidate, &negative, &final_suite, &cancel)
+                .unwrap_or_else(|error| panic!("{name} final QA: {error}"));
+            final_qa.validate_receipt(&final_receipt).unwrap();
+            assert_eq!(public_receipt.passed(), 2);
+            assert_eq!(final_receipt.passed(), 6);
+            assert!(
+                store
+                    .journal()
+                    .model_requests(&task.task_id)
+                    .unwrap()
+                    .is_empty()
+            );
+            println!("{name}: independent native public 2/2 and final 6/6 with negative controls");
+        }
+    }
+
+    async fn assert_native_build(fixture: AdaptiveTest) {
         let AdaptiveTest {
             _temp,
             mut tools,
@@ -2817,7 +3170,7 @@ mod tests {
             packet,
             ctx,
             ..
-        } = adaptive_test(true);
+        } = fixture;
         tools.build = true;
         let repo = Arc::new(
             Repository::open(&_temp.path().join("source"), Limits::default(), vec![]).unwrap(),
@@ -2887,6 +3240,247 @@ mod tests {
                 .len(),
             0
         );
+    }
+    #[test]
+    fn read_only_test_specialist_binds_actual_cli_tools_after_writer_handoff() {
+        use crate::app::{WORKSPACE, Workspace};
+        use melissa_local_store::journal::{
+            ModelRequestState, ModelReservation, ModelSettlement, ModelUsage,
+        };
+        let AdaptiveTest {
+            _temp,
+            mut tools,
+            scheduler,
+            packet,
+            ..
+        } = adaptive_test(false);
+        let home = _temp.path().join("home");
+        App::init(&home).unwrap();
+        let app = App::open(&home).unwrap();
+        let root = _temp.path().join("source");
+        let snapshot = tools.repo.snapshot(&AtomicBool::new(false)).unwrap();
+        let workspace = Workspace {
+            schema_version: "melissa.cli-workspace/v1".into(),
+            root: root.to_str().unwrap().into(),
+            limits: Limits::default(),
+            explicit_excludes: vec![],
+            snapshot,
+            files: BTreeMap::new(),
+        };
+        let task = tools.task.clone();
+        let time = now().unwrap();
+        let version = tools.store.journal().task(&task).unwrap().record.version;
+        tools
+            .store
+            .journal_mut()
+            .reserve_model_request(
+                &ModelReservation {
+                    schema_version: "melissa.model-reservation/v1".into(),
+                    request_id: "offline-control".into(),
+                    task_id: task.clone(),
+                    profile_id: packet.node.profile.clone(),
+                    provider_id: "primary-fixture".into(),
+                    model_id: "offline-fixture".into(),
+                    request_digest: digest(b"offline fixture"),
+                    pricing_digest: Some(digest(b"no generation")),
+                    reserved_input_tokens: 1,
+                    reserved_output_tokens: 1,
+                    reserved_cost_micro_usd: 0,
+                    created_at_unix_ms: time,
+                },
+                version,
+            )
+            .unwrap();
+        tools
+            .store
+            .journal_mut()
+            .finish_model_request(
+                "offline-control",
+                0,
+                &ModelSettlement {
+                    state: ModelRequestState::NeverDispatched,
+                    usage: ModelUsage {
+                        input_tokens: Some(0),
+                        output_tokens: Some(0),
+                        cached_input_tokens: Some(0),
+                        cost_micro_usd: Some(0),
+                    },
+                    receipt_digest: Some(digest(b"never dispatched")),
+                    reason: Some("offline tool binding test".into()),
+                    completed_at_unix_ms: time,
+                },
+            )
+            .unwrap();
+        put(
+            &mut tools.store,
+            &task,
+            WORKSPACE,
+            "workspace",
+            &bytes(&workspace).unwrap(),
+        )
+        .unwrap();
+        let result = melissa_model_gateway::agent_loop::RunResult {
+            schema_version: "melissa.agent-run-result/v1".into(),
+            run_id: packet.lease.run.clone(),
+            task_id: task.clone(),
+            status: melissa_model_gateway::agent_loop::RunStatus::FinalCandidate,
+            answer: Some(
+                json!({"summary":"offline control","source_digest":workspace.snapshot.digest})
+                    .to_string(),
+            ),
+            request_ids: vec!["offline-control".into()],
+            tool_calls: 0,
+            artifact_refs: vec![],
+            requires_reconciliation: false,
+            task_accepted: false,
+        };
+        put(
+            &mut tools.store,
+            &task,
+            &format!("model-run:{}:result", packet.lease.run),
+            "offline.fixture-result",
+            &bytes(&result).unwrap(),
+        )
+        .unwrap();
+        scheduler
+            .lock()
+            .unwrap()
+            .complete_native(&packet.lease)
+            .unwrap();
+        let packet = scheduler
+            .lock()
+            .unwrap()
+            .acquire("step-1", "cli:fixture", 60000)
+            .unwrap();
+        let node = &packet.node;
+        let expires = now().unwrap() + 60000;
+        let repo = RepositoryDispatcher::new(
+            app.source(&workspace).unwrap(),
+            tools.store.connect().unwrap(),
+            RepositoryToolPolicy {
+                files: PatchPolicy {
+                    task_id: task.clone(),
+                    principal_id: "cli:operator".into(),
+                    profile_id: node.profile.clone(),
+                    resource_id: packet.parent_task.workspace_ref.clone(),
+                    authorization_ref: packet.parent_task.authorization_refs[0].clone(),
+                    expires_at_ms: expires,
+                    epoch: 1,
+                    writable_paths: Default::default(),
+                    protected_paths: Default::default(),
+                },
+                read_repository: true,
+                enabled_tools: repo_wires(&node.tools),
+            },
+        )
+        .unwrap()
+        .with_portable_patch_wire()
+        .unwrap();
+        let context = crate::context_bridge::runtime(
+            &app,
+            &tools.store,
+            &packet.parent_task,
+            &node.profile,
+            expires,
+            &node.tools,
+            true,
+        )
+        .unwrap();
+        let development = crate::development::DevelopmentTools::new(
+            &app,
+            &tools.store,
+            &packet.parent_task,
+            &node.profile,
+            expires,
+            &node.tools,
+            "main.py",
+            false,
+        )
+        .unwrap();
+        let mut store = tools.store.connect().unwrap();
+        tools.run = packet.lease.run.clone();
+        tools.profile = node.profile.clone();
+        tools.adaptive = Some((scheduler.clone(), packet.lease.clone()));
+        tools.tests = true;
+        tools.build = false;
+        tools.history_read = node.tools.contains("fs.read");
+        let foreign_history = ToolCall {
+            id: "outside-history".into(),
+            name: "history_read".into(),
+            arguments: json!({"artifact_ref":format!("context-history:old-run:{}", "a".repeat(64)),
+                "start_byte":0,"max_bytes":16})
+            .to_string(),
+        };
+        let error = tools.validate_call(&foreign_history).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Invalid);
+        assert!(error.to_string().contains("current specialist archives"));
+        let router = ToolRouter::new(vec![
+            Box::new(repo),
+            Box::new(tools),
+            Box::new(context),
+            Box::new(development),
+        ])
+        .unwrap();
+        let projected = crate::model_tools::ModelTools {
+            inner: Box::new(router),
+            profile: crate::model_tools::ToolProfile::Precision,
+            specialist: node.profile.clone(),
+            writes: false,
+            domain: false,
+        };
+        let dispatcher =
+            NodeDispatcher::new(scheduler, packet.clone(), Box::new(projected)).unwrap();
+        let catalog = resources::catalog().unwrap();
+        let profile = &catalog.profiles[&node.profile];
+        let (pins, registry, policy) = resources::skills(
+            &node.profile,
+            profile.tool_ids.iter().cloned().collect(),
+            packet.parent_task.allowed_effects.iter().cloned().collect(),
+        )
+        .unwrap();
+        let source = app.source(&workspace).unwrap();
+        let assembly = Assembly {
+            namespace: crate::project_memory::namespace(&source),
+            resource_id: &packet.parent_task.workspace_ref,
+            pins,
+            registry: &registry,
+            policy: &policy,
+            catalog: &catalog,
+            repo: &source,
+            context_tokens: 1_048_576,
+        };
+        let spec = RunSpec {
+            run_id: packet.lease.run.clone(),
+            task_id: task,
+            profile_id: node.profile.clone(),
+            user_message: serde_json::to_string(&packet).unwrap(),
+            route: RouteRequirements {
+                category: "coding".into(),
+                tools: true,
+                structured_output: true,
+                vision: false,
+                minimum_success_ppm: None,
+                maximum_p95_ms: None,
+            },
+            max_output_tokens: 393_216,
+            output_schema: Some(node.output_schema.clone()),
+            required_tool_names: BTreeSet::from(["submit_candidate".into()]),
+        };
+        assert!(
+            dispatcher
+                .definitions()
+                .iter()
+                .any(|d| d.definition.name == "code_tests")
+        );
+        assert!(
+            dispatcher
+                .definitions()
+                .iter()
+                .all(|d| d.definition.name != "code_project_check")
+        );
+        assembly
+            .bind(&mut store, &spec, &dispatcher.definitions())
+            .unwrap();
     }
     #[test]
     fn model_pool_routes_by_role_budget_context_and_pins_existing_lease() {
@@ -3013,7 +3607,7 @@ mod tests {
         let state = TurnCheckpoint {
             schema_version: "melissa.turn-checkpoint/v1".into(),
             binding_digest: digest(b"fixture exact continuation"),
-            phase: TurnPhase::Safe,
+            phase: melissa_model_gateway::continuation::Phase::Safe,
             next_turn: 0,
             messages: vec![],
             seen_calls: BTreeSet::new(),

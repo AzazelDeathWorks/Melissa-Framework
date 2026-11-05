@@ -524,11 +524,11 @@ impl OpenAiDecoder {
             "function_call" => {
                 let call_id = nonempty(value, "call_id")?.to_owned();
                 let name = nonempty(value, "name")?.to_owned();
-                if !wire_name(&name)
-                    || !self.call_ids.insert(call_id.clone())
-                    || self.call_ids.len() > self.limits.max_tool_calls
-                {
-                    return protocol("invalid or duplicate function call");
+                if !wire_name(&name) {
+                    return protocol("invalid function call name");
+                }
+                if !self.call_ids.insert(call_id.clone()) {
+                    return protocol("duplicate function call ID");
                 }
                 let arguments = string(value, "arguments")?.to_owned();
                 if arguments.len() > self.limits.max_argument_bytes {

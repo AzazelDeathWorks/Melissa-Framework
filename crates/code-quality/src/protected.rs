@@ -622,8 +622,9 @@ impl ProtectedQa {
         {
             return Err(Error::Stale("QA project source binding"));
         }
-        if !source.snapshot().files.iter().any(|f| f.path == spec.entry)
-            || source.bytes(&spec.entry)?.is_empty()
+        if spec.language != Language::RustCargo
+            && (!source.snapshot().files.iter().any(|f| f.path == spec.entry)
+                || source.bytes(&spec.entry)?.is_empty())
         {
             return Err(Error::Invalid("project entry"));
         }

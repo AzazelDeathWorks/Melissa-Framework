@@ -8,7 +8,7 @@ use crate::{
 use melissa_local_store::{LocalStore, StoreError};
 use melissa_model_gateway::{
     ErrorKind,
-    continuation::{ContinuationStore, Phase, TurnCheckpoint},
+    continuation::{ContinuationStore, TurnCheckpoint},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -140,7 +140,7 @@ impl ContinuationStore for RecoveryContinuation {
         }
         if let Some(e) = latest {
             checked(
-                e.native.phase == Phase::Safe,
+                e.native.phase.is_safe(),
                 ErrorKind::Store,
                 "pending inference/tools require inspection, never automatic replay",
             )?;

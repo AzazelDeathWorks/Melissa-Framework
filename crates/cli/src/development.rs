@@ -236,7 +236,8 @@ impl DevelopmentTools {
         let git_capture_allowed = app
             .workspace(store, &t.task_id)?
             .explicit_excludes
-            .is_empty();
+            .is_empty()
+            && melissa_repository::git::metadata_available(&repo);
         Ok(Self {
             code,
             repo,
@@ -285,7 +286,7 @@ impl DevelopmentTools {
         if !self.git_capture_allowed {
             return Err(GatewayError::new(
                 ErrorKind::Authorization,
-                "Git full capture is unavailable with explicit source exclusions; no excluded files were read",
+                "Git full capture requires ordinary in-root metadata and no explicit source exclusions",
             ));
         }
         let value = melissa_model_gateway::strict_json(&c.arguments)?;
@@ -348,7 +349,8 @@ impl ToolDispatcher for DevelopmentTools {
         if self.debug {
             d.push(BoundTool{canonical_id:"code.diagnostics".into(),definition:ToolDefinition{name:"code_debug_start".into(),description:"Start an isolated DAP session at selected source breakpoints (one-based lines) using the host-selected entry. Use code_debug_command with its session ID to inspect/step/close. No host attach or arbitrary evaluation.".into(),parameters:json!({"type":"object","properties":{"breakpoints":{"type":"array","minItems":1,"maxItems":64,"items":{"type":"object","properties":{"path":{"type":"string"},"line":{"type":"integer","minimum":1}},"required":["path","line"],"additionalProperties":false}}},"required":["breakpoints"],"additionalProperties":false}),strict:false}});
         }
-        if self.tools.contains("git.status")
+        if self.git_capture_allowed
+            && self.tools.contains("git.status")
             && self.task.allowed_effects.iter().any(|e| e == "git.read")
         {
             d.push(BoundTool{canonical_id:"git.status".into(),definition:ToolDefinition{name:"code_git".into(),description:"Scoped Git on a captured private copy: status, diff(staged), log(max_entries 1..1000), log_paths(max_entries 1..1000; records ranking evidence), worktree_list, worktree_create(name, exact commit). No commit/push/host changes, hooks or credentials. Worktree creation needs explicit role/write authority; output is a quarantined artifact. Re-captures source and metadata on each call.".into(),parameters:json!({"type":"object","properties":{"operation":{"type":"string","enum":["status","diff","log","log_paths","worktree_list","worktree_create"]},"staged":{"type":"boolean"},"max_entries":{"type":"integer","minimum":1,"maximum":1000},"name":{"type":"string"},"commit":{"type":"string"}},"required":["operation"],"additionalProperties":false}),strict:false}});

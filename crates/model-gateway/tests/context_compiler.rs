@@ -114,6 +114,49 @@ fn intelligent() -> ContextCompiler {
 }
 
 #[test]
+fn lab_compaction_control_keeps_native_history_and_capacity_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, task, _) = setup(dir.path());
+    let protocol = Protocol::OpenAiResponses;
+    let transport = HttpTransport::new(true).unwrap();
+    let origin = endpoint(protocol);
+    let mut control = intelligent().with_lab_controls(false, true);
+    assert_ne!(control.policy_id(), intelligent().policy_id());
+    let original = request(protocol, 28);
+    let (_, evidence) = control
+        .compile(
+            &mut original.clone(),
+            &transport,
+            &origin,
+            2_000_000,
+            &mut store,
+            &task,
+            "lab-control",
+            vec![],
+        )
+        .unwrap();
+    assert!(evidence.archived.is_empty());
+    assert_eq!(
+        evidence.intelligence.unwrap().stages["archiving"],
+        "disabled_for_lab"
+    );
+    assert!(
+        control
+            .compile(
+                &mut original.clone(),
+                &transport,
+                &origin,
+                1_025,
+                &mut store,
+                &task,
+                "lab-control",
+                vec![],
+            )
+            .is_err()
+    );
+}
+
+#[test]
 fn intelligence_preserves_both_native_protocols_and_reduces_long_working_views() {
     for protocol in [Protocol::OpenAiResponses, Protocol::AnthropicMessages] {
         let dir = tempfile::tempdir().unwrap();
@@ -1195,4 +1238,64 @@ fn registered_fixture_counters_are_protocol_bound_and_unknown_images_are_explici
     assert_eq!(req.messages, original);
     assert_eq!(report.capacity_check, "not_measured_multimodal");
     assert!(report.exact_token_count.is_none());
+}
+
+#[test]
+fn oversized_recent_tool_results_are_paged_without_reducing_output_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, task, profile) = setup(dir.path());
+    let protocol = Protocol::OpenAiResponses;
+    let mut request = request(protocol, 3);
+    let output_tokens = 393_216;
+    request.max_output_tokens = output_tokens;
+    for message in &mut request.messages {
+        if let Message::ToolResult { content, .. } = message {
+            *content = "compiler output\n".repeat(18_000);
+        }
+    }
+    let original = request.clone();
+    let mut compiler = intelligent();
+    let (wire, report) = compiler
+        .compile(
+            &mut request,
+            &HttpTransport::new(true).unwrap(),
+            &endpoint(protocol),
+            1_048_576,
+            &mut store,
+            &task,
+            "recent-rust-pressure",
+            vec![],
+        )
+        .unwrap();
+    assert_eq!(wire["max_output_tokens"], output_tokens);
+    assert_eq!(report.reserved_output_tokens, output_tokens);
+    assert!(!report.archived.is_empty());
+    for (before, after) in original.messages.iter().zip(&request.messages) {
+        if !matches!(before, Message::ToolResult { .. }) {
+            assert_eq!(before, after);
+        }
+    }
+    let record = &report.archived[0];
+    let page = read_history(
+        &store,
+        &ToolContext {
+            task_id: task.clone(),
+            profile_id: profile,
+            run_id: "recent-rust-pressure".into(),
+            request_id: "request".into(),
+            invocation_id: "history-page".into(),
+            attempt_id: "history-page:attempt".into(),
+            generation: 1,
+        },
+        &json!({"artifact_ref":record.artifact_ref,"start_byte":0,"max_bytes":16384}).to_string(),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let payload: Value = serde_json::from_str(&page.content).unwrap();
+    assert!(
+        "compiler output\n"
+            .repeat(18_000)
+            .starts_with(payload["content"].as_str().unwrap())
+    );
+    assert!(store.journal().model_requests(&task).unwrap().is_empty());
 }

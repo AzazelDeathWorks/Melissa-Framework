@@ -2,8 +2,14 @@
 //! from the native ledger. An oracle is trusted ONLY for the exact snapshot
 //! selected by the independent host, never a digest selected by model output.
 use crate::{Kind, Result, digest, error, plan::Mode, require};
-use melissa_core_contracts::wire::{ObservationStatus, TaskLimitsV1, ToolObservationV2};
-use melissa_local_store::{LocalStore, journal::ModelRequestState};
+use melissa_core_contracts::{
+    TaskState,
+    wire::{ObservationStatus, TaskLimitsV1, ToolObservationV2},
+};
+use melissa_local_store::{
+    LocalStore,
+    journal::{JournalEvent, ModelRequestRecord, ModelRequestState, StoredTask},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -62,6 +68,54 @@ pub fn settings(request: &Value) -> Result<String> {
     Ok(digest(&serde_json::to_vec(
         &json!({"model":b["model"],"context":request["configured_context_tokens"],"output":request["configured_max_output_tokens"],"max_output_tokens":b["max_output_tokens"],"reasoning":b["reasoning"],"temperature":b["temperature"],"top_p":b["top_p"],"protocol":request["protocol"],"endpoint":request["endpoint"],"output_mode":request["configured_output_mode"]}),
     )?))
+}
+
+/// Read only the request bound to the host's native dispatch ledger.
+pub fn authenticated_request(
+    store: &LocalStore,
+    task: &str,
+    record: &ModelRequestRecord,
+) -> Result<Vec<u8>> {
+    let reservation = &record.reservation;
+    require(
+        reservation.task_id == task,
+        Kind::Invalid,
+        "native request belongs to another task",
+    )?;
+    let raw = store.get_artifact(task, &format!("{}:request", reservation.request_id))?;
+    require(
+        digest(&raw) == reservation.request_digest,
+        Kind::Invalid,
+        "native request digest changed",
+    )?;
+    Ok(raw)
+}
+
+/// Laboratory outcomes consume the host's protected completion event.
+pub fn verified_task_outcome(task: &StoredTask, last: &JournalEvent) -> Result<Option<bool>> {
+    require(
+        last.task == *task && last.task_id == task.record.task_id,
+        Kind::Uncertain,
+        "task state does not match its final journal event",
+    )?;
+    if task.record.state != TaskState::Completed {
+        return Ok(task.record.state.is_terminal().then_some(false));
+    }
+    let proof = last
+        .completion_evidence
+        .as_ref()
+        .ok_or_else(|| error(Kind::Invalid, "protected completion evidence missing"))?;
+    require(
+        proof.task_id == task.record.task_id
+            && proof.protected_checks_passed
+            && proof.actual_tool_run
+            && proof.acceptance_digest == task.record.acceptance_digest
+            && proof.final_digest == proof.verified_digest
+            && task.record.final_artifact_digest.as_ref() == Some(&proof.verified_digest),
+        Kind::Invalid,
+        "protected completion identity differs",
+    )?;
+    Ok(Some(true))
 }
 pub struct AuditSpec {
     pub key: PairKey,
@@ -125,11 +179,10 @@ pub fn audit_trial(store: &LocalStore, task: &str, spec: AuditSpec) -> Result<Tr
             Kind::Invalid,
             "comparison changed model/provider",
         )?;
-        let raw = store.get_artifact(task, &format!("{}:request", r.reservation.request_id))?;
+        let raw = authenticated_request(store, task, r)?;
         let request: Value = serde_json::from_slice(&raw)?;
         require(
-            digest(&raw) == r.reservation.request_digest
-                && settings(&request)? == key.model_settings_digest,
+            settings(&request)? == key.model_settings_digest,
             Kind::Invalid,
             "comparison changed native request/capacity/sampling",
         )?;

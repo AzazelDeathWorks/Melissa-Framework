@@ -260,6 +260,7 @@ pub struct AnthropicDecoder {
     model: Option<String>,
     response_id: Option<String>,
     blocks: Vec<Value>,
+    call_ids: BTreeSet<String>,
     active: Option<ActiveBlock>,
     stop: Option<String>,
     finalizing: bool,
@@ -279,6 +280,7 @@ impl AnthropicDecoder {
             model: None,
             response_id: None,
             blocks: Vec::new(),
+            call_ids: BTreeSet::new(),
             active: None,
             stop: None,
             finalizing: false,
@@ -417,7 +419,7 @@ impl AnthropicDecoder {
             "redacted_thinking" => self.add_output_bytes(string(&raw, "data")?.len())?,
             "tool_use" => {
                 validate_client_origin(&raw)?;
-                bounded_identity(&raw, "id")?;
+                let id = bounded_identity(&raw, "id")?;
                 if !valid_tool_name(bounded_identity(&raw, "name")?) {
                     return Err(GatewayError::protocol(
                         "invalid Claude client tool wire name",
@@ -428,20 +430,7 @@ impl AnthropicDecoder {
                         "Claude client input must be an object",
                     ));
                 }
-                let count = self
-                    .blocks
-                    .iter()
-                    .filter(|block| block["type"] == "tool_use")
-                    .count();
-                if count >= self.limits.max_tool_calls {
-                    return Err(GatewayError::protocol("Claude client call count exceeded"));
-                }
-                let id = string(&raw, "id")?;
-                if self
-                    .blocks
-                    .iter()
-                    .any(|block| block["type"] == "tool_use" && block["id"] == id)
-                {
+                if !self.call_ids.insert(id.into()) {
                     return Err(GatewayError::protocol("duplicate Claude client call ID"));
                 }
                 let input_bytes = serde_json::to_vec(&raw["input"])

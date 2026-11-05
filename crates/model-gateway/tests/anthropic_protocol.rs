@@ -466,10 +466,6 @@ fn byte_argument_item_and_call_limits_fail_before_exposing_calls() {
             max_items: 0,
             ..DecoderLimits::default()
         },
-        DecoderLimits {
-            max_tool_calls: 0,
-            ..DecoderLimits::default()
-        },
     ] {
         let mut decoder = AnthropicDecoder::new("configured-claude", limits);
         let mut failed = false;
@@ -669,4 +665,23 @@ fn hosted_caller_toolsets_and_invalid_wire_names_cannot_disguise_client_tools() 
             .is_err()
         );
     }
+}
+
+#[test]
+fn large_claude_tool_batches_require_a_terminal_event_and_unique_ids() {
+    let mut events = vec![start()];
+    for index in 0..40 {
+        events.extend(block(
+            index,
+            json!({
+                "type":"tool_use","id":format!("toolu_batch_{index}"),
+                "name":"process_exec","input":{"argv":["check"]}
+            }),
+        ));
+    }
+    events.extend(terminal("tool_use", 60));
+    assert_eq!(decode(events.clone()).unwrap().calls.len(), 40);
+    assert!(decode(events[..events.len() - 1].to_vec()).is_err());
+    events[79]["content_block"]["id"] = json!("toolu_batch_0");
+    assert!(decode(events).is_err());
 }

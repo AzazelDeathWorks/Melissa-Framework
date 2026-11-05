@@ -65,7 +65,8 @@ impl NodeDispatcher {
         let mut names = BTreeSet::new();
         for d in inner.definitions() {
             require(
-                packet.node.tools.contains(&d.canonical_id) && names.insert(d.definition.name),
+                packet.node.tools.contains(&d.canonical_id)
+                    && names.insert(d.definition.name.clone()),
                 Kind::Authority,
                 "dispatcher exposes a tool outside exact node grant",
             )?;
@@ -75,13 +76,18 @@ impl NodeDispatcher {
                     "no reviewed workflow effect binding for tool",
                 )
             })?;
-            require(
-                needed
-                    .iter()
-                    .all(|e| packet.node.effects.iter().any(|v| v == e)),
-                Kind::Authority,
-                "tool effects exceed attenuated node authority",
-            )?;
+            if let Some(effect) = needed
+                .iter()
+                .find(|e| !packet.node.effects.iter().any(|value| value == **e))
+            {
+                return Err(error(
+                    Kind::Authority,
+                    &format!(
+                        "tool {} requires ungranted effect {effect}",
+                        d.definition.name
+                    ),
+                ));
+            }
         }
         Ok(Self {
             scheduler,

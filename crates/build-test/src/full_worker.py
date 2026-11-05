@@ -275,8 +275,15 @@ def python():
         return
     if operation in ("check", "lint", "format_check"):
         if operation == "check":
-            config = {"include": [os.path.relpath(ROOT / p, PRIVATE) for p in paths], "extraPaths": [str(ROOT / "src")],
-                      "exclude": [str(PRIVATE)], "typeCheckingMode": "strict", "pythonVersion": "3.13"}
+            config = {
+                "include": [os.path.relpath(ROOT / p, PRIVATE) for p in paths],
+                "executionEnvironments": [{
+                    "root": os.path.relpath(ROOT, PRIVATE),
+                    "extraPaths": [os.path.relpath(ROOT / "src", PRIVATE)],
+                }],
+                "typeCheckingMode": "strict",
+                "pythonVersion": "3.13",
+            }
             (PRIVATE / "pyrightconfig.json").write_text(json.dumps(config))
             item, stdout, _ = run("typecheck", [NODE, TOOLS + "/pyright/index.js", "--project", str(PRIVATE / "pyrightconfig.json"), "--outputjson"])
             result = json.loads(stdout)

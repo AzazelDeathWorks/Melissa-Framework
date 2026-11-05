@@ -76,7 +76,7 @@ impl App {
             Err(Error::Unavailable(_)) => {
                 let s = self.live(id)?;
                 if !s.active() {
-                    return Err(Error::Unavailable("Canlı log oturumu doğrulanamadı."));
+                    return Err(Error::Unavailable("CanlÄ± log oturumu doÄŸrulanamadÄ±."));
                 }
                 Ok(
                     json!({"command":"task logs","task_id":id,"events":s.events,"model_budget":s.model_budget,"live":true,"updated_at_ms":s.updated_at_ms}),
@@ -92,7 +92,7 @@ impl App {
         let r = self.source(&w)?;
         let current = r.snapshot(&AtomicBool::new(false))?;
         if view["current_digest"] != current.digest {
-            return Err(Error::Conflict("Diff okunurken kaynak değişti."));
+            return Err(Error::Conflict("Diff okunurken kaynak deÄŸiÅŸti."));
         }
         let changes = view["changes"].as_array_mut().ok_or(Error::Store)?;
         for change in changes {
@@ -118,7 +118,7 @@ impl App {
         let task = s.journal().task(id)?;
         if task.record.state != melissa_core_contracts::TaskState::Completed {
             return Err(Error::Conflict(
-                "Doğrulanmış son teslim yok; görev tamamlanmadı.",
+                "DoÄŸrulanmÄ±ÅŸ son teslim yok; gÃ¶rev tamamlanmadÄ±.",
             ));
         }
         let a = s
@@ -143,7 +143,7 @@ impl App {
             let parent = out.parent().ok_or(Error::Io)?;
             let _pin = Repository::open(parent, Limits::default(), vec![])?;
             fs::create_dir(&out).map_err(|_| {
-                Error::Conflict("Teslim klasörü var/yazılamıyor; üzerine yazılmaz.")
+                Error::Conflict("Teslim klasÃ¶rÃ¼ var/yazÄ±lamÄ±yor; Ã¼zerine yazÄ±lmaz.")
             })?;
             let _out_pin = Repository::open(&out, Limits::default(), vec![])?;
             for (path, bytes) in &package {
@@ -207,7 +207,7 @@ impl App {
         }
         if previews.is_empty() {
             return Err(Error::Unavailable(
-                "Bu tamamlanan görevde tarife bağlı frontend önizlemesi yok; API/DB kanıtları task evidence ile okunur.",
+                "Bu tamamlanan gÃ¶revde tarife baÄŸlÄ± frontend Ã¶nizlemesi yok; API/DB kanÄ±tlarÄ± task evidence ile okunur.",
             ));
         }
         previews.sort_by_key(|p| p["width"].as_u64().unwrap_or(0));
@@ -217,7 +217,7 @@ impl App {
             let _parent =
                 Repository::open(out.parent().ok_or(Error::Io)?, Limits::default(), vec![])?;
             fs::create_dir(&out).map_err(|_| {
-                Error::Conflict("Önizleme klasörü var/yazılamıyor; üzerine yazılmaz.")
+                Error::Conflict("Ã–nizleme klasÃ¶rÃ¼ var/yazÄ±lamÄ±yor; Ã¼zerine yazÄ±lmaz.")
             })?;
             let _pin = Repository::open(&out, Limits::default(), vec![])?;
             for (index, p) in previews.iter().enumerate() {
@@ -244,7 +244,7 @@ impl App {
     }
     pub async fn wait_task(&self, id: &str, timeout_ms: u64) -> Result<Value> {
         if timeout_ms == 0 || timeout_ms > 30000 {
-            return Err(Error::Usage("Bekleme 1..30000 ms olmalı."));
+            return Err(Error::Usage("Bekleme 1..30000 ms olmalÄ±."));
         }
         let end = std::time::Instant::now() + Duration::from_millis(timeout_ms);
         loop {
@@ -260,47 +260,128 @@ pub(crate) fn sdk_image_present() -> bool {
     image_present(melissa_code_quality::protected::SDK_IMAGE)
 }
 pub(crate) fn image_present(expected: &str) -> bool {
-    #[cfg(windows)]
-    let client = r"C:\Program Files\Docker\Docker\resources\bin\docker.exe";
-    #[cfg(not(windows))]
-    let client = "docker";
-    let Ok(config) = tempfile::tempdir() else {
-        return false;
-    };
-    let mut command = std::process::Command::new(client);
+    docker_probe(&["image", "inspect", expected, "--format", "{{.Id}}"])
+        .is_some_and(|actual| actual == expected)
+}
+
+#[cfg(windows)]
+fn docker_probe(arguments: &[&str]) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let config = tempfile::tempdir().ok()?;
+    let mut command = Command::new(r"C:\Program Files\Docker\Docker\resources\bin\docker.exe");
     command.env_clear();
     if let Some(root) = std::env::var_os("SystemRoot") {
         command.env("SystemRoot", root);
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
-    let image = command
+    let mut child = command
+        .creation_flags(0x08000000)
         .arg("--config")
         .arg(config.path())
-        .args([
-            "--host",
-            "npipe:////./pipe/dockerDesktopLinuxEngine",
-            "image",
-            "inspect",
-            expected,
-            "--format",
-            "{{.Id}}",
-        ])
-        .output()
-        .ok()
-        .filter(|r| r.status.success())
-        .map(|r| String::from_utf8_lossy(&r.stdout).trim().to_owned());
-    image.as_deref() == Some(expected)
+        .args(["--host", "npipe:////./pipe/dockerDesktopLinuxEngine"])
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return status
+                    .success()
+                    .then(|| child.wait_with_output().ok())
+                    .flatten()
+                    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+            }
+            Ok(None) if started.elapsed() < Duration::from_secs(8) => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
 }
+
+#[cfg(not(windows))]
+fn docker_probe(_: &[&str]) -> Option<String> {
+    None
+}
+
+fn readiness(windows_x64: bool, engine: Option<&str>, image: bool) -> Value {
+    let linux_engine = engine == Some("linux/amd64");
+    let (status, next_step) = if !windows_x64 {
+        (
+            "BLOCKED",
+            "Use the Windows x64 preview on a supported Windows host.",
+        )
+    } else if !linux_engine {
+        (
+            "BLOCKED",
+            "Install or start Docker Desktop with its Linux container engine and re-run doctor.",
+        )
+    } else if !image {
+        (
+            "BLOCKED",
+            "Load the verified SDK worker archive from the matching release and re-run doctor.",
+        )
+    } else {
+        (
+            "PASS",
+            "Run the bundled quickstart to prepare and inspect a local task.",
+        )
+    };
+    json!({
+        "status":status,
+        "supported_preview_host":windows_x64,
+        "docker_engine_platform":engine,
+        "docker_linux_amd64_ready":linux_engine,
+        "pinned_sdk_worker_ready":image,
+        "next_step":next_step
+    })
+}
+
 pub fn doctor() -> Result<Value> {
     let executable = std::env::current_exe()?;
-    let image = sdk_image_present();
-    let web_image = image_present(melissa_web_development::plan::WEB_IMAGE);
+    let engine = docker_probe(&["version", "--format", "{{.Server.Os}}/{{.Server.Arch}}"]);
+    let image = engine.as_deref() == Some("linux/amd64") && sdk_image_present();
+    let web_image = engine.as_deref() == Some("linux/amd64")
+        && image_present(melissa_web_development::plan::WEB_IMAGE);
     let c = crate::resources::catalog()?;
-    Ok(
-        json!({"command":"doctor","host":std::env::consts::OS,"architecture":std::env::consts::ARCH,"binary_digest":digest(&fs::read(executable)?),"profiles":c.profiles.len(),"workers":c.workers.len(),"runtime_definitions":"bundled_and_validated_no_historical_evidence_claim","DPAPI":cfg!(windows),"isolated_SDK_image_present":image,"isolated_web_API_DB_image_present":web_image,"model_probe":"NOT_RUN","credential_read":false,"Tauri":false}),
-    )
+    Ok(json!({
+        "command":"doctor","source_commit":option_env!("MELISSA_BUILD_COMMIT"),"host":std::env::consts::OS,"architecture":std::env::consts::ARCH,
+        "binary_digest":digest(&fs::read(executable)?),"profiles":c.profiles.len(),"workers":c.workers.len(),
+        "runtime_definitions":"bundled_and_validated_no_historical_evidence_claim","DPAPI":cfg!(windows),
+        "isolated_SDK_image_present":image,"isolated_SDK_image_id":melissa_code_quality::protected::SDK_IMAGE,
+        "isolated_web_API_DB_image_present":web_image,"model_probe":"NOT_RUN","credential_read":false,"Tauri":false,
+        "release_readiness":readiness(cfg!(all(windows, target_arch = "x86_64")), engine.as_deref(), image)
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::readiness;
+
+    #[test]
+    fn release_doctor_identifies_host_engine_and_worker_in_order() {
+        assert_eq!(
+            readiness(false, Some("linux/amd64"), true)["status"],
+            "BLOCKED"
+        );
+        assert_eq!(readiness(true, None, false)["status"], "BLOCKED");
+        assert_eq!(
+            readiness(true, Some("windows/amd64"), false)["status"],
+            "BLOCKED"
+        );
+        assert_eq!(
+            readiness(true, Some("linux/amd64"), false)["status"],
+            "BLOCKED"
+        );
+        assert_eq!(readiness(true, Some("linux/amd64"), true)["status"], "PASS");
+    }
 }

@@ -577,6 +577,6 @@ impl RecoveryHook for RecoverySession {
                 "Stop the repeated action and report the concrete blocker. No success or silent budget reset is permitted."
             }
         };
-        Ok(RecoveryDirective{continue_run:proceed,feedback:json!({"status":"recovery_required","kind":event.kind,"diagnostic":event.diagnostic,"instruction":instruction,"continue_run":proceed,"reason":next.reason,"evidence_artifact":id,"task_accepted":false}).to_string()})
+        Ok(RecoveryDirective{continue_run:proceed,feedback:json!({"status":"recovery_required","kind":event.kind,"diagnostic":event.diagnostic,"instruction":instruction,"continue_run":proceed,"reason":next.reason,"operator_evidence_recorded":true,"task_accepted":false}).to_string()})
     }
 }

@@ -41,6 +41,14 @@ pub struct GitPlan {
     pub atomic_source_snapshot: bool,
     pub configuration_scope: String,
 }
+/// Only ordinary, in-root Git metadata has a supported private capture path.
+pub fn metadata_available(repo: &Repository) -> bool {
+    let git = repo.root_path().join(".git");
+    let Ok(_pin) = paths::pin(&git, true, false) else {
+        return false;
+    };
+    paths::pin(&git.join("HEAD"), false, false).is_ok()
+}
 impl GitPlan {
     pub fn prepare(
         repo: &Repository,

@@ -86,6 +86,7 @@ pub fn runtime(
     profile: &str,
     expires: u64,
     enabled: &std::collections::BTreeSet<String>,
+    persist_repository_index: bool,
 ) -> Result<ContextBridge> {
     let catalog = crate::resources::catalog()?;
     let repo = Arc::new(app.source(&app.workspace(store, &t.task_id)?)?);
@@ -133,7 +134,7 @@ pub fn runtime(
         &[],
     )
     .map_err(|_| Error::Store)?;
-    if enabled.contains("fs.search") {
+    if persist_repository_index && enabled.contains("fs.search") {
         let project = namespace(&repo).project;
         let id = project.strip_prefix("blake3:").ok_or(Error::Store)?;
         let path = app.home.join("projects").join(id).join("repository-index");

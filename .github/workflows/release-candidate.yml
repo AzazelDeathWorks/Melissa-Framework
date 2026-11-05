@@ -1,0 +1,69 @@
+name: Windows preview package
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/release-candidate.yml'
+      - 'crates/**'
+      - 'scripts/release/**'
+      - 'docs/QUICKSTART_WINDOWS.md'
+      - 'SECURITY.md'
+      - 'Cargo.lock'
+
+permissions:
+  contents: read
+
+jobs:
+  package-windows:
+    runs-on: windows-2025
+    env:
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Build and package the exact checkout
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:MELISSA_BUILD_COMMIT = git rev-parse HEAD
+          cargo +1.98.0 build --locked --release -p melissa-cli
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\scripts\release\package-windows.ps1 -BinaryPath .\target\release\melissa.exe -OutputRoot (Join-Path $env:RUNNER_TEMP 'melissa-package')
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: melissa-windows-x64-preview
+          path: ${{ runner.temp }}/melissa-package
+          if-no-files-found: error
+
+  smoke-windows-package:
+    runs-on: windows-2025
+    needs: package-windows
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: melissa-windows-x64-preview
+          path: ${{ runner.temp }}/melissa-download
+      - name: Verify and use the ZIP on a fresh Windows runner
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'melissa-download'
+          $entries = @(Get-ChildItem -LiteralPath $root -Filter '*.zip' -File)
+          if ($entries.Count -ne 1) { throw 'Expected one preview ZIP.' }
+          $zip = $entries[0]
+          $hashLine = Get-Content -LiteralPath (Join-Path $root 'SHA256SUMS.txt') -Raw
+          $hash = (Get-FileHash -LiteralPath $zip.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hashLine.Trim() -ne "$hash  $($zip.Name)") { throw 'Package digest mismatch.' }
+          $install = Join-Path $env:RUNNER_TEMP 'melissa-installed'
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath $install
+          $manifest = Get-Content -LiteralPath (Join-Path $install 'release-manifest.json') -Raw | ConvertFrom-Json
+          if ($manifest.source_commit -ne $env:GITHUB_SHA) { throw 'Package is from another commit.' }
+          $binary = Join-Path $install 'melissa.exe'
+          if ((Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.executable_sha256) {
+              throw 'Executable digest mismatch.'
+          }
+          $version = & $binary --version
+          if ($LASTEXITCODE -ne 0 -or $version -ne "melissa $($manifest.version)") { throw 'Unexpected CLI version.' }
+          & (Join-Path $install 'quickstart.ps1') -OutputRoot (Join-Path $env:RUNNER_TEMP 'melissa-offline-demo')
