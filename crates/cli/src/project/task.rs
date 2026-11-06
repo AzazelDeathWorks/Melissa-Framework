@@ -188,8 +188,32 @@ impl App {
         operation: &str,
         command: Option<super::Command>,
     ) -> Result<Value> {
+        self.run_project_operation_dispatch(id, operation, command, None)
+            .await
+    }
+    pub async fn run_project_verification(
+        &self,
+        id: &str,
+        request: crate::project_verification::runner::Request,
+        reproduce: bool,
+    ) -> Result<Value> {
+        self.run_project_operation_dispatch(
+            id,
+            if reproduce { "reproduce" } else { "verify" },
+            None,
+            Some(request),
+        )
+        .await
+    }
+    async fn run_project_operation_dispatch(
+        &self,
+        id: &str,
+        operation: &str,
+        command: Option<super::Command>,
+        verification: Option<crate::project_verification::runner::Request>,
+    ) -> Result<Value> {
         let result = self
-            .run_project_operation_inner(id, operation, command)
+            .run_project_operation_inner(id, operation, command, verification)
             .await;
         if result.is_err()
             && let Ok(mut store) = self.store(id)
@@ -217,6 +241,7 @@ impl App {
         id: &str,
         operation: &str,
         command: Option<super::Command>,
+        verification: Option<crate::project_verification::runner::Request>,
     ) -> Result<Value> {
         use melissa_core_contracts::TaskState;
         use std::sync::{Arc, atomic::AtomicBool};
@@ -230,10 +255,20 @@ impl App {
             .project
             .as_ref()
             .ok_or(Error::Denied("Bu işlem genel proje sözleşmesi gerektirir."))?;
-        if !["exec", "sync", "preflight"].contains(&operation) {
+        if !["exec", "sync", "preflight"].contains(&operation)
+            && !(verification.is_some() && ["verify", "reproduce"].contains(&operation))
+        {
             return Err(Error::Usage("project exec|sync|preflight gerekli."));
         }
-        if task.record.state != TaskState::Queued || crate::app::now()? >= e.expires_at_ms {
+        let resumed_validation = verification.is_some()
+            && task.record.state == TaskState::Running
+            && self
+                .live(id)
+                .is_ok_and(|s| s.phase == "paused" && !s.active())
+            && crate::engine::native_stop_proven(&store, id)?;
+        if (task.record.state != TaskState::Queued && !resumed_validation)
+            || crate::app::now()? >= e.expires_at_ms
+        {
             return Err(Error::Conflict(
                 "Operatör komutu henüz başlamamış, onaylı proje görevi gerektirir.",
             ));
@@ -251,7 +286,9 @@ impl App {
         }
         let workspace = self.workspace(&store, id)?;
         let repo = self.source(&workspace)?;
-        repo.validate_snapshot(&workspace.snapshot, &AtomicBool::new(false))?;
+        if !resumed_validation {
+            repo.validate_snapshot(&workspace.snapshot, &AtomicBool::new(false))?;
+        }
         let command = command.unwrap_or(super::Command {
             executable: "/bin/true".into(),
             argv: vec![],
@@ -288,38 +325,83 @@ impl App {
                 "Seçilen proje image'i yerelde yok; süreç/API çağrısı başlatılmadı.",
             ));
         }
-        let leased = store.transition_task(id, task.record.version, TaskState::Leased, None)?;
-        store.transition_task(id, leased.record.version, TaskState::Running, None)?;
+        if !resumed_validation {
+            let leased = store.transition_task(id, task.record.version, TaskState::Leased, None)?;
+            store.transition_task(id, leased.record.version, TaskState::Running, None)?;
+        }
         let cancel = Arc::new(AtomicBool::new(false));
         let pause = Arc::new(AtomicBool::new(false));
         let control = crate::control::Control::new(self, id, cancel.clone(), pause.clone())?;
         let mut runtime =
             super::runtime::Runtime::new(self, id, &profile, project.clone(), e.expires_at_ms)?;
-        let sid = runtime.start(
-            self,
-            &store,
-            &repo,
-            command,
-            "",
-            cancel.clone(),
-            operation == "preflight",
-            operation == "sync",
-        )?;
-        let result = loop {
-            control.poll()?;
-            if pause.load(std::sync::atomic::Ordering::Acquire) {
-                let _ = self.project_input(id, &sid, "operator-pause", "cancel", "");
+        let verification_mode = verification.is_some();
+        let (sid, result) = if let Some(request) = verification {
+            let mut runner = crate::project_verification::runner::Runner {
+                home: self.home.clone(),
+                task: id.into(),
+                profile: profile.clone(),
+                contract: project.clone(),
+                expires: e.expires_at_ms,
+                store: store.connect()?,
+                final_check: false,
+            };
+            let invocation = format!("operator-validation:{}", crate::app::nonce()?);
+            let inner_cancel = Arc::new(AtomicBool::new(false));
+            let native_signal = inner_cancel.clone();
+            let reproduce = operation == "reproduce";
+            control.publish(
+                "agent",
+                json!({"task_id":id}),
+                json!({"operation":operation}),
+                json!({}),
+                json!({}),
+            )?;
+            let job = tokio::task::spawn_blocking(move || {
+                runner.run(request, reproduce, &invocation, inner_cancel)
+            });
+            while !job.is_finished() {
+                control.poll()?;
+                if pause.load(std::sync::atomic::Ordering::Acquire)
+                    || cancel.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    native_signal.store(true, std::sync::atomic::Ordering::Release);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-            let state = store.journal().task(id)?;
-            control.publish("agent",json!({"state":state.record.state,"version":state.record.version,"goal":state.contract.goal,"task_id":id}),json!({"project_session":sid}),serde_json::to_value(store.journal().model_budget(id)?).map_err(|_|Error::Store)?,json!({"total":store.journal().events(id)?.len()}))?;
-            let poll = self.project_poll(id, &sid, 0, 1)?;
-            if !matches!(
-                poll["state"]["phase"].as_str(),
-                Some("preparing" | "running")
-            ) {
-                break poll["state"]["result"].clone();
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            (
+                String::new(),
+                job.await.map_err(|_| {
+                    Error::Reconciliation("Doğrulama sahibi kesildi; intent kaydını incele.")
+                })??,
+            )
+        } else {
+            let sid = runtime.start(
+                self,
+                &store,
+                &repo,
+                command,
+                "",
+                cancel.clone(),
+                operation == "preflight",
+                operation == "sync",
+            )?;
+            let result = loop {
+                control.poll()?;
+                if pause.load(std::sync::atomic::Ordering::Acquire) {
+                    let _ = self.project_input(id, &sid, "operator-pause", "cancel", "");
+                }
+                let state = store.journal().task(id)?;
+                control.publish("agent",json!({"state":state.record.state,"version":state.record.version,"goal":state.contract.goal,"task_id":id}),json!({"project_session":sid}),serde_json::to_value(store.journal().model_budget(id)?).map_err(|_|Error::Store)?,json!({"total":store.journal().events(id)?.len()}))?;
+                let poll = self.project_poll(id, &sid, 0, 1)?;
+                if !matches!(
+                    poll["state"]["phase"].as_str(),
+                    Some("preparing" | "running")
+                ) {
+                    break poll["state"]["result"].clone();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            };
+            (sid, result)
         };
         runtime.close()?;
         if !crate::engine::native_stop_proven(&store, id)? {
@@ -341,12 +423,12 @@ impl App {
                 store.transition_task(id, t.record.version, TaskState::Cancelled, None)?;
             control.publish("cancelled",json!({"task_id":id,"state":cancelled.record.state,"version":cancelled.record.version,"goal":t.contract.goal}),json!({"project_session":sid}),serde_json::to_value(store.journal().model_budget(id)?).map_err(|_|Error::Store)?,json!({"total":store.journal().events(id)?.len()}))?;
             return Ok(
-                json!({"command":format!("project {operation}"),"task_id":id,"session_id":sid,"result":result,"state":"cancelled","model_calls":0,"task_accepted":false}),
+                json!({"command":format!("project {operation}"),"task_id":id,"session_id":if verification_mode{Value::Null}else{json!(sid)},"result":result,"state":"cancelled","model_calls":0,"task_accepted":false}),
             );
         }
         control.publish("paused",json!({"task_id":id,"state":t.record.state,"version":t.record.version,"goal":t.contract.goal}),json!({"project_session":sid}),serde_json::to_value(store.journal().model_budget(id)?).map_err(|_|Error::Store)?,json!({"total":store.journal().events(id)?.len()}))?;
         Ok(
-            json!({"command":format!("project {operation}"),"task_id":id,"session_id":sid,"result":result,"state":"paused","resume":"task resume","model_calls":0,"task_accepted":false}),
+            json!({"command":format!("project {operation}"),"task_id":id,"session_id":if verification_mode{Value::Null}else{json!(sid)},"result":result,"state":"paused","resume":"task resume","model_calls":0,"task_accepted":false}),
         )
     }
 }
@@ -391,6 +473,43 @@ pub fn verify(
     expires: u64,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<Value> {
+    if contract.verification.is_some() {
+        source
+            .current(repo, &cancel)
+            .map_err(|_| Error::Conflict("Son doğrulama öncesi kaynak değişti."))?;
+        let mut runner = crate::project_verification::runner::Runner {
+            home: app.home.clone(),
+            task: task.task_id.clone(),
+            profile: "melissa.code.test-engineer".into(),
+            contract: contract.clone(),
+            expires,
+            store: store.connect()?,
+            final_check: true,
+        };
+        let result = runner.run(
+            Default::default(),
+            false,
+            &format!("host-final:{}", crate::app::nonce()?),
+            cancel.clone(),
+        )?;
+        source
+            .current(repo, &cancel)
+            .map_err(|_| Error::Conflict("Son doğrulama sırasında kaynak değişti."))?;
+        if result["outcome"] != "PASS" || result["all_required_checks_selected"] != true {
+            return Err(Error::Verification(
+                "Son proje doğrulaması geçmedi; fail/flaky/skip/belirsiz kayıtlar korunur.",
+            ));
+        }
+        let receipt = json!({"schema_version":"melissa.project-verification/v1","acceptance_kind":"host_source_bound_project_checks","source_digest":source.snapshot().digest,"environment_digest":contract.environment.fingerprint()?,"checks":result["checks"],"validation_receipt":result["receipt_id"],"private_oracle":false,"feature_coverage":"not_proven_by_public_checks_alone","release_acceptance":false});
+        crate::app::put(
+            store,
+            &task.task_id,
+            &format!("cli:project-verification:{}", crate::app::nonce()?),
+            "project.verification",
+            &bytes(&receipt)?,
+        )?;
+        return Ok(receipt);
+    }
     let mut runtime = super::runtime::Runtime::new(
         app,
         &task.task_id,

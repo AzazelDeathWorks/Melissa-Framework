@@ -21,6 +21,13 @@ pub struct Options {
 pub const DOMAIN_HELP: &str = "\nWeb/API/veritabanı (v2 özel tarif):\n  melissa task preview ID [--out NEW_DIRECTORY]\n  melissa task evidence ID [--artifact ARTIFACT_ID --out NEW_FILE]\n\nYerel tarayıcı/API/SQLite/PostgreSQL akışları sabit image üzerinde çalışır. Public development ve private final testleri ayrıdır. Preview kaynağa bağlı PNG ihracıdır; kalıcı web sunucusu açmaz.\n";
 #[derive(Debug)]
 pub enum Command {
+    Verification {
+        action: String,
+        id: Option<String>,
+        workspace: Option<PathBuf>,
+        path: Option<PathBuf>,
+        request: String,
+    },
     RepositoryInspect {
         action: String,
         workspace: PathBuf,
@@ -190,6 +197,48 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options> {
         "init" => Command::Init,
         "profiles" => Command::Profiles,
         "doctor" => Command::Doctor,
+        "verification" => {
+            let action = text(a.next().ok_or(Error::Usage(
+                "verification configure|show|verify|reproduce gerekli.",
+            ))?)?;
+            if !["configure", "show", "verify", "reproduce"].contains(&action.as_str()) {
+                return Err(Error::Usage("Bilinmeyen verification işlemi."));
+            }
+            let id = if ["verify", "reproduce"].contains(&action.as_str()) {
+                Some(text(
+                    a.next().ok_or(Error::Usage("Görev kimliği gerekli."))?,
+                )?)
+            } else {
+                None
+            };
+            let allowed: &[&str] = match action.as_str() {
+                "show" => &["--workspace"],
+                "configure" => &["--workspace", "--path"],
+                _ => &["--request-json"],
+            };
+            let mut f = flags(&mut a, allowed)?;
+            let workspace = f.remove("--workspace").map(PathBuf::from);
+            let path = f.remove("--path").map(PathBuf::from);
+            let request = f
+                .remove("--request-json")
+                .map(text)
+                .transpose()?
+                .unwrap_or_else(|| "{}".into());
+            if (id.is_none() && workspace.is_none())
+                || (action == "configure" && path.is_none())
+                || (id.is_some() && (workspace.is_some() || path.is_some()))
+                || (action == "show" && path.is_some())
+            {
+                return Err(Error::Usage("Verification seçenekleri işlemle eşleşmiyor."));
+            }
+            Command::Verification {
+                action,
+                id,
+                workspace,
+                path,
+                request,
+            }
+        }
         "repository" => {
             let action = text(a.next().ok_or(Error::Usage(
                 "repository impact-map|structural-patch --workspace PATH --query JSON gerekli.",
@@ -538,3 +587,5 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options> {
 }
 
 pub const REPOSITORY_HELP: &str = "\nDepo analizi (model/API çağırmaz):\n  melissa --json repository impact-map|structural-patch --workspace PATH --query JSON_FILE\n  Belgeler: docs/REPOSITORY_SCALE_TR.md\n";
+
+pub const VERIFICATION_HELP: &str = "\nProje doğrulama (model/API çağırmaz):\n  melissa --json verification configure --workspace PATH --path JSON_FILE\n  melissa --json verification show --workspace PATH\n  melissa --json verification reproduce TASK [--request-json JSON]\n  melissa --json verification verify TASK [--request-json JSON]\n  scripts/verify-change.ps1 ve scripts/reproduce-failure.ps1\n  Belgeler: docs/VERIFICATION_TR.md; sonuç PASS değilse çıkış kodu 7.\n";

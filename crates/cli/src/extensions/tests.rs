@@ -28,6 +28,7 @@ fn python(code: &str) -> Command {
 }
 fn contract(bundle: Bundle) -> Contract {
     Contract {
+        verification: None,
         extensions: Some(bundle),
         environment: Environment::default(),
         checks: BTreeMap::from([("test".into(), python("pass"))]),

@@ -10,6 +10,7 @@ name = "melissa"
 path = "src/main.rs"
 
 [dependencies]
+melissa-verification = { path = "../verification" }
 melissa-core-contracts = { path = "../core-contracts" }
 melissa-local-store = { path = "../local-store" }
 melissa-repository = { path = "../repository" }

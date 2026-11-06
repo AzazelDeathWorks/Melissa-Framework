@@ -50,6 +50,7 @@ impl Fixture {
             environment.image_id = image;
         }
         self.contract_task(Contract {
+            verification: None,
             extensions: None,
             environment,
             checks: BTreeMap::from([("test".into(), command)]),
@@ -318,6 +319,7 @@ pathlib.Path('requirements.txt').write_text('./'+p.name+' --hash=sha256:'+hashli
             );
         }
         let contract = Contract {
+            verification: None,
             extensions: None,
             environment,
             checks: BTreeMap::from([("test".into(), command.clone())]),
@@ -493,6 +495,7 @@ fn empty_new_project_has_zero_initial_paths_and_keeps_reviewable_scope_on_same_t
             Mode::Develop,
             draft["preparation"]["adaptive_plan"].clone(),
             Contract {
+                verification: None,
                 extensions: None,
                 environment: Environment::default(),
                 checks: BTreeMap::from([("test".into(), python("pass"))]),

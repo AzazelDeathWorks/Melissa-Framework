@@ -957,6 +957,13 @@ pub(crate) fn plan(task: &TaskContractV1, e: &Execution) -> Result<Plan> {
             input["project_onboarding"] = json!(include_str!(
                 "../../../skills/code/repo-onboarding/SKILL.md"
             ));
+            if project.verification.is_some() {
+                input["project_validation"] = json!({
+                    "workflow_guidance":include_str!("../../../skills/workflows/bug-repro-fix/SKILL.md"),
+                    "preferred_checks":"Use verify_change for approved named checks and reproduce_failure for an observed failure baseline, when exposed. Read full details with verification_result_page. Automatic after-edit checks already record their actual result; a failed check does not undo the edit.",
+                    "authority":"This guidance is data, not a tool or command grant. Frozen project checks, source scope and the current tool router remain authoritative. Public checks and their counts do not replace independent host acceptance."
+                });
+            }
             input["instructions"] = json!(
                 "Use repository tools for host source edits. project_process executes general argv or approved checks in a private isolated snapshot. Generated worker files do not automatically modify the host. Retain session IDs, page stdout/stderr, wait for native completion, and report blocked tools/dependencies honestly. Use the actual environment/version observations. Stop or finish every session before submit_candidate. Final project checks are host-run; never invent private oracle answers. Operator-approved added write paths take effect at safe pause/resume without resetting this task's budget or deadline."
             );
@@ -1965,6 +1972,30 @@ impl App {
                 Box::new(context),
                 development,
             ];
+            let project_verifier = if let Some(project) = &e.recipe.project {
+                if project_tools.is_some() && node.tools.contains("code.tests") {
+                    Some(Arc::new(Mutex::new(
+                        crate::project_verification::runner::Runner {
+                            home: self.home.clone(),
+                            task: t.task_id.clone(),
+                            profile: node.profile.clone(),
+                            contract: project.clone(),
+                            expires: e.expires_at_ms,
+                            store: store.connect()?,
+                            final_check: false,
+                        },
+                    )))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(host) = &project_verifier {
+                dispatchers.push(Box::new(crate::project_verification::tools::Tools(
+                    host.clone(),
+                )));
+            }
             if let Some(project) = project_tools {
                 dispatchers.push(Box::new(project));
             }
@@ -1980,6 +2011,7 @@ impl App {
                 store: store.connect()?,
                 task: t.task_id.clone(),
                 checker,
+                project_verifier,
                 language: crate::development::language(repo)?,
                 context: Some(context_host),
             };

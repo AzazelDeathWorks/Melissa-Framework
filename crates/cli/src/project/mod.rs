@@ -124,6 +124,8 @@ impl Environment {
 #[serde(deny_unknown_fields)]
 pub struct Contract {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<crate::project_verification::Spec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extensions: Option<crate::extensions::Bundle>,
     pub environment: Environment,
     pub checks: BTreeMap<String, Command>,
@@ -140,6 +142,9 @@ impl Contract {
     }
     pub fn validate(&self) -> Result {
         self.environment.validate()?;
+        if let Some(v) = &self.verification {
+            v.validate(&self.checks)?;
+        }
         if let Some(extensions) = &self.extensions {
             extensions.validate()?;
         }

@@ -36,6 +36,35 @@ async fn run(options: &args::Options) -> Result<Value> {
     }
     let app = App::open(&home)?;
     match &options.command {
+        Command::Verification {
+            action,
+            id,
+            workspace,
+            path,
+            request,
+        } => match action.as_str() {
+            "configure" => melissa_cli::project_verification::settings::configure(
+                &app,
+                workspace.as_ref().unwrap(),
+                path.as_ref().unwrap(),
+            ),
+            "show" => Ok(
+                json!({"verification":melissa_cli::project_verification::settings::load(&app,workspace.as_ref().unwrap())?}),
+            ),
+            _ => {
+                app.run_project_verification(
+                    id.as_ref().unwrap(),
+                    serde_json::from_value(
+                        melissa_model_gateway::strict_json(request).map_err(|_| {
+                            melissa_cli::Error::Usage("Verification JSON geçersiz.")
+                        })?,
+                    )
+                    .map_err(|_| melissa_cli::Error::Usage("Verification isteği geçersiz."))?,
+                    action == "reproduce",
+                )
+                .await
+            }
+        },
         Command::RepositoryInspect {
             action,
             workspace,
@@ -197,6 +226,7 @@ async fn main() {
         println!("{}", args::CAPABILITIES_HELP);
         println!("{}", args::METRICS_HELP);
         println!("{}", args::REPOSITORY_HELP);
+        println!("{}", args::VERIFICATION_HELP);
         return;
     }
     if matches!(options.command, Command::Version) {
@@ -210,7 +240,14 @@ async fn main() {
         } else {
             display::human(&value)
         } {
-            Ok(text) => println!("{text}"),
+            Ok(text) => {
+                println!("{text}");
+                if matches!(&options.command, Command::Verification { action, .. } if action == "verify" || action == "reproduce")
+                    && value["result"]["operation_status"] != "PASS"
+                {
+                    std::process::exit(7);
+                }
+            }
             Err(e) => {
                 eprintln!("{e}");
                 std::process::exit(4);

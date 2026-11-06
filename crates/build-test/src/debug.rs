@@ -2,7 +2,7 @@
 //! already admitted private process; they cannot choose adapters or attach PIDs.
 use crate::{
     Error, Result,
-    full::{Language, put, validate_source},
+    full::{Language, put},
     hex, toolchain,
 };
 use melissa_container_executor::{ContainerLimits, ContainerRequest, Conversation, Snapshot};
@@ -28,6 +28,54 @@ use std::{
     time::{Duration, Instant},
 };
 const DRIVER: &str = include_str!("debug_worker.py");
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Launch {
+    pub language: Language,
+    pub entry: String,
+    pub cwd: String,
+    #[serde(default)]
+    pub argv: Vec<String>,
+    #[serde(default)]
+    pub tsconfig: Option<String>,
+}
+impl Launch {
+    pub fn validate(&self) -> Result {
+        fn path(p: &str) -> bool {
+            !p.is_empty()
+                && !p.starts_with('/')
+                && !p.contains(['\\', ':', '\0'])
+                && p.split('/').all(|c| !c.is_empty() && c != "." && c != "..")
+        }
+        if !path(&self.entry)
+            || (self.cwd != "." && !path(&self.cwd))
+            || self.argv.len() > 1024
+            || self
+                .argv
+                .iter()
+                .any(|a| a.len() > 65536 || a.contains('\0'))
+            || self
+                .tsconfig
+                .as_ref()
+                .is_some_and(|p| !path(p) || !p.ends_with(".json"))
+        {
+            return Err(Error::Invalid("reviewed debug launch paths/arguments"));
+        }
+        if self.tsconfig.is_some() && self.language != Language::TypeScript {
+            return Err(Error::Invalid("tsconfig requires TypeScript debug"));
+        }
+        Ok(())
+    }
+}
+/// Trusted host environment, bound to the project contract and native permit.
+#[derive(Clone)]
+pub struct Project {
+    pub launch: Launch,
+    pub image_id: String,
+    pub executables: BTreeMap<String, String>,
+    pub versions: BTreeMap<String, String>,
+    pub rust_version: Option<String>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Breakpoint {
@@ -117,10 +165,55 @@ impl DebugPlan {
         limits: ContainerLimits,
         cancel: &AtomicBool,
     ) -> Result<Self> {
+        Self::prepare_with_launch(
+            repo,
+            source,
+            language,
+            entry,
+            breakpoints,
+            expected_binary_sha256,
+            limits,
+            cancel,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_with_launch(
+        repo: &Repository,
+        source: &RepositorySnapshot,
+        language: Language,
+        entry: String,
+        breakpoints: Vec<Breakpoint>,
+        expected_binary_sha256: Option<String>,
+        limits: ContainerLimits,
+        cancel: &AtomicBool,
+        project: Option<&Project>,
+    ) -> Result<Self> {
+        let launch = project.map(|p| &p.launch);
         let mut snapshot = repo
             .worker_input_with_budget(source, cancel, limits.disk_bytes)?
             .snapshot;
-        validate_source(&snapshot)?;
+        if snapshot.files.keys().any(|p| {
+            p.split('/').any(|c| {
+                c.starts_with(".melissa-code06")
+                    || matches!(c, ".cargo" | "rust-toolchain" | "rust-toolchain.toml")
+            })
+        }) {
+            return Err(Error::Invalid("debug SDK override/reserved adapter path"));
+        }
+        if let Some(l) = launch {
+            l.validate()?;
+            if l.language != language || l.entry != entry {
+                return Err(Error::Invalid(
+                    "debug launch differs from reviewed operation",
+                ));
+            }
+            if let Some(p) = &l.tsconfig
+                && !snapshot.files.contains_key(p)
+            {
+                return Err(Error::Invalid("debug tsconfig outside snapshot"));
+            }
+        }
         if !snapshot.files.contains_key(&entry) {
             return Err(Error::Invalid("debug entry absent from captured source"));
         }
@@ -140,12 +233,22 @@ impl DebugPlan {
                 "expected debug binary SHA256 required in lowercase hex",
             ));
         }
-        let options = crate::full::compiler_contract(&snapshot, language)?;
+        let options = if launch.is_some() {
+            json!({})
+        } else {
+            crate::full::compiler_contract(&snapshot, language)?
+        };
         let program = json!({"schema_version":"melissa.debug-program/v1","language":language.wire(),"entry":entry,"breakpoints":breakpoints,"expected_binary_sha256":expected_binary_sha256,"source_digest":source.digest,"source_manifest_version":melissa_container_executor::source_manifest::VERSION,"sources":melissa_container_executor::source_manifest::seal(&snapshot),"compiler_options":options,"trace_limit":limits.output_bytes});
-        snapshot.files.insert(
-            ".melissa-code06-debug/program.json".into(),
-            serde_json::to_vec(&program)?,
-        );
+        snapshot
+            .files
+            .insert(".melissa-code06-debug/program.json".into(), {
+                let mut program = program;
+                program["launch"] = serde_json::to_value(launch)?;
+                program["executables"] = json!(project.map(|p| &p.executables));
+                program["versions"] = json!(project.map(|p| &p.versions));
+                program["rust_version"] = json!(project.and_then(|p| p.rust_version.as_ref()));
+                serde_json::to_vec(&program)?
+            });
         snapshot.files.insert(
             ".melissa-code06-debug/driver.py".into(),
             [
@@ -160,7 +263,8 @@ impl DebugPlan {
             .map_err(|_| Error::Invalid("debug snapshot envelope"))?;
         let request = ContainerRequest {
             schema_version: "melissa.container-exec/v1".into(),
-            image_id: toolchain::COMPLETE_IMAGE.into(),
+            image_id: project
+                .map_or_else(|| toolchain::COMPLETE_IMAGE.into(), |p| p.image_id.clone()),
             executable: "/usr/bin/python3".into(),
             argv: vec![
                 "-I".into(),

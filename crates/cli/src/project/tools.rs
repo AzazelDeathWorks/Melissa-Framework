@@ -293,7 +293,14 @@ impl ToolDispatcher for ProjectTools {
 pub struct NavigationOnly(pub Box<dyn ToolDispatcher>);
 impl NavigationOnly {
     fn allowed(name: &str) -> bool {
-        matches!(name, "code_semantic" | "code_git" | "code_result_page")
+        matches!(
+            name,
+            "code_semantic"
+                | "code_git"
+                | "code_result_page"
+                | "code_debug_start"
+                | "code_debug_command"
+        )
     }
 }
 impl ToolDispatcher for NavigationOnly {

@@ -366,12 +366,28 @@ impl Discovery {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect()
         });
-        let c = Contract {
+        let mut c = Contract {
+            verification: None,
             extensions: None,
             environment,
             checks,
             sync: self.sync.clone(),
         };
+        let mut spec = crate::project_verification::Spec::default();
+        for name in c.checks.keys() {
+            let kind = crate::project_verification::check(&c, name);
+            if matches!(
+                kind.kind,
+                crate::project_verification::Kind::Type
+                    | crate::project_verification::Kind::Lint
+                    | crate::project_verification::Kind::Format
+                    | crate::project_verification::Kind::Syntax
+            ) {
+                spec.after_edit.push(name.clone());
+            }
+            spec.checks.insert(name.clone(), kind);
+        }
+        c.verification = Some(spec);
         c.validate()?;
         Ok(c)
     }

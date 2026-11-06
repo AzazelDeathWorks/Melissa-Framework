@@ -343,3 +343,5 @@ Test kayıtları özel geliştirme klasöründe tutulur. Eski başarısız denem
 silinmez; son test sonucu onları geçmişte başarılı olmuş gibi değiştirmez.
 Bu sürüm için yeni canlı model, büyük depo karşılaştırması, temiz Windows,
 dağıtım ZIP'i veya public yayın kabulü iddia edilmez.
+
+Proje kontrolleri, erken doğrulama, gerçek proje debug ayarı ve hata tekrar üretimi: [doğrulama rehberi](VERIFICATION_TR.md).

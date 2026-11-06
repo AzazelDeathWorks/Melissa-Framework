@@ -116,6 +116,7 @@ pub(crate) struct Host {
     session_context: Option<ToolContext>,
     active_cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     results: BTreeMap<String, CodeOperation>,
+    debug_project: Option<crate::debug::Project>,
 }
 pub struct CodeDispatcher {
     host: Arc<Mutex<Host>>,
@@ -633,7 +634,7 @@ impl Host {
                 breakpoints,
                 expected_binary_sha256,
             } => {
-                let plan = DebugPlan::prepare(
+                let plan = DebugPlan::prepare_with_launch(
                     &self.repo,
                     &source,
                     *language,
@@ -642,6 +643,7 @@ impl Host {
                     expected_binary_sha256.clone(),
                     self.policy.limits.clone(),
                     &cancel,
+                    self.debug_project.as_ref(),
                 )?;
                 let (b, p) = self.broker(&op, plan.request(), plan.snapshot())?;
                 *self.active_cancel.lock().map_err(|_| denied())? = Some(cancel.clone());
@@ -692,6 +694,15 @@ pub(crate) fn token() -> Result<String> {
     Ok(blake3::hash(&b).to_hex().to_string())
 }
 impl CodeDispatcher {
+    pub fn with_project_debug(self, project: crate::debug::Project) -> Result<Self> {
+        project.launch.validate()?;
+        {
+            let mut host = self.host.lock().map_err(|_| denied())?;
+            if !host.policy.operations.values().any(|op|matches!(op,CodeOperation::Debug {language,entry,..} if *language==project.launch.language && *entry==project.launch.entry)){return Err(denied());}
+            host.debug_project = Some(project);
+        }
+        Ok(self)
+    }
     /// Trusted-host finite query registration. Existing result paging remains
     /// available; callers cannot register a raw command or change authority.
     pub fn bind_query(&mut self, name: &str, operation: CodeOperation) -> Result {
@@ -779,6 +790,7 @@ impl CodeDispatcher {
             session_context: None,
             active_cancel: active_cancel.clone(),
             results: BTreeMap::new(),
+            debug_project: None,
         };
         for op in h.policy.operations.values() {
             h.authority(op)?;

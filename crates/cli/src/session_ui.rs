@@ -59,6 +59,10 @@ pub(super) const COMMANDS: &[(&str, &str)] = &[
     ),
     ("/help", "Komutlar ve kısayollar"),
     ("/doctor", "Windows ve Docker hazırlığı"),
+    (
+        "/verification",
+        "[DOSYA] · proje kontrol/debug tercihi; yeni görevler için",
+    ),
     ("/skills", "Kullanıcı/proje skill kataloğu ve sabit pinler"),
     (
         "/skill-import",

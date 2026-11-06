@@ -109,3 +109,5 @@ mod telemetry;
 mod verification;
 
 pub mod repository_inspect;
+
+pub mod project_verification;

@@ -164,3 +164,5 @@ Komut davranışlarının resmi kaynakları: [mise exec](https://mise.jdx.dev/cl
 [rustup override](https://rust-lang.github.io/rustup/overrides.html),
 [npm ci](https://docs.npmjs.com/cli/v11/commands/npm-ci/),
 [Corepack packageManager](https://github.com/nodejs/corepack).
+
+Proje kontrolleri, erken doğrulama, gerçek proje debug ayarı ve hata tekrar üretimi: [doğrulama rehberi](VERIFICATION_TR.md).

@@ -21,8 +21,10 @@ ROOT = Path.cwd().resolve()
 PRIVATE = ROOT / ".melissa-code06-debug"
 TARGET = ROOT / ".melissa-code06-target"
 P = json.loads((PRIVATE / "program.json").read_bytes())
-NODE = "/opt/node/bin/node"
-PY = "/opt/melissa-python/bin/python"
+EXECUTABLES = P.get("executables") or {}
+LAUNCH = P.get("launch") or {"cwd":".", "argv":[], "tsconfig":None}
+NODE = EXECUTABLES.get("node", "/opt/node/bin/node")
+PY = EXECUTABLES.get("python", "/opt/melissa-python/bin/python")
 trace = (PRIVATE / "dap-transcript.ndjson").open("wb")
 trace_lock = threading.Lock()
 trace_bytes = 0
@@ -236,11 +238,20 @@ class Session:
 
     def build(self):
         language = P["language"]
+        tool = {"python":"python","javascript":"node","typescript":"node","rust":"rust"}[language]
+        required = (P.get("versions") or {}).get(tool)
+        if required:
+            executable = {"python":PY,"node":NODE,"rust":EXECUTABLES.get("rustc","/usr/local/cargo/bin/rustc")}[tool]
+            command = [executable,*(["+"+P["rust_version"]] if tool=="rust" and P.get("rust_version") else []),"--version"]
+            observed = subprocess.run(command,stdin=subprocess.DEVNULL,capture_output=True,timeout=30)
+            match = re.search(rb"\d+\.\d+(?:\.\d+)?(?:-[A-Za-z0-9.]+)?", observed.stdout+observed.stderr)
+            if observed.returncode or not match or match.group().decode().split('.')[:len(required.split('.'))] != required.split('.'):
+                raise DebugError("runtime_version_mismatch","selected debug runtime does not match reviewed project version; explicit image executable selection required")
         entry = ROOT / P["entry"]
         self.check_file(P["entry"])
         if language == "rust":
-            command = ["/usr/local/cargo/bin/cargo", "build", "--locked", "--offline", "--target-dir", str(TARGET), "--message-format=json"]
-            compiled = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True)
+            command = [EXECUTABLES.get("cargo", "/usr/local/cargo/bin/cargo"), *(["+"+P["rust_version"]] if P.get("rust_version") else []), "build", "--locked", "--offline", "--target-dir", str(TARGET), "--message-format=json"]
+            compiled = subprocess.run(command, cwd=ROOT / LAUNCH["cwd"], stdin=subprocess.DEVNULL, capture_output=True)
             (PRIVATE / "build.stdout").write_bytes(compiled.stdout)
             (PRIVATE / "build.stderr").write_bytes(compiled.stderr)
             if compiled.returncode:
@@ -265,7 +276,11 @@ class Session:
             config["compilerOptions"].update(sourceMap=True, inlineSources=True, noEmit=False,
                                               rootDir=str(ROOT), outDir=str(TARGET))
             (PRIVATE / "tsconfig.json").write_text(json.dumps(config))
-            compiled = subprocess.run([NODE, "/opt/melissa-tools/node_modules/typescript/bin/tsc", "-p", str(PRIVATE / "tsconfig.json")], capture_output=True)
+            tsconfig = LAUNCH.get("tsconfig")
+            command = [NODE, "/opt/melissa-tools/node_modules/typescript/bin/tsc", "-p", str(ROOT / tsconfig if tsconfig else PRIVATE / "tsconfig.json")]
+            if tsconfig:
+                command += ["--sourceMap", "true", "--inlineSources", "true", "--noEmit", "false", "--rootDir", str(ROOT), "--outDir", str(TARGET)]
+            compiled = subprocess.run(command, cwd=ROOT / LAUNCH["cwd"], capture_output=True)
             (PRIVATE / "build.stdout").write_bytes(compiled.stdout)
             (PRIVATE / "build.stderr").write_bytes(compiled.stderr)
             if compiled.returncode:
@@ -289,13 +304,13 @@ class Session:
             self.dap = Dap(child.stdout, child.stdin, child)
             adapter = "python"
             launch = {"name": "owned Python", "type": "python", "request": "launch", "program": str(entry),
-                      "python": [PY, "-Xfrozen_modules=off"], "cwd": str(ROOT), "console": "internalConsole",
+                      "python": [PY, "-Xfrozen_modules=off"], "cwd": str(ROOT / LAUNCH["cwd"]), "console": "internalConsole",
                       "justMyCode": False, "subProcess": False}
         elif language == "rust":
             child = process(["/usr/bin/lldb-dap-19"])
             self.dap = Dap(child.stdout, child.stdin, child)
             adapter = "lldb"
-            launch = {"program": str(entry), "cwd": str(ROOT), "stopOnEntry": False, "disableASLR": False,
+            launch = {"program": str(entry), "cwd": str(ROOT / LAUNCH["cwd"]), "stopOnEntry": False, "disableASLR": False,
                       "initCommands": ["settings set target.disable-aslr false"]}
         else:
             server = process([NODE, "/opt/js-debug/src/dapDebugServer.js", "0", "127.0.0.1"], stdin=subprocess.DEVNULL)
@@ -316,10 +331,11 @@ class Session:
             self.dap = Dap(stream, stream, server, self.js_child)
             adapter = "pwa-node"
             launch = {"name": "owned Node", "type": "pwa-node", "request": "launch", "program": str(entry),
-                "runtimeExecutable": NODE, "cwd": str(ROOT), "console": "internalConsole", "stopOnEntry": True,
-                "sourceMaps": True, "outFiles": [str(TARGET / "**/*.js")], "resolveSourceMapLocations": [str(TARGET / "**"), "!**/node_modules/**"],
+                "runtimeExecutable": NODE, "cwd": str(ROOT / LAUNCH["cwd"]), "console": "internalConsole", "stopOnEntry": True,
+                "sourceMaps": True, "outFiles": [str(TARGET / "**/*.js"), str(ROOT / "**/*.js")], "resolveSourceMapLocations": [str(ROOT / "**"), "!**/node_modules/**"],
                 "autoAttachChildProcesses": False, "skipFiles": ["<node_internals>/**"]}
             self.js_launch = launch
+        launch["args"] = LAUNCH["argv"]
         self.root_dap = self.dap
         self.dap.initialize(adapter)
         sequence = self.dap.send({"type": "request", "command": "launch", "arguments": launch})

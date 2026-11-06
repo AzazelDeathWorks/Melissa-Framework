@@ -25,6 +25,7 @@ const HELP: &str = "Bir görev yaz veya aşağıdaki komutları kullan.\n\
   /scope-approve ÖZET      Gösterilen hazırlık kapsamını kabul et\n\
   /pause  /cancel         Güvenli duraklatma veya iptal iste\n\
   /doctor                 Windows ve Docker hazırlığını kontrol et\n\
+  /verification [DOSYA]   Proje kontrol/debug tercihini göster veya yeni görevlere ayarla\n\
   /config DOSYA           Özel model ayarlarını içe aktar\n\
   /acceptance DOSYA       Proje dışındaki kabul tarifini seç\n\
   /plan                   Son hazırlığı veya görev planını göster\n\
@@ -154,6 +155,14 @@ impl Session {
                 self.app.import_skill(&path_argument(path)?, None)?
             }
             ("/doctor", "") => crate::views::doctor()?,
+            ("/verification", "") => {
+                serde_json::json!({"verification":crate::project_verification::settings::load(&self.app,&self.workspace)?})
+            }
+            ("/verification", path) => crate::project_verification::settings::configure(
+                &self.app,
+                &self.workspace,
+                Path::new(path),
+            )?,
             ("/project-doctor", "") => self
                 .app
                 .project_doctor(&self.workspace, self.environment.clone())?,
@@ -440,7 +449,7 @@ impl Session {
             let repo =
                 melissa_repository::Repository::open(&self.workspace, Default::default(), vec![])?;
             let discovery = crate::project::discovery::discover(&repo)?;
-            let contract = if self.extra_checks.is_empty() {
+            let mut contract = if self.extra_checks.is_empty() {
                 discovery.contract(self.environment.clone())?
             } else {
                 discovery.contract_with_checks(
@@ -448,6 +457,12 @@ impl Session {
                     Some(self.extra_checks.clone()),
                 )?
             };
+            if let Some(spec) =
+                crate::project_verification::settings::load(&self.app, &self.workspace)?
+            {
+                spec.validate(&contract.checks)?;
+                contract.verification = Some(spec);
+            }
             self.app.create_project(
                 &self.workspace,
                 &draft.goal,
