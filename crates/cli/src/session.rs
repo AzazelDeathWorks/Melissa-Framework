@@ -25,6 +25,8 @@ const HELP: &str = "Bir görev yaz veya aşağıdaki komutları kullan.\n\
   /scope-approve ÖZET      Gösterilen hazırlık kapsamını kabul et\n\
   /pause  /cancel         Güvenli duraklatma veya iptal iste\n\
   /doctor                 Windows ve Docker hazırlığını kontrol et\n\
+  /checkpoints · /changes · /checkpoint ETIKET · /undo-preview JSON · /undo JSON\n\
+  /adopt-preview · /adopt-source DIGEST   Değişmiş kaynağı açık incele\n\
   /services [DOSYA]       Yeni görevler için servis/API/DB tercihleri\n\
   /verification [DOSYA]   Proje kontrol/debug tercihini göster veya yeni görevlere ayarla\n\
   /config DOSYA           Özel model ayarlarını içe aktar\n\
@@ -324,6 +326,34 @@ impl Session {
             }
             ("/plan", "") if self.task.is_none() => return self.show_draft(output),
             ("/plan", "") => self.app.conversation_view(&self.task()?.id)?,
+            ("/checkpoints", "") | ("/continuity", "") => self.app.continuity(&self.task()?.id)?,
+            ("/changes", "") => crate::continuity::undo::changes(&self.app, &self.task()?.id)?,
+            ("/checkpoint", label) => self.app.checkpoint(&self.task()?.id, label)?,
+            ("/adopt-preview", "") => self.app.adopt_preview(&self.task()?.id)?,
+            ("/adopt-source", digest) => self.app.adopt_source(&self.task()?.id, digest)?,
+            ("/undo-preview", input) => {
+                let request = serde_json::from_value(
+                    melissa_model_gateway::strict_json(input)
+                        .map_err(|_| Error::Usage("Geri alma JSON geçersiz."))?,
+                )
+                .map_err(|_| Error::Usage("Geri alma seçimi geçersiz."))?;
+                self.app.undo_preview(&self.task()?.id, request)?
+            }
+            ("/undo", input) => {
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Input {
+                    selection: crate::continuity::undo::Request,
+                    digest: String,
+                }
+                let request: Input = serde_json::from_value(
+                    melissa_model_gateway::strict_json(input)
+                        .map_err(|_| Error::Usage("Geri alma JSON geçersiz."))?,
+                )
+                .map_err(|_| Error::Usage("Geri alma incelemesi geçersiz."))?;
+                self.app
+                    .undo(&self.task()?.id, request.selection, &request.digest)?
+            }
             ("/status", "") => {
                 let id = &self.task()?.id;
                 let mut result = self.app.progress(id)?;

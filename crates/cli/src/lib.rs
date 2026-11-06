@@ -5,6 +5,7 @@ pub mod args;
 #[cfg(all(test, windows))]
 mod capabilities_tests;
 pub mod context_bridge;
+pub mod continuity;
 pub mod control;
 pub mod conversation;
 pub mod development;

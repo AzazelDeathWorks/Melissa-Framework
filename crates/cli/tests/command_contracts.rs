@@ -206,3 +206,93 @@ fn terminal_control_and_bidi_are_escaped_without_changing_json_data() {
     assert!(!human.contains('\u{1b}') && !human.contains('\u{202e}'));
     assert!(human.contains("\\u{a}"));
 }
+
+#[test]
+fn continuity_review_commands_require_explicit_selections_and_cannot_alias_execution() {
+    for action in ["continuity", "checkpoints", "changes", "adopt-preview"] {
+        assert!(matches!(
+            parse(&["task", action, "task_a"]).unwrap().command,
+            Command::Continuity { .. }
+        ));
+        assert!(parse(&["task", action, "task_a", "--execute", "yes"]).is_err());
+    }
+    for args in [
+        vec![
+            "task",
+            "checkpoint",
+            "task_a",
+            "--label",
+            "review before refactor",
+        ],
+        vec![
+            "task",
+            "undo-preview",
+            "task_a",
+            "--request-json",
+            r#"{"turn_request":"request_a"}"#,
+        ],
+        vec![
+            "task",
+            "undo",
+            "task_a",
+            "--request-json",
+            r#"{"turn_request":"request_a"}"#,
+            "--digest",
+            "review",
+        ],
+        vec!["task", "adopt-source", "task_a", "--digest", "review"],
+    ] {
+        assert!(matches!(
+            parse(&args).unwrap().command,
+            Command::Continuity { .. }
+        ));
+    }
+    for args in [
+        vec!["task", "checkpoint", "task_a"],
+        vec!["task", "undo-preview", "task_a"],
+        vec!["task", "undo", "task_a", "--request-json", "{}"],
+        vec!["task", "adopt-source", "task_a"],
+        vec![
+            "task",
+            "undo",
+            "task_a",
+            "--request-json",
+            "{}",
+            "--digest",
+            "a",
+            "--digest",
+            "b",
+        ],
+        vec![
+            "task",
+            "undo",
+            "task_a",
+            "--request-json",
+            "{}",
+            "--digest",
+            "a",
+            "--force",
+            "yes",
+        ],
+    ] {
+        assert!(parse(&args).is_err());
+    }
+}
+
+#[test]
+fn terminal_continuity_shows_checkpoint_freshness_and_remaining_work_without_hiding_unknown_state()
+{
+    let value = json!({"command":"task continuity","task_id":"task_a","state":"running","last_control_phase":"paused","source_digest":"source","settled":false,"checkpoints":[{"id":"cp_a","label":"before edit","source_current":false}],"remaining_milestones":[{"id":"test","profile":"melissa.code.test-engineer","state":"pending"}],"model_budget":{"active_requests":0,"unknown_requests":1,"known_cost_micro_usd":0}});
+    let shown = display::human(&value).unwrap();
+    assert!(
+        shown.contains("Checkpoint: 1")
+            && shown.contains("cp_a")
+            && shown.contains("eski veya bilinmiyor")
+    );
+    assert!(
+        shown.contains("Kalan uzman adımı: 1")
+            && shown.contains("test-engineer")
+            && shown.contains("1 belirsiz")
+    );
+    assert!(shown.contains("uzlaştırılmış: false"));
+}

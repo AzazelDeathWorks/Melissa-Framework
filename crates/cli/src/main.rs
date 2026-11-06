@@ -36,6 +36,31 @@ async fn run(options: &args::Options) -> Result<Value> {
     }
     let app = App::open(&home)?;
     match &options.command {
+        Command::Continuity {
+            id,
+            action,
+            request,
+            digest,
+            label,
+        } => match action.as_str() {
+            "continuity" | "checkpoints" => app.continuity(id),
+            "changes" => melissa_cli::continuity::undo::changes(&app, id),
+            "checkpoint" => app.checkpoint(id, label.as_ref().unwrap()),
+            "adopt-preview" => app.adopt_preview(id),
+            "adopt-source" => app.adopt_source(id, digest.as_ref().unwrap()),
+            _ => {
+                let selection = serde_json::from_value(
+                    melissa_model_gateway::strict_json(request.as_ref().unwrap())
+                        .map_err(|_| melissa_cli::Error::Usage("Geri alma JSON geçersiz."))?,
+                )
+                .map_err(|_| melissa_cli::Error::Usage("Geri alma seçimi geçersiz."))?;
+                if action == "undo-preview" {
+                    app.undo_preview(id, selection)
+                } else {
+                    app.undo(id, selection, digest.as_ref().unwrap())
+                }
+            }
+        },
         Command::Services {
             action,
             id,
@@ -271,6 +296,7 @@ async fn main() {
         println!("{}", args::REPOSITORY_HELP);
         println!("{}", args::VERIFICATION_HELP);
         println!("{}", args::SERVICES_HELP);
+        println!("{}", args::CONTINUITY_HELP);
         return;
     }
     if matches!(options.command, Command::Version) {
@@ -288,6 +314,11 @@ async fn main() {
                 println!("{text}");
                 if matches!(&options.command, Command::Verification { action, .. } if action == "verify" || action == "reproduce")
                     && value["result"]["operation_status"] != "PASS"
+                {
+                    std::process::exit(7);
+                }
+                if matches!(&options.command,Command::Continuity{action,..} if action=="undo")
+                    && value["outcome"] != "PASS"
                 {
                     std::process::exit(7);
                 }

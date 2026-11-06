@@ -12,6 +12,7 @@ pub mod discovery;
 #[cfg(windows)]
 mod file_journal;
 pub mod git;
+pub mod git_context;
 pub mod graph;
 pub mod impact;
 pub mod patch;

@@ -50,6 +50,12 @@ impl App {
                         v["supervisor"] = s.supervisor().map_err(|_| Error::Store)?;
                         serde_json::to_value(s.state().map_err(|_| Error::Store)?)
                             .map_err(|_| Error::Store)?
+                    } else if s
+                        .list_artifacts(id)?
+                        .iter()
+                        .any(|a| a.logical_type == "workflow.state")
+                    {
+                        return Err(Error::Store);
                     } else {
                         json!({"plan":p,"execution_started":false})
                     };

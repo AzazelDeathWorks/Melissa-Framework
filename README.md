@@ -21,7 +21,8 @@ korunur; derlenen CLI'ya dahil edilmez. Masaüstü arayüzü bu kapsamda yoktur.
 - Gerçek dil sunucusu sorguları ve dosya değişikliğinden sonra erken kontroller.
 - Kaynak envanterine dayalı, incelenebilir doğal dil görev taslakları.
 - Build/test/lint, sahip olunan hata ayıklama oturumu ve izole Git işlemleri.
-- Kalıcı oturum geçmişi, devam etme ve kalan adımları yeniden planlama.
+- Kalıcı oturum geçmişi, kaynak bağlı checkpoint, kalan adımlar ve onaylı yeniden planlama.
+- Türlü proje belleği, başarısız yaklaşım geçmişi ve kullanıcı değişikliğini koruyan seçili/tur geri alma.
 - Göreve göre sıralı uzman seçimi, kaynak sürümüne bağlı devir ve yürütücünün doğruladığı model plan önerileri.
 
 Desteklenen diller, çalışma sınırları ve komutlar:
@@ -67,3 +68,5 @@ Proje kontrolleri, erken doğrulama, gerçek proje debug ayarı ve hata tekrar �
 Göreve ait servisler, API sözleşmesi ve ayrı DB migration provası: [servis rehberi](docs/SERVICES_TR.md).
 
 Frontend/browser verification: [source-bound previews, accessibility and accepted visual regression](docs/FRONTEND_VERIFY_TR.md).
+
+Bellek türleri, checkpoint, değişmiş kaynağı inceleyerek devam ve native dosya geri alma: [süreklilik rehberi](docs/CONTINUITY_TR.md).

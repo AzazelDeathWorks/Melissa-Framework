@@ -111,6 +111,45 @@ pub enum MemoryStatus {
     Superseded,
     Deleted,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryKind {
+    ProjectDecision,
+    UserPreference,
+    TransientState,
+    FailureExperience,
+    Unclassified,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryMetadata {
+    pub kind: MemoryKind,
+    pub created_at_ms: u64,
+    pub task_id: String,
+    pub git: melissa_repository::git_context::GitContext,
+    pub expires_at_ms: Option<u64>,
+}
+impl MemoryMetadata {
+    pub fn withheld(
+        &self,
+        task: &str,
+        git: &melissa_repository::git_context::GitContext,
+        time: u64,
+    ) -> Option<&'static str> {
+        if self.expires_at_ms.is_some_and(|until| time >= until) {
+            return Some("expired");
+        }
+        if self.kind == MemoryKind::TransientState && self.task_id != task {
+            return Some("different_task");
+        }
+        if self.kind != MemoryKind::UserPreference
+            && (self.git.scope_key().is_none() || self.git.scope_key() != git.scope_key())
+        {
+            return Some("branch_unknown_or_changed");
+        }
+        None
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Memory {
@@ -122,6 +161,8 @@ pub struct Memory {
     pub sources: Vec<crate::retrieval::SourceRef>,
     pub status: MemoryStatus,
     pub review_evidence_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<MemoryMetadata>,
 }
 fn memory_review_digest(record: &Memory) -> Result<String> {
     // Re-observation renews freshness without changing the proposed fact.
@@ -203,8 +244,22 @@ struct MemoryView<'a, S: Serialize> {
     sources: S,
     status: MemoryStatus,
     review_evidence_ref: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<&'a MemoryMetadata>,
 }
 impl Memory {
+    fn operator_reviewed_preference(&self) -> bool {
+        self.status == MemoryStatus::Accepted
+            && self
+                .metadata
+                .as_ref()
+                .is_some_and(|m| m.kind == MemoryKind::UserPreference)
+            && self
+                .review_evidence_ref
+                .as_ref()
+                .is_some_and(|r| r.starts_with("project-review:"))
+    }
+
     fn view(&self) -> MemoryView<'_, &[crate::retrieval::SourceRef]> {
         MemoryView {
             id: &self.id,
@@ -214,6 +269,7 @@ impl Memory {
             sources: &self.sources,
             status: self.status,
             review_evidence_ref: self.review_evidence_ref.as_deref(),
+            metadata: self.metadata.as_ref(),
         }
     }
 }
@@ -389,6 +445,9 @@ impl MemoryBook {
             {
                 continue;
             }
+            if record.operator_reviewed_preference() {
+                continue;
+            }
             if record.sources.iter().all(|old| {
                 current.get(old.id.as_str()).is_some_and(|s| {
                     s.version == old.version && s.digest == old.digest && s.domain == old.domain
@@ -493,6 +552,7 @@ impl MemoryBook {
             sources: &references,
             status: MemoryStatus::Proposed,
             review_evidence_ref: None,
+            metadata: None,
         };
         self.preflight(id, &view, &BTreeSet::new())?;
         let record = Memory {
@@ -503,6 +563,7 @@ impl MemoryBook {
             sources: references.into_iter().cloned().collect(),
             status: MemoryStatus::Proposed,
             review_evidence_ref: None,
+            metadata: None,
         };
         let hash = memory_review_digest(&record)?;
         self.records.insert(id.into(), record);
@@ -585,6 +646,67 @@ impl MemoryBook {
                     && r.status == MemoryStatus::Accepted
                     && r.sources.iter().all(|s| scope.allows_ref(s))
                     && (r.key.contains(query) || r.claim.contains(query))
+            })
+            .collect()
+    }
+    /// Host-observed provenance decorates only an unreviewed proposal and is
+    /// admitted through the same aggregate byte accounting as all memory.
+    pub fn annotate(&mut self, id: &str, metadata: MemoryMetadata) -> Result<String> {
+        let record = self
+            .records
+            .get(id)
+            .ok_or_else(|| crate::Error("memory not found".into()))?;
+        require(
+            record.status == MemoryStatus::Proposed
+                && record.metadata.is_none()
+                && metadata.created_at_ms > 0
+                && !metadata.task_id.is_empty()
+                && metadata.task_id.len() <= 256
+                && metadata
+                    .expires_at_ms
+                    .is_none_or(|t| t > metadata.created_at_ms)
+                && (metadata.kind != MemoryKind::TransientState
+                    || metadata.expires_at_ms.is_some()),
+            "invalid memory provenance",
+        )?;
+        let mut view = record.view();
+        view.metadata = Some(&metadata);
+        self.preflight(id, &view, &BTreeSet::new())?;
+        let record = self.records.get_mut(id).expect("checked");
+        record.metadata = Some(metadata);
+        let hash = memory_review_digest(record)?;
+        self.dirty.insert(id.into());
+        Ok(hash)
+    }
+    /// Operator-reviewed preferences are project-scoped statements, not claims
+    /// about the current source bytes. Their evidence remains visible-policy
+    /// checked even when those bytes change. All other kinds require freshness.
+    pub fn search_context(
+        &self,
+        scope: &SearchScope,
+        query: &str,
+        task: &str,
+        git: &melissa_repository::git_context::GitContext,
+        time: u64,
+        visibility: &melissa_repository::SourceVisibilityPolicy,
+    ) -> Vec<&Memory> {
+        self.records
+            .values()
+            .filter(|record| {
+                record.namespace == scope.namespace
+                    && record.status == MemoryStatus::Accepted
+                    && (record.key.contains(query) || record.claim.contains(query))
+                    && record.sources.iter().all(|source| {
+                        source.namespace == scope.namespace
+                            && source.domain == scope.domain
+                            && visibility.allows(&source.id)
+                    })
+                    && record
+                        .metadata
+                        .as_ref()
+                        .is_none_or(|m| m.withheld(task, git, time).is_none())
+                    && (record.operator_reviewed_preference()
+                        || record.sources.iter().all(|source| scope.allows_ref(source)))
             })
             .collect()
     }

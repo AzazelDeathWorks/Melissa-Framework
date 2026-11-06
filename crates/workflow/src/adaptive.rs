@@ -161,6 +161,8 @@ pub struct Repair {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ledger {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub failed_approaches: BTreeMap<String, FailedApproach>,
     pub schema_version: String,
     pub goal: String,
     pub current_milestone: Option<String>,
@@ -207,6 +209,8 @@ pub struct CandidateSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Handoff {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub failed_approaches: BTreeMap<String, FailedApproach>,
     pub task_goal: String,
     pub current_milestone: Milestone,
     pub source_version: String,
@@ -236,6 +240,7 @@ pub struct Handoff {
 impl Ledger {
     pub fn new(task: &TaskContractV1, plan: &Plan, deadline: u64) -> Self {
         Self {
+            failed_approaches: BTreeMap::new(),
             schema_version: "melissa.adaptive-ledger/v1".into(),
             goal: task.goal.clone(),
             current_milestone: None,
@@ -280,6 +285,7 @@ impl Ledger {
             dependencies: n.after.clone(),
         };
         Ok(Handoff {
+            failed_approaches: self.failed_approaches.clone(),
             task_goal: self.goal.clone(),
             current_milestone: milestone(node),
             source_version: self.source_version.clone(),
@@ -496,4 +502,29 @@ pub fn validate_serial(plan: &Plan) -> Result<()> {
         Kind::Invalid,
         "adaptive output must be the final reviewer",
     )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailedApproach {
+    pub tool: String,
+    pub source_digest: String,
+    pub input_digest: String,
+    pub count: u32,
+    #[serde(default)]
+    pub resolved: bool,
+    pub last_evidence_ref: String,
+}
+pub fn selection_explanation(signals: &Signals, profiles: &[String]) -> serde_json::Value {
+    serde_json::json!({"basis":"deterministic source/risk signals; not measured expert quality","complexity":complexity(signals),"risk_requires_security_review":signals.high_risk,"architecture_review_required":signals.architecture_change||signals.affected_files>16||signals.affected_modules>2||signals.cross_module_dependencies>8,"repository_review_required":complexity(signals)!=Complexity::Simple,"compiler_failure_requires_debugger":signals.compiler_failure,"selected_serial_profiles":profiles,"authority_expanded":false})
+}
+
+pub fn repeated_approach(ledger: &Ledger, threshold: u32) -> bool {
+    if ledger.failed_approaches.is_empty() {
+        ledger.repeated_failures.values().any(|n| *n >= threshold)
+    } else {
+        ledger.failed_approaches.values().any(|a| {
+            a.source_digest == ledger.source_version && !a.resolved && a.count >= threshold
+        })
+    }
 }

@@ -34,6 +34,23 @@ const NOTICE: Color = Color::Rgb {
 };
 
 pub(super) const COMMANDS: &[(&str, &str)] = &[
+    ("/checkpoints", "Görev checkpoint ve kalan iş görünümü"),
+    ("/continuity", "Kaynak, bütçe ve devam durumu"),
+    ("/changes", "Tur bazlı native dosya değişiklikleri"),
+    ("/checkpoint", "ETIKET · kaynak kaydı, yeni yetki vermez"),
+    (
+        "/undo-preview",
+        "JSON · seçili makbuz/parça geri alma incelemesi",
+    ),
+    ("/undo", "JSON {selection,digest} · incelenmiş geri alma"),
+    (
+        "/adopt-preview",
+        "Değişmiş kaynağı ve geçersizleşecek eski çıktıları incele",
+    ),
+    (
+        "/adopt-source",
+        "DIGEST · aynı bütçeyle fresh uzman koşuları",
+    ),
     (
         "/project-doctor",
         "Proje, kilit dosyaları, komutlar ve ortam tercihi",
@@ -307,6 +324,27 @@ impl Ui {
     }
 
     pub fn result(&self, value: &Value, output: &mut impl Write) -> Result {
+        if matches!(
+            value["command"].as_str(),
+            Some(
+                "task continuity"
+                    | "task checkpoint"
+                    | "task changes"
+                    | "task undo-preview"
+                    | "task undo"
+                    | "task adopt-preview"
+                    | "task adopt-source"
+            )
+        ) {
+            if !self.interactive {
+                return Ok(writeln!(output, "{}", display::human(value)?)?);
+            }
+            let lines = display::human(value)?
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            return self.card("DEVAM VE DEĞİŞİKLİK İNCELEMESİ", &lines, output);
+        }
         if value["command"] == "task conversation" {
             if !self.interactive {
                 return Ok(writeln!(output, "{}", display::json(value)?)?);

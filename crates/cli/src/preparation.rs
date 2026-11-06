@@ -193,7 +193,7 @@ impl App {
         let adaptive = json!({
             "mode":mode,"write_intent":write,"source_digest":snap.digest,"guidance":crate::instructions::load(&self.home,&repo,&AtomicBool::new(false))?,
             "task_goal":goal, "complexity":melissa_workflow::adaptive::complexity(&signals),
-            "signals":signals, "dependency_evidence":dependency_evidence,
+            "signals":signals, "specialist_selection":melissa_workflow::adaptive::selection_explanation(&signals,&agents.iter().map(|s|s.profile.clone()).collect::<Vec<_>>()), "dependency_evidence":dependency_evidence,
             "scope":{"inspected_paths":affected,"proposed_writes":writable},
             "acceptance_criteria":if acceptance_template.is_some(){"operator acceptance template; private expected values withheld"}else{"reviewed project requirements and source-bound checks; execution/environment contract in Phase 3; no private oracle invented"},
             "risk":{"high_risk":signals.high_risk,"authority_expansion_allowed":false},
@@ -365,6 +365,13 @@ pub(crate) fn activate_pending(
         return Ok(false);
     }
     let n = next - 1;
+    if store
+        .journal()
+        .checkpoint(&format!("cli:discarded-plan:{n}"), task)
+        .is_ok()
+    {
+        return Ok(false);
+    }
     let applied = format!("cli:applied-plan:{n}");
     match store.journal().checkpoint(&applied, task) {
         Ok(_) => return Ok(false),

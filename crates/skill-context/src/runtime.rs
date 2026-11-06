@@ -972,12 +972,29 @@ impl ContextRuntime {
         match op {
             ContextOperation::MemorySearch { query } => {
                 let (_, scope) = self.observe_memory(&[], cancel)?;
-                let mut records = self.state.memory.search(&scope, query);
+                let git = melissa_repository::git_context::observe(&self.repo);
+                let time =
+                    melissa_execution_broker::unix_ms().map_err(|_| Error("host clock".into()))?;
+                let mut records = self.state.memory.search_context(
+                    &scope,
+                    query,
+                    &ctx.task_id,
+                    &git,
+                    time,
+                    self.repo.source_visibility(),
+                );
                 for book in &self.imported {
-                    records.extend(book.search(&scope, query));
+                    records.extend(book.search_context(
+                        &scope,
+                        query,
+                        &ctx.task_id,
+                        &git,
+                        time,
+                        self.repo.source_visibility(),
+                    ));
                 }
                 return Ok(
-                    value!({"cached":false,"data":{"accepted":records,"proposal_is_not_fact":true}}),
+                    value!({"cached":false,"data":{"accepted":records,"proposal_is_not_fact":true,"git_context":git,"memory_types":"project_decision/user_preference/transient_state/failure_experience; legacy metadata is unknown"}}),
                 );
             }
             ContextOperation::MemoryPropose {

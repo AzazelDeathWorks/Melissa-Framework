@@ -21,6 +21,13 @@ pub struct Options {
 pub const DOMAIN_HELP: &str = "\nWeb/API/veritabanı (v2 özel tarif):\n  melissa task preview ID [--out NEW_DIRECTORY]\n  melissa task evidence ID [--artifact ARTIFACT_ID --out NEW_FILE]\n\nYerel tarayıcı/API/SQLite/PostgreSQL akışları sabit image üzerinde çalışır. Public development ve private final testleri ayrıdır. Preview kaynağa bağlı PNG ihracıdır; kalıcı web sunucusu açmaz.\n";
 #[derive(Debug)]
 pub enum Command {
+    Continuity {
+        id: String,
+        action: String,
+        request: Option<String>,
+        digest: Option<String>,
+        label: Option<String>,
+    },
     Services {
         action: String,
         id: Option<String>,
@@ -480,6 +487,36 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options> {
                         recipe: required(&mut f, "--recipe")?.into(),
                     }
                 }
+                "continuity" | "checkpoints" | "checkpoint" | "changes" | "undo-preview"
+                | "undo" | "adopt-preview" | "adopt-source" => {
+                    let id = text(a.next().ok_or(Error::Usage("Görev kimliği gerekli."))?)?;
+                    let allowed: &[&str] = match action.as_str() {
+                        "checkpoint" => &["--label"],
+                        "undo-preview" => &["--request-json"],
+                        "undo" => &["--request-json", "--digest"],
+                        "adopt-source" => &["--digest"],
+                        _ => &[],
+                    };
+                    let mut f = flags(&mut a, allowed)?;
+                    let request = f.remove("--request-json").map(text).transpose()?;
+                    let digest = f.remove("--digest").map(text).transpose()?;
+                    let label = f.remove("--label").map(text).transpose()?;
+                    if (["undo-preview", "undo"].contains(&action.as_str()) && request.is_none())
+                        || (["undo", "adopt-source"].contains(&action.as_str()) && digest.is_none())
+                        || (action == "checkpoint" && label.is_none())
+                    {
+                        return Err(Error::Usage(
+                            "Checkpoint/geri alma inceleme seçenekleri eksik.",
+                        ));
+                    }
+                    Command::Continuity {
+                        id,
+                        action,
+                        request,
+                        digest,
+                        label,
+                    }
+                }
                 "list" => Command::List,
                 "new" => {
                     let mut workspace = None;
@@ -639,3 +676,5 @@ pub const REPOSITORY_HELP: &str = "\nDepo analizi (model/API çağırmaz):\n  me
 pub const VERIFICATION_HELP: &str = "\nProje doğrulama (model/API çağırmaz):\n  melissa --json verification configure --workspace PATH --path JSON_FILE\n  melissa --json verification show --workspace PATH\n  melissa --json verification reproduce TASK [--request-json JSON]\n  melissa --json verification verify TASK [--request-json JSON]\n  scripts/verify-change.ps1 ve scripts/reproduce-failure.ps1\n  Belgeler: docs/VERIFICATION_TR.md; sonuç PASS değilse çıkış kodu 7.\n";
 
 pub const SERVICES_HELP: &str = "\nProje servisleri (model sağlayıcısını çağırmaz):\n  /services [JSON_DOSYASI]  Yeni görevler için servis tercihi\n  melissa --json services configure --workspace PATH --path JSON\n  melissa --json services show --workspace PATH\n  melissa --json services session TASK\n  melissa --json services run TASK --request-json JSON_OPERATION\n  Belgeler: docs/SERVICES_TR.md ve docs/FRONTEND_VERIFY_TR.md. Browser ayarında session canlı preview_ready URL verir. Oturum foreground; JSON komut veya /close, EOF.\n  services baseline-accept TASK --request-json JSON_ACCEPT: yalnız operatörün incelediği checkpoint PNG ve tam review_digest; oturum kapalı olmalı.\n";
+
+pub const CONTINUITY_HELP: &str = "\nUzun görev, checkpoint ve geri alma (model çağırmaz):\n  melissa --json task continuity|checkpoints|changes ID\n  melissa --json task checkpoint ID --label TEXT\n  melissa --json task undo-preview ID --request-json JSON_SELECTION\n  melissa --json task undo ID --request-json JSON_SELECTION --digest REVIEW_DIGEST\n  melissa --json task adopt-preview ID\n  melissa --json task adopt-source ID --digest REVIEW_DIGEST\n  task resume yalnız özgün güvenli kaynak/harcama sınırından devam eder. Değişmiş kaynağı açık inceleme fresh uzman koşularına bağlar. Belgeler: docs/CONTINUITY_TR.md\n";
