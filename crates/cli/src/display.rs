@@ -28,6 +28,12 @@ pub fn safe(text: &str) -> String {
         .collect()
 }
 pub fn human(v: &Value) -> Result<String> {
+    if v["command"]
+        .as_str()
+        .is_some_and(|c| c.starts_with("observe ") || c.starts_with("maintenance "))
+    {
+        return json(v);
+    }
     if v["command"] == "task continuity" {
         let mut out = format!(
             "Görev sürekliliği: {}\nDurum: {} · aşama: {}\nKaynak: {}\nİşlemler uzlaştırılmış: {}\n",

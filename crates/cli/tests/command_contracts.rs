@@ -296,3 +296,64 @@ fn terminal_continuity_shows_checkpoint_freshness_and_remaining_work_without_hid
     );
     assert!(shown.contains("uzlaştırılmış: false"));
 }
+
+#[test]
+fn observations_and_backups_have_explicit_operator_destinations_without_delete_or_resume_flags() {
+    for args in [
+        vec!["observe", "diagnose", "task_a"],
+        vec!["observe", "support", "task_a", "--out", "new"],
+        vec!["observe", "otlp", "task_a"],
+        vec!["maintenance", "disk", "task_a"],
+        vec!["maintenance", "retention-preview", "task_a"],
+        vec!["maintenance", "keygen", "--out", "key"],
+        vec![
+            "maintenance",
+            "backup",
+            "task_a",
+            "--out",
+            "new",
+            "--key-file",
+            "key",
+        ],
+        vec![
+            "maintenance",
+            "restore",
+            "--from",
+            "archive",
+            "--out",
+            "new",
+            "--key-file",
+            "key",
+        ],
+    ] {
+        assert!(parse(&args).is_ok());
+    }
+    for args in [
+        vec!["observe", "support", "task_a"],
+        vec!["maintenance", "backup", "task_a", "--out", "new"],
+        vec![
+            "maintenance",
+            "restore",
+            "--out",
+            "new",
+            "--key-file",
+            "key",
+        ],
+        vec!["maintenance", "delete", "task_a"],
+        vec![
+            "maintenance",
+            "restore",
+            "--from",
+            "archive",
+            "--out",
+            "new",
+            "--key-file",
+            "key",
+            "--resume",
+            "true",
+        ],
+        vec!["observe", "support", "task_a", "--out", "a", "--out", "b"],
+    ] {
+        assert!(parse(&args).is_err());
+    }
+}

@@ -34,6 +34,18 @@ const NOTICE: Color = Color::Rgb {
 };
 
 pub(super) const COMMANDS: &[(&str, &str)] = &[
+    (
+        "/diagnose",
+        "Hatanın kaynağı, belirsizlik ve son checkpoint",
+    ),
+    ("/metrics", "Kayda bağlı süre ve host süreç ölçümleri"),
+    ("/disk", "Görevin mantıksal disk kullanımı"),
+    (
+        "/retention-preview",
+        "Silmeden saklama/kalıcı kanıt sınırlarını göster",
+    ),
+    ("/support", "YENI_KLASOR · temizlenmiş destek paketi"),
+    ("/otlp", "YENI_DOSYA · temizlenmiş yerel OTLP JSON"),
     ("/checkpoints", "Görev checkpoint ve kalan iş görünümü"),
     ("/continuity", "Kaynak, bütçe ve devam durumu"),
     ("/changes", "Tur bazlı native dosya değişiklikleri"),
@@ -324,6 +336,20 @@ impl Ui {
     }
 
     pub fn result(&self, value: &Value, output: &mut impl Write) -> Result {
+        if value["command"]
+            .as_str()
+            .is_some_and(|c| c.starts_with("observe ") || c.starts_with("maintenance "))
+        {
+            let shown = display::json(value)?;
+            if !self.interactive {
+                return Ok(writeln!(output, "{shown}")?);
+            }
+            return self.card(
+                "TANILAMA VE KAYIT BAKIMI",
+                &shown.lines().map(str::to_owned).collect::<Vec<_>>(),
+                output,
+            );
+        }
         if matches!(
             value["command"].as_str(),
             Some(

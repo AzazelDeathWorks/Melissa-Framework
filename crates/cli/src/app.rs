@@ -54,7 +54,7 @@ pub struct App {
     pub(crate) key: StoreKey,
     _pin: Repository,
 }
-fn task_store_config() -> StoreConfig {
+pub(crate) fn task_store_config() -> StoreConfig {
     StoreConfig {
         max_blob_bytes: 512 * 1024 * 1024,
         max_cas_bytes: 24 * 1024 * 1024 * 1024,
@@ -229,6 +229,48 @@ impl App {
         Ok(
             json!({"command":"init","status":"initialized","home":home,"encryption":"DPAPI_user_key_and_authenticated_local_store","API_calls":0}),
         )
+    }
+    pub(crate) fn restored_home(home: &Path, secret: &[u8; 32]) -> Result<StoreKey> {
+        safe_path(home)?;
+        fs::create_dir(home)?;
+        let key =
+            vault::import_key(&home.join("store-key.dpapi"), secret).map_err(|_| Error::Store)?;
+        fs::create_dir(home.join("tasks"))?;
+        let manifest = HomeManifest {
+            schema_version: "melissa.cli-home/v1".into(),
+            installation_id: nonce()?,
+        };
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(home.join("home.json"))?;
+        file.write_all(&bytes(&manifest)?)?;
+        file.sync_all()?;
+        Ok(key)
+    }
+    pub(crate) fn restored(&self, id: &str) -> Result<bool> {
+        validate_id(id)?;
+        let root = self.home.join("tasks").join(id);
+        let path = root.join("restore-boundary.enc");
+        match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(_) => return Err(Error::Store),
+            Ok(_) => {}
+        }
+        let repo = Repository::open(&root, Limits::default(), vec![])?;
+        let raw = repo.read("restore-boundary.enc")?.1;
+        let plain = zeroize::Zeroizing::new(
+            self.key
+                .open(&raw, format!("melissa.restore-boundary/v1:{id}").as_bytes())?,
+        );
+        let value: Value = decode(&plain)?;
+        if value["schema_version"] != "melissa.restore-boundary/v1"
+            || value["task_id"] != id
+            || value["new_task_required"] != true
+        {
+            return Err(Error::Store);
+        }
+        Ok(true)
     }
     pub fn open(home: &Path) -> Result<Self> {
         let home = absolute(home)?;

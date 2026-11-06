@@ -6,12 +6,18 @@ use std::{fs, path::Path};
 use zeroize::Zeroizing;
 #[cfg(windows)]
 pub fn create_key(path: &Path) -> Result<StoreKey> {
+    let mut bytes = Zeroizing::new([0u8; 32]);
+    getrandom::fill(&mut *bytes).map_err(|_| Error::Denied("vault entropy"))?;
+    import_key(path, &bytes)
+}
+/// Trusted-host restore, after archive authentication. Destination must be new.
+#[cfg(windows)]
+pub fn import_key(path: &Path, secret: &[u8; 32]) -> Result<StoreKey> {
     use windows_sys::Win32::{
         Foundation::LocalFree,
         Security::Cryptography::{CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData},
     };
-    let mut bytes = Zeroizing::new([0u8; 32]);
-    getrandom::fill(&mut *bytes).map_err(|_| Error::Denied("vault entropy"))?;
+    let mut bytes = Zeroizing::new(*secret);
     let input = CRYPT_INTEGER_BLOB {
         cbData: 32,
         pbData: bytes.as_mut_ptr(),
@@ -109,5 +115,10 @@ pub fn create_key(_: &Path) -> Result<StoreKey> {
 }
 #[cfg(not(windows))]
 pub fn open_key(_: &Path) -> Result<StoreKey> {
+    Err(Error::Denied("DPAPI vault requires Windows"))
+}
+
+#[cfg(not(windows))]
+pub fn import_key(_: &Path, _: &[u8; 32]) -> Result<StoreKey> {
     Err(Error::Denied("DPAPI vault requires Windows"))
 }

@@ -84,6 +84,8 @@ pub struct Snapshot {
     pub events: Value,
     pub cancel_requested: bool,
     pub pause_requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_measurement: Option<crate::process_measurement::Measurement>,
 }
 impl Snapshot {
     pub fn active(&self) -> bool {
@@ -109,6 +111,7 @@ pub(crate) struct Control {
     pub cancel: Arc<AtomicBool>,
     pub pause: Arc<AtomicBool>,
     pub phase: Arc<AtomicU8>,
+    baseline: crate::process_measurement::Sample,
 }
 fn aad(task: &str) -> String {
     format!("melissa.cli.control/v1:{task}")
@@ -192,6 +195,7 @@ impl Control {
             cancel,
             pause,
             phase: Arc::new(AtomicU8::new(0)),
+            baseline: crate::process_measurement::sample(),
         })
     }
     pub fn poll(&self) -> Result {
@@ -216,6 +220,9 @@ impl Control {
         }
         Ok(())
     }
+    pub(crate) fn measurement(&self) -> crate::process_measurement::Measurement {
+        crate::process_measurement::Measurement::observe(&self.baseline)
+    }
     pub fn publish(
         &self,
         phase: &str,
@@ -237,6 +244,7 @@ impl Control {
             events,
             cancel_requested: self.cancel.load(Ordering::Acquire),
             pause_requested: self.pause.load(Ordering::Acquire),
+            host_measurement: Some(self.measurement()),
         };
         write(
             &self.root.join("snapshot.enc"),

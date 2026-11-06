@@ -70,3 +70,5 @@ Göreve ait servisler, API sözleşmesi ve ayrı DB migration provası: [servis 
 Frontend/browser verification: [source-bound previews, accessibility and accepted visual regression](docs/FRONTEND_VERIFY_TR.md).
 
 Bellek türleri, checkpoint, değişmiş kaynağı inceleyerek devam ve native dosya geri alma: [süreklilik rehberi](docs/CONTINUITY_TR.md).
+
+Hata kaynağı ve süreç ölçümü, OpenTelemetry, destek paketi ve şifreli görev yedeği: [tanılama ve kayıt bakımı](docs/OBSERVABILITY_TR.md).

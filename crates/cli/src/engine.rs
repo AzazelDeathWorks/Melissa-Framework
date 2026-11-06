@@ -1262,6 +1262,22 @@ fn publish(
     scheduler: Option<&SharedScheduler>,
     phase: &str,
 ) -> Result {
+    if matches!(
+        phase,
+        "paused" | "completed" | "failed" | "blocked" | "cancelled" | "needs_reconciliation"
+    ) {
+        let mut shared = store.connect()?;
+        let reference = format!("cli:host-measurement:{}", control.session);
+        if shared.artifact_metadata(task, &reference).is_err() {
+            put(
+                &mut shared,
+                task,
+                &reference,
+                "host-measurement",
+                &bytes(&control.measurement())?,
+            )?;
+        }
+    }
     let t = store.journal().task(task)?;
     let events = store.journal().events(task)?;
     let count = events.len();
@@ -1284,6 +1300,12 @@ impl App {
         }
     }
     pub async fn run_task(&self, id: &str, resume: bool) -> Result<Value> {
+        if self.restored(id)? {
+            return Err(Error::Denied(
+                "Geri yüklenen kayıt kanıt içindir; yürütmek için yeni kaynak ve ayarlarla yeni görev oluştur.",
+            ));
+        }
+
         if self.conversation(id)?.is_none() {
             self.attach_conversation(id, crate::conversation::Mode::Develop, json!({}))?;
         }
@@ -1629,7 +1651,7 @@ impl App {
                 &format!("cli:run-error:{}", control.session),
                 "run.error",
                 &bytes(
-                    &json!({"session":control.session,"phase":phase,"error_kind":error.kind(),"error":error.to_string(),"automatic_retry":false,"requires_reconciliation":uncertain,"owned_workers_confirmed_stopped":workers_stopped}),
+                    &json!({"session":control.session,"phase":phase,"error_kind":error.kind(),"diagnosis":crate::diagnostics::explain(&error),"error":error.to_string(),"automatic_retry":false,"requires_reconciliation":uncertain,"owned_workers_confirmed_stopped":workers_stopped}),
                 )?,
             )?;
             publish(&control, &store, id, Some(&scheduler), phase)?;

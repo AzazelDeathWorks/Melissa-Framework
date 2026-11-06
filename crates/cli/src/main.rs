@@ -16,6 +16,25 @@ async fn run(options: &args::Options) -> Result<Value> {
             json!({"command":"profiles","profiles":melissa_cli::app::profiles()?.profiles,"definition_only":true}),
         );
     }
+    if let Command::Maintenance {
+        action,
+        out,
+        source,
+        key_file,
+        ..
+    } = &options.command
+    {
+        if action == "keygen" {
+            return melissa_cli::maintenance::portable::keygen(out.as_ref().unwrap());
+        }
+        if action == "restore" {
+            return melissa_cli::maintenance::portable::restore(
+                source.as_ref().unwrap(),
+                out.as_ref().unwrap(),
+                key_file.as_ref().unwrap(),
+            );
+        }
+    }
     let home = options.home.clone().map(Ok).unwrap_or_else(default_home)?;
     if let Command::Session { workspace } = &options.command {
         let workspace = workspace
@@ -36,6 +55,35 @@ async fn run(options: &args::Options) -> Result<Value> {
     }
     let app = App::open(&home)?;
     match &options.command {
+        Command::Observe {
+            action,
+            id,
+            out,
+            endpoint,
+        } => match action.as_str() {
+            "diagnose" => app.diagnose(id),
+            "support" => app.support(id, out.as_ref().unwrap()),
+            _ => {
+                app.export_otlp(id, out.as_deref(), endpoint.as_deref())
+                    .await
+            }
+        },
+        Command::Maintenance {
+            action,
+            id,
+            out,
+            key_file,
+            ..
+        } => match action.as_str() {
+            "disk" => app.disk(id.as_ref().unwrap()),
+            "retention-preview" => app.retention_preview(id.as_ref().unwrap()),
+            "backup" => app.backup_task(
+                id.as_ref().unwrap(),
+                out.as_ref().unwrap(),
+                key_file.as_ref().unwrap(),
+            ),
+            _ => Err(melissa_cli::Error::Usage("Bakım komutu desteklenmiyor.")),
+        },
         Command::Continuity {
             id,
             action,
@@ -297,6 +345,7 @@ async fn main() {
         println!("{}", args::VERIFICATION_HELP);
         println!("{}", args::SERVICES_HELP);
         println!("{}", args::CONTINUITY_HELP);
+        println!("{}", args::OBSERVABILITY_HELP);
         return;
     }
     if matches!(options.command, Command::Version) {
@@ -314,6 +363,11 @@ async fn main() {
                 println!("{text}");
                 if matches!(&options.command, Command::Verification { action, .. } if action == "verify" || action == "reproduce")
                     && value["result"]["operation_status"] != "PASS"
+                {
+                    std::process::exit(7);
+                }
+                if matches!(&options.command,Command::Observe{action,..} if action=="otlp")
+                    && value["status"] != "PASS"
                 {
                     std::process::exit(7);
                 }
@@ -337,7 +391,7 @@ async fn main() {
             if options.json {
                 eprintln!(
                     "{}",
-                    display::json(&json!({"ok":false,"error":e.to_string(),"kind":e.kind()}))
+                    display::json(&json!({"ok":false,"error":e.to_string(),"kind":e.kind(),"diagnosis":melissa_cli::diagnostics::explain(&e)}))
                         .unwrap_or_else(|_| "{\"ok\":false}".into())
                 );
             } else {

@@ -14,7 +14,7 @@ pub mod crypto;
 pub mod journal;
 mod service;
 
-pub use artifacts::{ArtifactMetadata, ArtifactRequest, GarbageCollection};
+pub use artifacts::{ArtifactMetadata, ArtifactRequest, GarbageCollection, RetentionEntry};
 pub use backup::{BackupBlob, BackupManifest};
 pub use crypto::StoreKey;
 pub use derived_index::{MAX_INDEX_BYTES, RepositoryIndexCache};

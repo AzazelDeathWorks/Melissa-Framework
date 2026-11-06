@@ -25,6 +25,7 @@ const HELP: &str = "Bir görev yaz veya aşağıdaki komutları kullan.\n\
   /scope-approve ÖZET      Gösterilen hazırlık kapsamını kabul et\n\
   /pause  /cancel         Güvenli duraklatma veya iptal iste\n\
   /doctor                 Windows ve Docker hazırlığını kontrol et\n\
+  /diagnose · /metrics · /disk · /retention-preview · /support KLASOR · /otlp DOSYA\n\
   /checkpoints · /changes · /checkpoint ETIKET · /undo-preview JSON · /undo JSON\n\
   /adopt-preview · /adopt-source DIGEST   Değişmiş kaynağı açık incele\n\
   /services [DOSYA]       Yeni görevler için servis/API/DB tercihleri\n\
@@ -326,6 +327,16 @@ impl Session {
             }
             ("/plan", "") if self.task.is_none() => return self.show_draft(output),
             ("/plan", "") => self.app.conversation_view(&self.task()?.id)?,
+            ("/diagnose", "") => self.app.diagnose(&self.task()?.id)?,
+            ("/metrics", "") => self.app.metrics(&self.task()?.id)?,
+            ("/disk", "") => self.app.disk(&self.task()?.id)?,
+            ("/retention-preview", "") => self.app.retention_preview(&self.task()?.id)?,
+            ("/support", path) => self.app.support(&self.task()?.id, Path::new(path))?,
+            ("/otlp", path) => {
+                self.app
+                    .export_otlp(&self.task()?.id, Some(Path::new(path)), None)
+                    .await?
+            }
             ("/checkpoints", "") | ("/continuity", "") => self.app.continuity(&self.task()?.id)?,
             ("/changes", "") => crate::continuity::undo::changes(&self.app, &self.task()?.id)?,
             ("/checkpoint", label) => self.app.checkpoint(&self.task()?.id, label)?,

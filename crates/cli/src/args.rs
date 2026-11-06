@@ -21,6 +21,19 @@ pub struct Options {
 pub const DOMAIN_HELP: &str = "\nWeb/API/veritabanı (v2 özel tarif):\n  melissa task preview ID [--out NEW_DIRECTORY]\n  melissa task evidence ID [--artifact ARTIFACT_ID --out NEW_FILE]\n\nYerel tarayıcı/API/SQLite/PostgreSQL akışları sabit image üzerinde çalışır. Public development ve private final testleri ayrıdır. Preview kaynağa bağlı PNG ihracıdır; kalıcı web sunucusu açmaz.\n";
 #[derive(Debug)]
 pub enum Command {
+    Observe {
+        action: String,
+        id: String,
+        out: Option<PathBuf>,
+        endpoint: Option<String>,
+    },
+    Maintenance {
+        action: String,
+        id: Option<String>,
+        out: Option<PathBuf>,
+        source: Option<PathBuf>,
+        key_file: Option<PathBuf>,
+    },
     Continuity {
         id: String,
         action: String,
@@ -441,6 +454,67 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options> {
                 _ => return Err(Error::Usage("Proje komutu bilinmiyor.")),
             }
         }
+        "observe" => {
+            let action = text(
+                a.next()
+                    .ok_or(Error::Usage("observe diagnose|support|otlp gerekli."))?,
+            )?;
+            let id = text(a.next().ok_or(Error::Usage("Görev kimliği gerekli."))?)?;
+            let allowed: &[&str] = match action.as_str() {
+                "diagnose" => &[],
+                "support" => &["--out"],
+                "otlp" => &["--out", "--endpoint"],
+                _ => return Err(Error::Usage("Gözlem işlemi bilinmiyor.")),
+            };
+            let mut f = flags(&mut a, allowed)?;
+            let out = f.remove("--out").map(PathBuf::from);
+            let endpoint = f.remove("--endpoint").map(text).transpose()?;
+            if action == "support" && out.is_none() {
+                return Err(Error::Usage("Destek paketi için --out gerekli."));
+            }
+            Command::Observe {
+                action,
+                id,
+                out,
+                endpoint,
+            }
+        }
+        "maintenance" => {
+            let action = text(a.next().ok_or(Error::Usage(
+                "maintenance disk|retention-preview|backup|restore|keygen gerekli.",
+            ))?)?;
+            let id = if ["disk", "retention-preview", "backup"].contains(&action.as_str()) {
+                Some(text(
+                    a.next().ok_or(Error::Usage("Görev kimliği gerekli."))?,
+                )?)
+            } else {
+                None
+            };
+            let allowed: &[&str] = match action.as_str() {
+                "disk" | "retention-preview" => &[],
+                "backup" => &["--out", "--key-file"],
+                "restore" => &["--from", "--out", "--key-file"],
+                "keygen" => &["--out"],
+                _ => return Err(Error::Usage("Bakım işlemi bilinmiyor.")),
+            };
+            let mut f = flags(&mut a, allowed)?;
+            let out = f.remove("--out").map(PathBuf::from);
+            let source = f.remove("--from").map(PathBuf::from);
+            let key_file = f.remove("--key-file").map(PathBuf::from);
+            if (["backup", "restore", "keygen"].contains(&action.as_str()) && out.is_none())
+                || (["backup", "restore"].contains(&action.as_str()) && key_file.is_none())
+                || (action == "restore" && source.is_none())
+            {
+                return Err(Error::Usage("Bakım/yedek seçenekleri eksik."));
+            }
+            Command::Maintenance {
+                action,
+                id,
+                out,
+                source,
+                key_file,
+            }
+        }
         "memory" => {
             let action = text(
                 a.next()
@@ -678,3 +752,5 @@ pub const VERIFICATION_HELP: &str = "\nProje doğrulama (model/API çağırmaz):
 pub const SERVICES_HELP: &str = "\nProje servisleri (model sağlayıcısını çağırmaz):\n  /services [JSON_DOSYASI]  Yeni görevler için servis tercihi\n  melissa --json services configure --workspace PATH --path JSON\n  melissa --json services show --workspace PATH\n  melissa --json services session TASK\n  melissa --json services run TASK --request-json JSON_OPERATION\n  Belgeler: docs/SERVICES_TR.md ve docs/FRONTEND_VERIFY_TR.md. Browser ayarında session canlı preview_ready URL verir. Oturum foreground; JSON komut veya /close, EOF.\n  services baseline-accept TASK --request-json JSON_ACCEPT: yalnız operatörün incelediği checkpoint PNG ve tam review_digest; oturum kapalı olmalı.\n";
 
 pub const CONTINUITY_HELP: &str = "\nUzun görev, checkpoint ve geri alma (model çağırmaz):\n  melissa --json task continuity|checkpoints|changes ID\n  melissa --json task checkpoint ID --label TEXT\n  melissa --json task undo-preview ID --request-json JSON_SELECTION\n  melissa --json task undo ID --request-json JSON_SELECTION --digest REVIEW_DIGEST\n  melissa --json task adopt-preview ID\n  melissa --json task adopt-source ID --digest REVIEW_DIGEST\n  task resume yalnız özgün güvenli kaynak/harcama sınırından devam eder. Değişmiş kaynağı açık inceleme fresh uzman koşularına bağlar. Belgeler: docs/CONTINUITY_TR.md\n";
+
+pub const OBSERVABILITY_HELP: &str = "\nTanılama ve güvenli bakım (model çağırmaz):\n  melissa --json observe diagnose TASK\n  melissa --json observe support TASK --out NEW_DIRECTORY\n  melissa --json observe otlp TASK [--out NEW_JSON] [--endpoint http://127.0.0.1:4318/v1/traces]\n  melissa --json maintenance disk|retention-preview TASK\n  melissa --json maintenance keygen --out NEW_PRIVATE_KEY_FILE\n  melissa --json maintenance backup TASK --out NEW_ARCHIVE_DIR --key-file PRIVATE_KEY_FILE\n  melissa --json maintenance restore --from ARCHIVE_DIR --out NEW_HOME --key-file PRIVATE_KEY_FILE\n  Temizleme yalnız önizleme; yedek yeni home'a kanıt olarak döner, otomatik resume yok. docs/OBSERVABILITY_TR.md\n";
