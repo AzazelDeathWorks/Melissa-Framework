@@ -36,6 +36,40 @@ async fn run(options: &args::Options) -> Result<Value> {
     }
     let app = App::open(&home)?;
     match &options.command {
+        Command::Services {
+            action,
+            id,
+            workspace,
+            path,
+            request,
+        } => match action.as_str() {
+            "configure" => melissa_cli::services::settings::configure(
+                &app,
+                workspace.as_ref().unwrap(),
+                path.as_ref().unwrap(),
+            ),
+            "show" => Ok(
+                json!({"services":melissa_cli::services::settings::load(&app,workspace.as_ref().unwrap())?}),
+            ),
+            _ => {
+                app.run_services(
+                    id.as_ref().unwrap(),
+                    request
+                        .as_ref()
+                        .map(|s| {
+                            melissa_model_gateway::strict_json(s)
+                                .map_err(|_| melissa_cli::Error::Usage("Servis JSON geçersiz."))
+                                .and_then(|v| {
+                                    serde_json::from_value(v).map_err(|_| {
+                                        melissa_cli::Error::Usage("Servis işlemi geçersiz.")
+                                    })
+                                })
+                        })
+                        .transpose()?,
+                )
+                .await
+            }
+        },
         Command::Verification {
             action,
             id,
@@ -227,6 +261,7 @@ async fn main() {
         println!("{}", args::METRICS_HELP);
         println!("{}", args::REPOSITORY_HELP);
         println!("{}", args::VERIFICATION_HELP);
+        println!("{}", args::SERVICES_HELP);
         return;
     }
     if matches!(options.command, Command::Version) {
@@ -244,6 +279,11 @@ async fn main() {
                 println!("{text}");
                 if matches!(&options.command, Command::Verification { action, .. } if action == "verify" || action == "reproduce")
                     && value["result"]["operation_status"] != "PASS"
+                {
+                    std::process::exit(7);
+                }
+                if matches!(&options.command,Command::Services{action,..} if action=="run"||action=="session")
+                    && value["outcome"] != "PASS"
                 {
                     std::process::exit(7);
                 }

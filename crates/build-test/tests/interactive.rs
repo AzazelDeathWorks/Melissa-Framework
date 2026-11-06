@@ -23,6 +23,7 @@ fn run(
         support::limits(),
     );
     let request = ContainerRequest {
+        backend: Default::default(),
         schema_version: "melissa.container-exec/v1".into(),
         image_id: COMPLETE_IMAGE.into(),
         executable: "/usr/bin/python3".into(),

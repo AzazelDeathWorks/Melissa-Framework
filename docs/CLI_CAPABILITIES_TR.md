@@ -345,3 +345,5 @@ Bu sürüm için yeni canlı model, büyük depo karşılaştırması, temiz Win
 dağıtım ZIP'i veya public yayın kabulü iddia edilmez.
 
 Proje kontrolleri, erken doğrulama, gerçek proje debug ayarı ve hata tekrar üretimi: [doğrulama rehberi](VERIFICATION_TR.md).
+
+Göreve ait servisler, API sözleşmesi ve ayrı DB migration provası: [servis rehberi](SERVICES_TR.md).

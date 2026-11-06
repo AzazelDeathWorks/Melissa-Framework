@@ -19,7 +19,7 @@
     },
     {
       "name": "feature-vertical-slice",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "owner_profile": "melissa.code.implementer",
       "entry": "feature-vertical-slice/SKILL.md",
       "status": "instruction_template",
@@ -43,7 +43,7 @@
     },
     {
       "name": "api-contract",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "owner_profile": "melissa.code.backend",
       "entry": "api-contract/SKILL.md",
       "status": "instruction_template",
@@ -51,7 +51,7 @@
     },
     {
       "name": "database-migration",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "owner_profile": "melissa.code.database",
       "entry": "database-migration/SKILL.md",
       "status": "instruction_template",

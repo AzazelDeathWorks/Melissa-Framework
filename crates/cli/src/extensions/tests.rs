@@ -28,6 +28,7 @@ fn python(code: &str) -> Command {
 }
 fn contract(bundle: Bundle) -> Contract {
     Contract {
+        services: None,
         verification: None,
         extensions: Some(bundle),
         environment: Environment::default(),

@@ -295,6 +295,7 @@ impl WebPlan {
             snapshot.files.insert(format!("{PRIVATE}/{p}"), b);
         }
         let request = ContainerRequest {
+            backend: Default::default(),
             schema_version: "melissa.container-exec/v1".into(),
             image_id: WEB_IMAGE.into(),
             executable: "/opt/melissa-python/bin/python".into(),

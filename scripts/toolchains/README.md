@@ -38,3 +38,5 @@ different test scopes. Missing prerequisites must be reported, not counted as
 passing tests.
 
 Optional nextest, coverage and targeted mutation tools: [verification image](verification/README.md).
+
+Optional reviewed service/Schemathesis tools: [service image](services/README.md).

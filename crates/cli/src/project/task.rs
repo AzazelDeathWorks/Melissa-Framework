@@ -473,6 +473,11 @@ pub fn verify(
     expires: u64,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<Value> {
+    if contract.services.is_some() {
+        return crate::services::final_check::verify(
+            app, store, task, source, repo, contract, expires, cancel,
+        );
+    }
     if contract.verification.is_some() {
         source
             .current(repo, &cancel)

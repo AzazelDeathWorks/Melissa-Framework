@@ -1406,6 +1406,7 @@ fn container_fixture() -> (
     task.limits.max_disk_bytes = 8 * 1024 * 1024;
     task.limits.max_output_bytes = 4 * 1024 * 1024;
     let container = ContainerRequest {
+        backend: Default::default(),
         schema_version: "melissa.container-exec/v1".into(),
         image_id: format!("sha256:{}", "a".repeat(64)),
         executable: "/bin/sh".into(),

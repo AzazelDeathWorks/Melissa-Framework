@@ -60,6 +60,17 @@ impl Runner {
         }
         let mut unique = BTreeSet::new();
         for name in &names {
+            if self
+                .contract
+                .services
+                .as_ref()
+                .is_some_and(|s| s.business_checks.contains(name))
+            {
+                return Err(Error::Denied(
+                    "Bu kontrol canlı özel servis gerektirir; project_services business veya services run business kullan.",
+                ));
+            }
+
             if !self.contract.checks.contains_key(name) || !unique.insert(name) {
                 return Err(Error::Denied("Bilinmeyen/tekrarlı doğrulama komutu."));
             }

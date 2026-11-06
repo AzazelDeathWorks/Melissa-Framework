@@ -367,6 +367,7 @@ impl Discovery {
                 .collect()
         });
         let mut c = Contract {
+            services: None,
             verification: None,
             extensions: None,
             environment,

@@ -954,6 +954,10 @@ pub(crate) fn plan(task: &TaskContractV1, e: &Execution) -> Result<Plan> {
         if let Some(project) = &e.recipe.project {
             let input = &mut nodes.last_mut().ok_or(Error::Store)?.literal_input;
             input["project"] = project.public_summary()?;
+            if project.services.is_some() {
+                input["service_workflow"] = json!({"api_contract":include_str!("../../../skills/workflows/api-contract/SKILL.md"),"database_migration":include_str!("../../../skills/workflows/database-migration/SKILL.md"),"vertical_slice":include_str!("../../../skills/workflows/feature-vertical-slice/SKILL.md"),"instructions":"Use project_services with the reviewed service bundle. Read readiness and exact logs, use registered API/DB operations, contract checks, business tests and migration rehearsals. Preserve failing source-bound records. Close the owned session before editing source and before submit_candidate. A ready server, a passing API contract and business correctness are distinct. Browser/frontend acceptance follows separately."});
+            }
+
             input["project_onboarding"] = json!(include_str!(
                 "../../../skills/code/repo-onboarding/SKILL.md"
             ));
@@ -1942,6 +1946,26 @@ impl App {
                 None
             };
             let project_lifecycle = project_tools.as_ref().map(|p| p.runtime.clone());
+            let service_host = if let Some(project) = &e.recipe.project {
+                if project.services.is_some()
+                    && node.tools.contains("process.exec")
+                    && project_tools.is_some()
+                {
+                    Some(Arc::new(Mutex::new(crate::services::host::Host::new(
+                        self,
+                        store,
+                        &t.task_id,
+                        &node.profile,
+                        project.clone(),
+                        e.expires_at_ms,
+                    )?)))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let service_lifecycle = service_host.clone();
             let extensions = if let Some(project) = &e.recipe.project {
                 if project.extensions.is_some() {
                     Some(crate::extensions::tools::Shared::new(
@@ -1991,6 +2015,9 @@ impl App {
             } else {
                 None
             };
+            if let Some(host) = service_host {
+                dispatchers.push(Box::new(crate::services::tools::Tools(host)));
+            }
             if let Some(host) = &project_verifier {
                 dispatchers.push(Box::new(crate::project_verification::tools::Tools(
                     host.clone(),
@@ -2269,6 +2296,9 @@ impl App {
                     control.cancel.clone(),
                 )
                 .await;
+            if let Some(lifecycle) = service_lifecycle {
+                lifecycle.lock().map_err(|_| Error::Store)?.close()?;
+            }
             if let Some(lifecycle) = project_lifecycle {
                 lifecycle.lock().map_err(|_| Error::Store)?.close()?;
             }

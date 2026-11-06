@@ -50,6 +50,7 @@ impl Fixture {
             environment.image_id = image;
         }
         self.contract_task(Contract {
+            services: None,
             verification: None,
             extensions: None,
             environment,
@@ -319,6 +320,7 @@ pathlib.Path('requirements.txt').write_text('./'+p.name+' --hash=sha256:'+hashli
             );
         }
         let contract = Contract {
+            services: None,
             verification: None,
             extensions: None,
             environment,
@@ -495,6 +497,7 @@ fn empty_new_project_has_zero_initial_paths_and_keeps_reviewable_scope_on_same_t
             Mode::Develop,
             draft["preparation"]["adaptive_plan"].clone(),
             Contract {
+                services: None,
                 verification: None,
                 extensions: None,
                 environment: Environment::default(),

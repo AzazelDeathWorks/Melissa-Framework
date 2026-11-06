@@ -262,6 +262,7 @@ impl DebugPlan {
             .validate(limits.disk_bytes)
             .map_err(|_| Error::Invalid("debug snapshot envelope"))?;
         let request = ContainerRequest {
+            backend: Default::default(),
             schema_version: "melissa.container-exec/v1".into(),
             image_id: project
                 .map_or_else(|| toolchain::COMPLETE_IMAGE.into(), |p| p.image_id.clone()),

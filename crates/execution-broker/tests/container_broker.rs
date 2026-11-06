@@ -126,6 +126,7 @@ fn fixture_with_controls(script: &str, controls: bool) -> Fixture {
     )
     .unwrap();
     let request = ContainerRequest {
+        backend: Default::default(),
         schema_version: "melissa.container-exec/v1".into(),
         image_id: IMAGE.into(),
         executable: "/bin/sh".into(),
@@ -655,4 +656,36 @@ fn separately_signed_inspect_and_cancel_reach_the_real_container_watcher_and_per
             .is_ok()
     );
     f.broker.store().integrity_check().unwrap();
+}
+
+#[test]
+fn compose_creation_is_bound_to_the_exact_signed_request_and_legacy_default_wire() {
+    let mut f = fixture("printf unused");
+    let signed = permit(&f, "backend-wire");
+    assert!(
+        serde_json::to_value(&signed.binding.request)
+            .unwrap()
+            .get("backend")
+            .is_none()
+    );
+    let mut changed = signed;
+    changed.binding.request.backend = melissa_container_executor::CreationBackend::Compose;
+    assert!(
+        f.broker
+            .execute(
+                TASK,
+                &changed,
+                &f.snapshot,
+                &identity("backend-swap"),
+                &AtomicBool::new(false)
+            )
+            .is_err()
+    );
+    assert!(
+        f.broker
+            .store()
+            .journal()
+            .attempt("attempt:backend-swap")
+            .is_err()
+    );
 }

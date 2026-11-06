@@ -76,6 +76,7 @@ impl Environment {
             ));
         }
         let req = melissa_container_executor::ContainerRequest {
+            backend: Default::default(),
             schema_version: "melissa.container-exec/v1".into(),
             image_id: self.image_id.clone(),
             executable: "/usr/bin/python3".into(),
@@ -124,6 +125,8 @@ impl Environment {
 #[serde(deny_unknown_fields)]
 pub struct Contract {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub services: Option<crate::services::Spec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<crate::project_verification::Spec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extensions: Option<crate::extensions::Bundle>,
@@ -142,6 +145,9 @@ impl Contract {
     }
     pub fn validate(&self) -> Result {
         self.environment.validate()?;
+        if let Some(s) = &self.services {
+            s.validate(self)?;
+        }
         if let Some(v) = &self.verification {
             v.validate(&self.checks)?;
         }

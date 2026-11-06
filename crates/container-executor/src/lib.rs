@@ -66,9 +66,23 @@ pub struct ContainerLimits {
     /// Zero explicitly disables workspace archive capture.
     pub export_bytes: u64,
 }
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CreationBackend {
+    #[default]
+    Docker,
+    Compose,
+}
+impl CreationBackend {
+    pub fn is_default(&self) -> bool {
+        *self == Self::Docker
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContainerRequest {
+    #[serde(default, skip_serializing_if = "CreationBackend::is_default")]
+    pub backend: CreationBackend,
     pub schema_version: String,
     pub image_id: String,
     pub executable: String,

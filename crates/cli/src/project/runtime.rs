@@ -39,6 +39,7 @@ pub struct Runtime {
     contract: Contract,
     expires: u64,
     private_input: bool,
+    creation_backend: melissa_container_executor::CreationBackend,
     workers: Vec<(String, Arc<AtomicBool>, thread::JoinHandle<()>)>,
 }
 impl Runtime {
@@ -57,8 +58,16 @@ impl Runtime {
             contract,
             expires,
             private_input: false,
+            creation_backend: Default::default(),
             workers: vec![],
         })
+    }
+    pub(crate) fn with_creation_backend(
+        mut self,
+        backend: melissa_container_executor::CreationBackend,
+    ) -> Self {
+        self.creation_backend = backend;
+        self
     }
     pub(crate) fn with_private_input(mut self) -> Self {
         self.private_input = true;
@@ -130,7 +139,14 @@ impl Runtime {
             ));
         }
         let discovery = super::discovery::discover(repo)?;
-        let program = json!({"environment":self.contract.environment,"command":command,"required_commands":self.contract.checks.values().collect::<Vec<_>>(),"constraints":discovery.constraints,"preflight_only":preflight_only,"sync":self.contract.sync});
+        let program = json!({"environment":self.contract.environment,"command":command,"required_commands":self.contract.checks.values().chain(self.contract.services.iter().flat_map(|s|s.services.values().map(|s|&s.command))).collect::<Vec<_>>(),"constraints":discovery.constraints,"preflight_only":preflight_only,"sync":self.contract.sync});
+        let program = if let Some(services) = &self.contract.services {
+            let mut program = program;
+            program["service_requirements"] = json!({"contract":!services.api_checks.is_empty(),"postgres":services.database.as_ref().is_some_and(|d|matches!(d.engine,melissa_web_development::plan::Database::Postgres))||services.rehearsals.values().any(|r|matches!(r.engine,melissa_web_development::plan::Database::Postgres))});
+            program
+        } else {
+            program
+        };
         // environment-sync uses the same session and returns after its last sync.
         let program = if sync_only {
             let mut p = program;
@@ -179,6 +195,7 @@ impl Runtime {
         limits.cpu_time_ms = limits.cpu_time_ms.min(limits.wall_time_ms);
         limits.export_bytes = 0;
         let request = ContainerRequest {
+            backend: self.creation_backend,
             schema_version: "melissa.container-exec/v1".into(),
             image_id: self.contract.environment.image_id.clone(),
             executable: "/usr/bin/python3".into(),

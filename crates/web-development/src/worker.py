@@ -14,7 +14,7 @@ import time
 import urllib.error
 import urllib.request
 
-ROOT=Path.cwd(); PRIVATE=ROOT/'.melissa-code10'; STATE=PRIVATE/'state'
+ROOT=Path.cwd(); PRIVATE=Path(globals().get('MELISSA_ADAPTER_PRIVATE',ROOT/'.melissa-code10')); STATE=PRIVATE/'state'
 P=json.loads((PRIVATE/'program.json').read_text()); R=P['registration']
 ORIGIN='http://127.0.0.1:37641'
 processes=[]; connections={}; clients={}; migration_receipts={}; browser=None; pg=None; started=False
@@ -319,31 +319,36 @@ def cleanup():
             child.terminate()
             try:child.wait(timeout=5)
             except subprocess.TimeoutExpired:child.kill();child.wait(timeout=5)
-try:
-    for line in sys.stdin:
-        request=json.loads(line);op=request['operation'];current_seq=request['seq']
-        try:
-            body=command(op)
-            reply={'ok':True,'body':body,'error':None}
-        except Exception as e:
-            reply={'ok':False,'body':None,'error':{'kind':type(e).__name__,'message':str(e)[:8192],'sqlstate':getattr(e,'sqlstate',None),'sqlite_errorcode':getattr(e,'sqlite_errorcode',None)}}
-            if uncertain_sql_error(op,e):reply['error']['effect']='outcome_unknown'
-            if isinstance(e,subprocess.CalledProcessError):
-                reply['error'].update(exit_code=e.returncode,argv=e.cmd,stdout_hex=e.stdout[:65536].hex(),stderr_hex=e.stderr[:65536].hex(),truncated=len(e.stdout)>65536 or len(e.stderr)>65536)
-        closed=op['command']=='close'
-        reply.update(schema_version='melissa.web-reply/v1',seq=request['seq'],source_digest=P['source_digest'],closed=closed,task_completed=False)
-        raw=json.dumps(reply,ensure_ascii=False,default=str)
-        if len(raw.encode())>P['response_limit']:raise ValueError('response envelope exceeded; no truncated success')
-        # Preserve the existing C03 64KiB frame contract. Each bounded response
-        # fragment requires an acknowledgement, so the transport queue cannot
-        # lose a burst of screenshots/traces. The host validates exact sequence,
-        # total/part lengths, reassembles original UTF-8 bytes, then strict-parses.
-        encoded=raw.encode('utf-8');parts=(len(encoded)+24575)//24576
-        for index in range(parts):
-            fragment=encoded[index*24576:(index+1)*24576]
-            print(json.dumps({'schema_version':'melissa.web-fragment/v1','seq':request['seq'],'index':index,'parts':parts,'total_bytes':len(encoded),'data_hex':fragment.hex()}),flush=True)
-            ack=json.loads(sys.stdin.readline(2048))
-            if ack!={'ack':request['seq'],'index':index}:raise ValueError('response fragment acknowledgement mismatch')
-        if reply['ok'] and reply['body'].get('binary_artifact'):send_binary(request['seq'],reply['body']['binary_artifact'])
-        if closed:break
-finally:cleanup()
+def main():
+    global current_seq
+    try:
+        for line in sys.stdin:
+            request=json.loads(line);op=request['operation'];current_seq=request['seq']
+            try:
+                body=command(op)
+                reply={'ok':True,'body':body,'error':None}
+            except Exception as e:
+                reply={'ok':False,'body':None,'error':{'kind':type(e).__name__,'message':str(e)[:8192],'sqlstate':getattr(e,'sqlstate',None),'sqlite_errorcode':getattr(e,'sqlite_errorcode',None)}}
+                if uncertain_sql_error(op,e):reply['error']['effect']='outcome_unknown'
+                if isinstance(e,subprocess.CalledProcessError):
+                    reply['error'].update(exit_code=e.returncode,argv=e.cmd,stdout_hex=e.stdout[:65536].hex(),stderr_hex=e.stderr[:65536].hex(),truncated=len(e.stdout)>65536 or len(e.stderr)>65536)
+            closed=op['command']=='close'
+            reply.update(schema_version='melissa.web-reply/v1',seq=request['seq'],source_digest=P['source_digest'],closed=closed,task_completed=False)
+            raw=json.dumps(reply,ensure_ascii=False,default=str)
+            if len(raw.encode())>P['response_limit']:raise ValueError('response envelope exceeded; no truncated success')
+            # Preserve the existing C03 64KiB frame contract. Each bounded response
+            # fragment requires an acknowledgement, so the transport queue cannot
+            # lose a burst of screenshots/traces. The host validates exact sequence,
+            # total/part lengths, reassembles original UTF-8 bytes, then strict-parses.
+            encoded=raw.encode('utf-8');parts=(len(encoded)+24575)//24576
+            for index in range(parts):
+                fragment=encoded[index*24576:(index+1)*24576]
+                print(json.dumps({'schema_version':'melissa.web-fragment/v1','seq':request['seq'],'index':index,'parts':parts,'total_bytes':len(encoded),'data_hex':fragment.hex()}),flush=True)
+                ack=json.loads(sys.stdin.readline(2048))
+                if ack!={'ack':request['seq'],'index':index}:raise ValueError('response fragment acknowledgement mismatch')
+            if reply['ok'] and reply['body'].get('binary_artifact'):send_binary(request['seq'],reply['body']['binary_artifact'])
+            if closed:break
+    finally:cleanup()
+
+if __name__=="__main__":
+    main()

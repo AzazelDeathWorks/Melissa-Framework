@@ -19,6 +19,7 @@ pub mod project_memory;
 pub mod recipe;
 mod repository_signals;
 pub mod resources;
+pub mod services;
 pub mod session;
 mod session_ui;
 pub mod settings;

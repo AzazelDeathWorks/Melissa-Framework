@@ -60,6 +60,10 @@ pub(super) const COMMANDS: &[(&str, &str)] = &[
     ("/help", "Komutlar ve kısayollar"),
     ("/doctor", "Windows ve Docker hazırlığı"),
     (
+        "/services",
+        "[DOSYA] · yeni görevlerin servis/API/DB tercihi",
+    ),
+    (
         "/verification",
         "[DOSYA] · proje kontrol/debug tercihi; yeni görevler için",
     ),

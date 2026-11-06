@@ -63,3 +63,5 @@ MIT lisansı: [LICENSE](LICENSE).
 Büyük depolarda kaynak aktarımı, semantik gezinti ve yapısal değişiklik için [depo araçları kılavuzuna](docs/REPOSITORY_SCALE_TR.md) bakın.
 
 Proje kontrolleri, erken doğrulama, gerçek proje debug ayarı ve hata tekrar üretimi: [doğrulama rehberi](docs/VERIFICATION_TR.md).
+
+Göreve ait servisler, API sözleşmesi ve ayrı DB migration provası: [servis rehberi](docs/SERVICES_TR.md).

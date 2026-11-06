@@ -166,3 +166,5 @@ Komut davranışlarının resmi kaynakları: [mise exec](https://mise.jdx.dev/cl
 [Corepack packageManager](https://github.com/nodejs/corepack).
 
 Proje kontrolleri, erken doğrulama, gerçek proje debug ayarı ve hata tekrar üretimi: [doğrulama rehberi](VERIFICATION_TR.md).
+
+Göreve ait servisler, API sözleşmesi ve ayrı DB migration provası: [servis rehberi](SERVICES_TR.md).

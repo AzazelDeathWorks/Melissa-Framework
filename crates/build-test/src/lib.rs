@@ -238,6 +238,7 @@ impl RustPlan {
             .validate(limits.disk_bytes)
             .map_err(|_| Error::Invalid("build snapshot exceeds worker envelope"))?;
         let request = ContainerRequest {
+            backend: Default::default(),
             schema_version: "melissa.container-exec/v1".into(),
             image_id: RUST_IMAGE.into(),
             executable: "/usr/bin/python3".into(),

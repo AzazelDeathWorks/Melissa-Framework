@@ -25,6 +25,7 @@ const HELP: &str = "Bir görev yaz veya aşağıdaki komutları kullan.\n\
   /scope-approve ÖZET      Gösterilen hazırlık kapsamını kabul et\n\
   /pause  /cancel         Güvenli duraklatma veya iptal iste\n\
   /doctor                 Windows ve Docker hazırlığını kontrol et\n\
+  /services [DOSYA]       Yeni görevler için servis/API/DB tercihleri\n\
   /verification [DOSYA]   Proje kontrol/debug tercihini göster veya yeni görevlere ayarla\n\
   /config DOSYA           Özel model ayarlarını içe aktar\n\
   /acceptance DOSYA       Proje dışındaki kabul tarifini seç\n\
@@ -155,6 +156,14 @@ impl Session {
                 self.app.import_skill(&path_argument(path)?, None)?
             }
             ("/doctor", "") => crate::views::doctor()?,
+            ("/services", "") => {
+                serde_json::json!({"services":crate::services::settings::load(&self.app,&self.workspace)?})
+            }
+            ("/services", path) => crate::services::settings::configure(
+                &self.app,
+                &self.workspace,
+                &path_argument(path)?,
+            )?,
             ("/verification", "") => {
                 serde_json::json!({"verification":crate::project_verification::settings::load(&self.app,&self.workspace)?})
             }
@@ -462,6 +471,10 @@ impl Session {
             {
                 spec.validate(&contract.checks)?;
                 contract.verification = Some(spec);
+            }
+            if let Some(spec) = crate::services::settings::load(&self.app, &self.workspace)? {
+                spec.validate(&contract)?;
+                contract.services = Some(spec);
             }
             self.app.create_project(
                 &self.workspace,

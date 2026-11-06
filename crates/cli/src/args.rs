@@ -21,6 +21,13 @@ pub struct Options {
 pub const DOMAIN_HELP: &str = "\nWeb/API/veritabanı (v2 özel tarif):\n  melissa task preview ID [--out NEW_DIRECTORY]\n  melissa task evidence ID [--artifact ARTIFACT_ID --out NEW_FILE]\n\nYerel tarayıcı/API/SQLite/PostgreSQL akışları sabit image üzerinde çalışır. Public development ve private final testleri ayrıdır. Preview kaynağa bağlı PNG ihracıdır; kalıcı web sunucusu açmaz.\n";
 #[derive(Debug)]
 pub enum Command {
+    Services {
+        action: String,
+        id: Option<String>,
+        workspace: Option<PathBuf>,
+        path: Option<PathBuf>,
+        request: Option<String>,
+    },
     Verification {
         action: String,
         id: Option<String>,
@@ -197,6 +204,45 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options> {
         "init" => Command::Init,
         "profiles" => Command::Profiles,
         "doctor" => Command::Doctor,
+        "services" => {
+            let action = text(
+                a.next()
+                    .ok_or(Error::Usage("services configure|show|session|run gerekli."))?,
+            )?;
+            if !["configure", "show", "session", "run"].contains(&action.as_str()) {
+                return Err(Error::Usage("Bilinmeyen services işlemi."));
+            }
+            let id = if ["session", "run"].contains(&action.as_str()) {
+                Some(text(
+                    a.next().ok_or(Error::Usage("Görev kimliği gerekli."))?,
+                )?)
+            } else {
+                None
+            };
+            let allowed: &[&str] = match action.as_str() {
+                "configure" => &["--workspace", "--path"],
+                "show" => &["--workspace"],
+                "run" => &["--request-json"],
+                _ => &[],
+            };
+            let mut f = flags(&mut a, allowed)?;
+            let workspace = f.remove("--workspace").map(PathBuf::from);
+            let path = f.remove("--path").map(PathBuf::from);
+            let request = f.remove("--request-json").map(text).transpose()?;
+            if (id.is_none() && workspace.is_none())
+                || (action == "configure" && path.is_none())
+                || (action == "run" && request.is_none())
+            {
+                return Err(Error::Usage("Servis seçenekleri eksik."));
+            }
+            Command::Services {
+                action,
+                id,
+                workspace,
+                path,
+                request,
+            }
+        }
         "verification" => {
             let action = text(a.next().ok_or(Error::Usage(
                 "verification configure|show|verify|reproduce gerekli.",
@@ -589,3 +635,5 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options> {
 pub const REPOSITORY_HELP: &str = "\nDepo analizi (model/API çağırmaz):\n  melissa --json repository impact-map|structural-patch --workspace PATH --query JSON_FILE\n  Belgeler: docs/REPOSITORY_SCALE_TR.md\n";
 
 pub const VERIFICATION_HELP: &str = "\nProje doğrulama (model/API çağırmaz):\n  melissa --json verification configure --workspace PATH --path JSON_FILE\n  melissa --json verification show --workspace PATH\n  melissa --json verification reproduce TASK [--request-json JSON]\n  melissa --json verification verify TASK [--request-json JSON]\n  scripts/verify-change.ps1 ve scripts/reproduce-failure.ps1\n  Belgeler: docs/VERIFICATION_TR.md; sonuç PASS değilse çıkış kodu 7.\n";
+
+pub const SERVICES_HELP: &str = "\nProje servisleri (model sağlayıcısını çağırmaz):\n  /services [JSON_DOSYASI]  Yeni görevler için servis tercihi\n  melissa --json services configure --workspace PATH --path JSON\n  melissa --json services show --workspace PATH\n  melissa --json services session TASK\n  melissa --json services run TASK --request-json JSON_OPERATION\n  Belgeler: docs/SERVICES_TR.md. Oturum foreground; JSON komut veya /close, EOF.\n";

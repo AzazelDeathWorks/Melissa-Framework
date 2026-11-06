@@ -27,6 +27,7 @@ fn long_utf8_ustar_paths_reach_the_actual_worker_without_truncation() {
 }
 fn make_request(script: &str) -> ContainerRequest {
     ContainerRequest {
+        backend: Default::default(),
         schema_version: "melissa.container-exec/v1".into(),
         image_id: IMAGE.into(),
         executable: "/bin/sh".into(),

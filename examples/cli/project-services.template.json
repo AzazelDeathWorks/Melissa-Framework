@@ -1,0 +1,101 @@
+{
+  "backend": "compose",
+  "services": {
+    "api": {
+      "command": {
+        "executable": "python",
+        "argv": [
+          "app.py"
+        ],
+        "cwd": "."
+      },
+      "port": 8000,
+      "ready": {
+        "path": "/health",
+        "status": 200,
+        "timeout_ms": 20000
+      },
+      "depends_on": [
+        "database"
+      ]
+    }
+  },
+  "database": {
+    "engine": "postgres",
+    "schema": "db/v1.sql",
+    "sample": "db/sample.synthetic.sql",
+    "provenance": "synthetic"
+  },
+  "statements": {
+    "insert_item": "db/insert-item.sql"
+  },
+  "api_checks": {
+    "api_contract": {
+      "service": "api",
+      "schema": "openapi.json",
+      "seed": 42,
+      "examples": 50,
+      "phases": [
+        "examples",
+        "coverage",
+        "fuzzing",
+        "stateful"
+      ]
+    }
+  },
+  "business_checks": [
+    "operator-1"
+  ],
+  "rehearsals": {
+    "upgrade": {
+      "engine": "postgres",
+      "fresh": [
+        "db/v1.sql",
+        "db/up.sql"
+      ],
+      "baseline": "db/v1.sql",
+      "sample": "db/sample.synthetic.sql",
+      "upgrade": [
+        "db/up.sql"
+      ],
+      "downgrade": [
+        "db/down.sql"
+      ],
+      "transactional": true,
+      "provenance": "synthetic",
+      "before": [
+        {
+          "sql": "SELECT id,name FROM items ORDER BY id",
+          "rows": [
+            [
+              7,
+              "synthetic-record"
+            ]
+          ]
+        }
+      ],
+      "after": [
+        {
+          "sql": "SELECT id,name,score FROM items ORDER BY id",
+          "rows": [
+            [
+              7,
+              "synthetic-record",
+              0
+            ]
+          ]
+        }
+      ]
+    }
+  },
+  "acceptance": [
+    {
+      "kind": "contract",
+      "name": "api_contract"
+    },
+    {
+      "kind": "migration",
+      "name": "upgrade"
+    }
+  ]
+}

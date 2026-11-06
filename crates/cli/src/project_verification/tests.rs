@@ -141,6 +141,7 @@ async fn native_reproduction_scoped_fix_early_checks_and_regression_keep_one_tas
         debug: None,
     };
     let contract = Contract {
+        services: None,
         verification: Some(spec),
         extensions: None,
         environment: Environment::default(),
@@ -462,6 +463,7 @@ fn native_rust_nextest_coverage_mutation_and_cargo_doctest_are_separate_checks()
         ..Default::default()
     };
     let contract = Contract {
+        services: None,
         verification: Some(spec),
         extensions: None,
         environment,
@@ -521,6 +523,7 @@ fn native_missing_tool_and_skipped_tests_are_not_passing_acceptance() {
             )
         };
         let contract = Contract {
+            services: None,
             verification: Some(Spec {
                 checks: BTreeMap::from([("tests".into(), check)]),
                 ..Default::default()
@@ -579,6 +582,7 @@ fn native_nextest_recovered_retry_is_flaky_not_a_clean_pass() {
         ..Default::default()
     };
     let contract = Contract {
+        services: None,
         verification: Some(Spec {
             checks: BTreeMap::from([(
                 "tests".into(),
@@ -635,6 +639,7 @@ async fn native_project_debug_is_exposed_only_from_reviewed_config() {
     )
     .unwrap();
     let contract = Contract {
+        services: None,
         verification: Some(Spec {
             debug: Some(melissa_build_test::debug::Launch {
                 language: melissa_build_test::full::Language::Python,
@@ -726,6 +731,7 @@ async fn unfinished_intent_and_wrong_artifact_never_replay_or_become_model_evide
     use melissa_model_gateway::{ToolCall, tools::ToolDispatcher};
     let f = Fixture::new(false);
     let contract = Contract {
+        services: None,
         verification: Some(Spec::default()),
         extensions: None,
         environment: Environment::default(),
@@ -800,6 +806,7 @@ fn native_operator_helpers_preserve_failure_and_same_task_after_pause() {
         ..Default::default()
     };
     let contract = Contract {
+        services: None,
         verification: Some(spec.clone()),
         extensions: None,
         environment: Environment::default(),
@@ -972,6 +979,7 @@ fn native_default_python_counts_and_unusable_reports_remain_explicit() {
             }
         };
         let contract = Contract {
+            services: None,
             verification: Some(Spec {
                 checks: BTreeMap::from([("tests".into(), check)]),
                 ..Default::default()
@@ -1019,6 +1027,7 @@ fn reviewed_launch_does_not_require_or_grant_debug_to_a_navigation_only_role() {
     for configured in [false, true] {
         let f = Fixture::new(false);
         let contract = Contract {
+            services: None,
             verification: Some(Spec {
                 debug: configured.then(|| melissa_build_test::debug::Launch {
                     language: melissa_build_test::full::Language::Python,

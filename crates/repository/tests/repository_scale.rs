@@ -328,6 +328,7 @@ fn native_structural_refactor_runs_real_callers_from_more_than_1024_files() {
     let mut limits = support::limits();
     limits.export_bytes = 0;
     let request = melissa_container_executor::ContainerRequest {
+        backend: Default::default(),
         schema_version: "melissa.container-exec/v1".into(),
         image_id: "sha256:fd18bccfbb336754152a58054354bcea114919c38c07ab40a25ced856f613c1e".into(),
         executable: "/usr/bin/python3".into(),

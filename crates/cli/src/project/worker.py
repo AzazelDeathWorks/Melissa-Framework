@@ -104,6 +104,15 @@ def probe(tool):
     return version
 
 def preflight():
+    requirements = P.get("service_requirements", {})
+    if requirements.get("contract") and not Path("/opt/melissa-contracts/bin/schemathesis").is_file():
+        raise RuntimeError("Selected service SDK has no reviewed Schemathesis executable")
+    if requirements.get("postgres"):
+        if not any(Path("/usr/lib/postgresql").glob("*/bin/postgres")):
+            raise RuntimeError("Selected service SDK has no PostgreSQL engine")
+        adapter_probe = subprocess.run(["/opt/melissa-python/bin/python", "-I", "-c", "import psycopg"], env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        if adapter_probe.returncode:
+            raise RuntimeError("Selected service SDK has no PostgreSQL adapter")
     tools = set(ENVIRONMENT["versions"])
     for command in [P["command"], *P.get("sync", []), *P.get("required_commands", [])]:
         name = Path(command["executable"]).name
