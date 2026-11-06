@@ -1,5 +1,6 @@
 //! Task-owned loopback service bundles, contract checks and disposable DB rehearsals.
 pub mod final_check;
+pub mod frontend;
 pub mod host;
 pub mod operator;
 pub mod settings;
@@ -83,10 +84,13 @@ pub struct Rehearsal {
 pub enum Required {
     Contract { name: String },
     Migration { name: String },
+    Browser { name: String },
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Spec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser: Option<frontend::Spec>,
     #[serde(default)]
     pub acceptance: Vec<Required>,
     #[serde(default)]
@@ -122,6 +126,9 @@ impl Spec {
             return Err(Error::Usage(
                 "Servis, özel DB veya migration provası gerekli.",
             ));
+        }
+        if let Some(browser) = &self.browser {
+            browser.validate(self)?;
         }
         let mut ports = BTreeSet::new();
         ports.insert(37642);
@@ -220,6 +227,14 @@ impl Spec {
                 }
                 Required::Migration { name } if !self.rehearsals.contains_key(name) => {
                     return Err(Error::Usage("Son kabul migration provası kayıtlı değil."));
+                }
+                Required::Browser { name }
+                    if !self
+                        .browser
+                        .as_ref()
+                        .is_some_and(|b| b.checks.contains_key(name)) =>
+                {
+                    return Err(Error::Usage("Son frontend kontrolü kayıtlı değil."));
                 }
                 _ => {}
             }

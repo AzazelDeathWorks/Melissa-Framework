@@ -2231,6 +2231,7 @@
         "melissa.code.database",
         "melissa.code.debugger",
         "melissa.code.dependency-build",
+        "melissa.code.frontend",
         "melissa.code.implementer",
         "melissa.code.release-engineer",
         "melissa.code.security-reviewer",

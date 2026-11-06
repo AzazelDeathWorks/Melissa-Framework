@@ -190,3 +190,5 @@ ve hedef temizlenirken diğer DB'nin çalışması gerçekten kontrol edilir. Ho
 ayrı özel Python ortamı ve [Windows lock dosyası](../scripts/tests/services-testcontainers-windows.lock)
 kullanılır; bu Docker SDK erişimi model araçlarına veya worker'a verilmez. Ryuk
 kapalıdır; test yalnız kendi kesin container nesnelerini finally içinde kaldırır.
+
+Genel proje browser ve canlı önizleme: [frontend doğrulama](FRONTEND_VERIFY_TR.md).

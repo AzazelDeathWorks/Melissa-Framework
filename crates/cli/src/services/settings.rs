@@ -74,6 +74,9 @@ pub fn configure(app: &App, workspace: &Path, path: &Path) -> Result<serde_json:
         sync: vec![],
     };
     spec.validate(&contract)?;
+    if let Some(browser) = &spec.browser {
+        super::frontend::baseline::has_baselines(app, workspace, browser)?;
+    }
     let (destination, binding) = slot(app, workspace)?;
     std::fs::create_dir_all(destination.parent().ok_or(Error::Io)?)?;
     safe_path(&destination)?;

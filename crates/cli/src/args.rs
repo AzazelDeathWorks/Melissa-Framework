@@ -209,10 +209,12 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options> {
                 a.next()
                     .ok_or(Error::Usage("services configure|show|session|run gerekli."))?,
             )?;
-            if !["configure", "show", "session", "run"].contains(&action.as_str()) {
+            if !["configure", "show", "session", "run", "baseline-accept"]
+                .contains(&action.as_str())
+            {
                 return Err(Error::Usage("Bilinmeyen services işlemi."));
             }
-            let id = if ["session", "run"].contains(&action.as_str()) {
+            let id = if ["session", "run", "baseline-accept"].contains(&action.as_str()) {
                 Some(text(
                     a.next().ok_or(Error::Usage("Görev kimliği gerekli."))?,
                 )?)
@@ -222,7 +224,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options> {
             let allowed: &[&str] = match action.as_str() {
                 "configure" => &["--workspace", "--path"],
                 "show" => &["--workspace"],
-                "run" => &["--request-json"],
+                "run" | "baseline-accept" => &["--request-json"],
                 _ => &[],
             };
             let mut f = flags(&mut a, allowed)?;
@@ -231,7 +233,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options> {
             let request = f.remove("--request-json").map(text).transpose()?;
             if (id.is_none() && workspace.is_none())
                 || (action == "configure" && path.is_none())
-                || (action == "run" && request.is_none())
+                || (["run", "baseline-accept"].contains(&action.as_str()) && request.is_none())
             {
                 return Err(Error::Usage("Servis seçenekleri eksik."));
             }
@@ -636,4 +638,4 @@ pub const REPOSITORY_HELP: &str = "\nDepo analizi (model/API çağırmaz):\n  me
 
 pub const VERIFICATION_HELP: &str = "\nProje doğrulama (model/API çağırmaz):\n  melissa --json verification configure --workspace PATH --path JSON_FILE\n  melissa --json verification show --workspace PATH\n  melissa --json verification reproduce TASK [--request-json JSON]\n  melissa --json verification verify TASK [--request-json JSON]\n  scripts/verify-change.ps1 ve scripts/reproduce-failure.ps1\n  Belgeler: docs/VERIFICATION_TR.md; sonuç PASS değilse çıkış kodu 7.\n";
 
-pub const SERVICES_HELP: &str = "\nProje servisleri (model sağlayıcısını çağırmaz):\n  /services [JSON_DOSYASI]  Yeni görevler için servis tercihi\n  melissa --json services configure --workspace PATH --path JSON\n  melissa --json services show --workspace PATH\n  melissa --json services session TASK\n  melissa --json services run TASK --request-json JSON_OPERATION\n  Belgeler: docs/SERVICES_TR.md. Oturum foreground; JSON komut veya /close, EOF.\n";
+pub const SERVICES_HELP: &str = "\nProje servisleri (model sağlayıcısını çağırmaz):\n  /services [JSON_DOSYASI]  Yeni görevler için servis tercihi\n  melissa --json services configure --workspace PATH --path JSON\n  melissa --json services show --workspace PATH\n  melissa --json services session TASK\n  melissa --json services run TASK --request-json JSON_OPERATION\n  Belgeler: docs/SERVICES_TR.md ve docs/FRONTEND_VERIFY_TR.md. Browser ayarında session canlı preview_ready URL verir. Oturum foreground; JSON komut veya /close, EOF.\n  services baseline-accept TASK --request-json JSON_ACCEPT: yalnız operatörün incelediği checkpoint PNG ve tam review_digest; oturum kapalı olmalı.\n";

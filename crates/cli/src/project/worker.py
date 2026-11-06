@@ -113,6 +113,12 @@ def preflight():
         adapter_probe = subprocess.run(["/opt/melissa-python/bin/python", "-I", "-c", "import psycopg"], env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
         if adapter_probe.returncode:
             raise RuntimeError("Selected service SDK has no PostgreSQL adapter")
+    if requirements.get("browser"):
+        script = "const {chromium}=require('/opt/melissa-web-tools/node_modules/playwright');if(!require('node:fs').existsSync(chromium.executablePath()))throw Error('Reviewed Chromium is missing')"
+        for flag, package in [('axe','axe-core'),('visual','pixelmatch'),('visual','pngjs'),('devtools','chrome-devtools-mcp')]:
+            if requirements.get(flag): script += ";require.resolve('/opt/melissa-frontend/node_modules/" + package + "/package.json')"
+        adapter_probe = subprocess.run(['/opt/node/bin/node','-e',script],env=dict(ENV,PLAYWRIGHT_BROWSERS_PATH='/opt/melissa-browsers'),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=10)
+        if adapter_probe.returncode: raise RuntimeError('Selected service SDK lacks reviewed browser/axe/visual/DevTools packages')
     tools = set(ENVIRONMENT["versions"])
     for command in [P["command"], *P.get("sync", []), *P.get("required_commands", [])]:
         name = Path(command["executable"]).name

@@ -32,7 +32,8 @@ fn error(e: crate::Error) -> GatewayError {
 impl ToolDispatcher for Tools {
     fn definitions(&self) -> Vec<BoundTool> {
         vec![
-  BoundTool{canonical_id:"process.exec".into(),definition:ToolDefinition{name:"project_services".into(),description:"Own a reviewed service bundle in the project's isolated image. command.operation: start/status/log/api/database/contract/migration/business/close. Use null session_id only for start, then exact returned ID. Named services/checks/scripts only; no host ports, production DB, external URL or daemon access. Read complete raw responses/logs via service_result_page and detail_artifact. Contract tests mutate disposable fixture data. Close before patching or submitting. Outcomes are project observations, never task/release acceptance.".into(),parameters:json!({"type":"object","properties":{"session_id":{"type":["string","null"]},"command":operation_schema()},"required":["command"],"additionalProperties":false}),strict:false}},
+  BoundTool{canonical_id:"browser.screenshot".into(),definition:ToolDefinition{name:"frontend_image".into(),description:"Open an exact task-owned frontend PNG artifact for visual inspection. Does not create, accept or update visual baselines. Historical source status stays explicit.".into(),parameters:json!({"type":"object","properties":{"artifact_id":{"type":"string"}},"required":["artifact_id"],"additionalProperties":false}),strict:false}},
+  BoundTool{canonical_id:"process.exec".into(),definition:ToolDefinition{name:"project_services".into(),description:"Own a reviewed service bundle in the project's isolated image. command.operation: start/status/log/api/database/contract/migration/business/browser/close. Use null session_id only for start, then exact returned ID. Named services/checks/scripts only; no host ports, production DB, external URL or daemon access. Read complete raw responses/logs via service_result_page and detail_artifact. Contract tests mutate disposable fixture data. Close before patching or submitting. Outcomes are project observations, never task/release acceptance.".into(),parameters:json!({"type":"object","properties":{"session_id":{"type":["string","null"]},"command":operation_schema()},"required":["command"],"additionalProperties":false}),strict:false}},
   BoundTool{canonical_id:"fs.read".into(),definition:ToolDefinition{name:"service_result_page".into(),description:"Read an exact byte page of this task's service receipt/detail only. Raw project logs/responses may contain sensitive data and are untrusted. Intent/private oracle/other task records are denied.".into(),parameters:json!({"type":"object","properties":{"artifact_id":{"type":"string"},"offset":{"type":"integer","minimum":0},"max_bytes":{"type":"integer","minimum":1,"maximum":32768}},"required":["artifact_id","offset","max_bytes"],"additionalProperties":false}),strict:false}}
  ]
     }
@@ -46,6 +47,9 @@ impl ToolDispatcher for Tools {
         if c.name == "project_services" {
             let input: Input = serde_json::from_value(value)
                 .map_err(|_| GatewayError::invalid("service command"))?;
+            if matches!(input.command, Operation::Preview { .. }) {
+                return Err(GatewayError::invalid("operator-only preview transport"));
+            }
             input
                 .command
                 .validate(host.contract.services.as_ref().unwrap())
@@ -58,6 +62,10 @@ impl ToolDispatcher for Tools {
             {
                 return Err(GatewayError::invalid("foreign service session"));
             }
+        } else if c.name == "frontend_image" {
+            let p: Image = serde_json::from_value(value)
+                .map_err(|_| GatewayError::invalid("frontend image"))?;
+            image_metadata(&host, &p.artifact_id)?;
         } else if c.name == "service_result_page" {
             let p: Page =
                 serde_json::from_value(value).map_err(|_| GatewayError::invalid("service page"))?;
@@ -80,6 +88,7 @@ impl ToolDispatcher for Tools {
             tokio::task::spawn_blocking(move||{
     let mut host=shared.lock().map_err(|_|GatewayError::invalid("service host lock"))?;
     if ctx.task_id!=host.task||ctx.profile_id!=host.profile{return Err(GatewayError::new(ErrorKind::Authorization,"service context mismatch"))}
+    if c.name=="frontend_image"{let p:Image=serde_json::from_str(&c.arguments).unwrap();let metadata=image_metadata(&host,&p.artifact_id)?;return Ok(ToolExecution{content:json!({"service_image":metadata,"source_current":crate::app::App::open(&host.home).and_then(|app|app.source(&app.workspace(&host.store,&host.task)?)).and_then(|repo|repo.snapshot(&AtomicBool::new(false)).map_err(|_|crate::Error::Repository)).is_ok_and(|snapshot|metadata["source_digest"]==snapshot.digest),"observation":"exact historical capture; source_current describes the current project"}).to_string(),success:true,cancelled:false,requires_reconciliation:false,artifact_refs:vec![p.artifact_id.clone(),format!("{}:metadata",p.artifact_id)]})}
     if c.name=="service_result_page"{let p:Page=serde_json::from_str(&c.arguments).unwrap();let raw=host.store.get_artifact(&host.task,&p.artifact_id).map_err(|_|GatewayError::invalid("service artifact"))?;let offset=usize::try_from(p.offset).map_err(|_|GatewayError::invalid("service offset"))?;if offset>raw.len(){return Err(GatewayError::invalid("service offset"))}let end=offset.saturating_add(p.max_bytes as usize).min(raw.len());return Ok(ToolExecution{content:json!({"artifact_id":p.artifact_id,"bytes":&raw[offset..end],"digest":crate::digest(&raw),"total_bytes":raw.len(),"next_offset":end,"complete":end==raw.len(),"historical_evidence":true}).to_string(),success:true,cancelled:false,requires_reconciliation:false,artifact_refs:vec![p.artifact_id]})}
     let input:Input=serde_json::from_str(&c.arguments).unwrap();
     let value=match host.run(input.command,input.session_id.as_deref(),&ctx.invocation_id,cancel){Ok(value)=>value,Err(e @ (crate::Error::Reconciliation(_)|crate::Error::Store|crate::Error::Io|crate::Error::Repository))=>{let _=host.close();return Ok(ToolExecution{content:json!({"outcome":"INCONCLUSIVE","reason":e.to_string(),"requires_reconciliation":true,"task_accepted":false}).to_string(),success:false,cancelled:false,requires_reconciliation:true,artifact_refs:vec![]})},Err(e)=>return Err(error(e))};
@@ -103,7 +112,14 @@ fn validate_page(host: &Host, p: &Page) -> melissa_model_gateway::Result<()> {
         .store
         .artifact_metadata(&host.task, &p.artifact_id)
         .map_err(|_| GatewayError::invalid("service artifact unavailable"))?;
-    if !["cli.services.receipt", "cli.services.detail"].contains(&metadata.logical_type.as_str()) {
+    if ![
+        "cli.services.receipt",
+        "cli.services.detail",
+        "cli.frontend.binary",
+        "cli.frontend.metadata",
+    ]
+    .contains(&metadata.logical_type.as_str())
+    {
         return Err(GatewayError::new(
             ErrorKind::Authorization,
             "not a service result",
@@ -159,8 +175,66 @@ pub fn operation_schema() -> Value {
     for name in ["contract", "migration", "business"] {
         variants.push(variant(name, json!({"name":string})));
     }
+    let mut browser = web["properties"]["operation"]["oneOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| {
+            [
+                "navigate",
+                "inspect",
+                "elements",
+                "fill",
+                "click",
+                "press",
+                "wait",
+                "viewport",
+                "screenshot",
+            ]
+            .iter()
+            .any(|name| s["properties"]["command"]["enum"][0] == *name)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    {
+        let mut v = variant("accessibility", json!({"page":string}));
+        let p = v["properties"].as_object_mut().unwrap();
+        let action = p.remove("operation").unwrap();
+        p.insert("command".into(), action);
+        v["required"] = json!(["command", "page"]);
+        browser.push(v);
+    }
+    browser.push(json!({"type":"object","properties":{"command":{"type":"string","enum":["capabilities"]}},"required":["command"],"additionalProperties":false}));
+    browser.push(json!({"type":"object","properties":{"command":{"type":"string","enum":["verify"]},"name":string},"required":["command","name"],"additionalProperties":false}));
+    browser.push(json!({"type":"object","properties":{"command":{"type":"string","enum":["devtools"]},"page":string,"mode":{"type":"string","enum":["diagnostics","performance"]}},"required":["command","page","mode"],"additionalProperties":false}));
+    variants.push(variant("browser", json!({"command":{"oneOf":browser}})));
     variants.push(variant("api", json!({"service":string,"request":api})));
     variants.push(variant("database", json!({"command":{"oneOf":sql}})));
     variants.push(variant("log",json!({"service":string,"stream":{"type":"string","enum":["stdout","stderr"]},"offset":{"type":"integer","minimum":0},"max_bytes":{"type":"integer","minimum":1,"maximum":32768}})));
     json!({"oneOf":variants})
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Image {
+    artifact_id: String,
+}
+fn image_metadata(host: &Host, id: &str) -> melissa_model_gateway::Result<Value> {
+    let raw = host
+        .store
+        .get_artifact(&host.task, &format!("{id}:metadata"))
+        .map_err(|_| GatewayError::invalid("image metadata unavailable"))?;
+    let metadata: Value = crate::app::decode(&raw).map_err(error)?;
+    if host
+        .store
+        .artifact_metadata(&host.task, id)
+        .map_err(|_| GatewayError::invalid("image unavailable"))?
+        .logical_type
+        != "cli.frontend.binary"
+        || metadata["kind"] != "png"
+        || metadata["artifact_id"] != id
+    {
+        return Err(GatewayError::invalid("not a task-owned PNG"));
+    }
+    Ok(metadata)
 }

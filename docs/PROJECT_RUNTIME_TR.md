@@ -168,3 +168,5 @@ Komut davranışlarının resmi kaynakları: [mise exec](https://mise.jdx.dev/cl
 Proje kontrolleri, erken doğrulama, gerçek proje debug ayarı ve hata tekrar üretimi: [doğrulama rehberi](VERIFICATION_TR.md).
 
 Göreve ait servisler, API sözleşmesi ve ayrı DB migration provası: [servis rehberi](SERVICES_TR.md).
+
+Genel proje browser ve canlı önizleme: [frontend doğrulama](FRONTEND_VERIFY_TR.md).

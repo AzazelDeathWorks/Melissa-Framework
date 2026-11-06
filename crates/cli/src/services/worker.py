@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import signal
 import shutil
 import subprocess
@@ -25,6 +26,10 @@ database = None
 started = False
 closed = False
 sequence = 0
+browser_process = None
+browser_start_failure = None
+collected_browser_artifacts = set()
+last_browser_body = None
 origins = {name: 'http://127.0.0.1:' + str(s['port']) for name, s in SPEC['services'].items()}
 base_environment = dict(os.environ)
 
@@ -396,8 +401,96 @@ def business_check(name):
 
 
 
+def browser_call(command):
+    global browser_process, last_browser_body, browser_start_failure
+    if browser_start_failure is not None:
+        return browser_start_failure
+    if browser_process is None:
+        if not SPEC.get('browser'):
+            raise ValueError('browser configuration missing')
+        browser_process = subprocess.Popen(['/opt/node/bin/node', str(PRIVATE / 'browser.cjs')],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=(PRIVATE / 'browser-stderr.log').open('wb'),
+            text=True, bufsize=1, env=dict(environment(), PLAYWRIGHT_BROWSERS_PATH="/opt/melissa-browsers"), start_new_session=True)
+        initialized = browser_call({'command': 'start'})
+        if initialized.get('outcome') in ('FAIL','BLOCKED'):
+            browser_start_failure = initialized
+            return initialized
+    browser_process.stdin.write(json.dumps(command) + '\n')
+    browser_process.stdin.flush()
+    selector = selectors.DefaultSelector()
+    selector.register(browser_process.stdout, selectors.EVENT_READ)
+    try:
+        if not selector.select(125):
+            raise BrowserUncertain('browser response timeout; do not replay')
+        line = browser_process.stdout.readline(P['max_bytes'] + 1)
+    finally:
+        selector.close()
+    if not line or len(line) > P['max_bytes']:
+        raise BrowserUncertain('browser response incomplete or oversized')
+    reply = json.loads(line)
+    if not reply.get('ok'):
+        return {'outcome': 'BLOCKED' if command['command']=='start' else 'FAIL', 'browser_error': reply.get('error'), 'browser_command': command['command'], 'application_navigation_started': command['command']!='start'}
+    last_browser_body = reply['body']
+    return reply['body']
+
+
+def collect_browser_artifacts(body):
+    artifacts = {}
+    state = PRIVATE / 'browser-state'
+    def collect(value):
+        if isinstance(value, dict):
+            if all(k in value for k in ('id', 'kind', 'bytes', 'sha256')):
+                key = value['id']
+                if not re.fullmatch(r'a[0-9]+', key):
+                    raise ValueError('browser artifact path denied')
+                if key not in collected_browser_artifacts:
+                    data = read_bounded(state / 'artifacts' / key)
+                    if len(data) != value['bytes'] or 'sha256:' + hashlib.sha256(data).hexdigest() != value['sha256']:
+                        raise BrowserUncertain('browser artifact digest mismatch')
+                    artifacts[key] = dict(value, data_hex=data.hex())
+            for item in value.values(): collect(item)
+        elif isinstance(value, list):
+            for item in value: collect(item)
+    collect(body)
+    if len(json.dumps(artifacts)) > P['max_bytes'] - len(json.dumps(body)) - 65536:
+        raise OverflowError('complete browser artifacts exceed reviewed response capacity')
+    collected_browser_artifacts.update(artifacts)
+    return artifacts
+
+
+class BrowserUncertain(Exception):
+    pass
+
+
+def preview_request(value):
+    if value['service'] != SPEC['browser']['service']:
+        raise ValueError('preview destination denied')
+    data = bytes.fromhex(value['body_hex'])
+    request = urllib.request.Request(origins[value['service']] + value['path'],
+        data=data if value['method'] not in ('GET','HEAD') else None,
+        method=value['method'], headers={'content-type': value.get('content_type') or 'application/octet-stream'})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    try:
+        try: response = opener.open(request, timeout=20)
+        except urllib.error.HTTPError as error: response = error
+        with response:
+            raw = response.read(max(0, (P['max_bytes'] - 65536) // 2) + 1)
+            if len(raw) * 2 > P['max_bytes'] - 65536: raise OverflowError('preview response exceeds reviewed capacity')
+            return {'status': response.status, 'content_type': response.headers.get('content-type','application/octet-stream'), 'data_hex': raw.hex(), 'outcome': 'PASS'}
+    except urllib.error.URLError:
+        return {'outcome': 'FAIL' if value['method'] in ('GET','HEAD') else 'INCONCLUSIVE', 'effect': 'read_failed' if value['method'] in ('GET','HEAD') else 'outcome_unknown'}
+
+
 def cleanup():
     global closed
+    if browser_process and browser_process.poll() is None:
+        try:
+            os.killpg(browser_process.pid, signal.SIGTERM)
+            browser_process.wait(timeout=3)
+        except (subprocess.TimeoutExpired, ProcessLookupError):
+            try: os.killpg(browser_process.pid, signal.SIGKILL)
+            except ProcessLookupError: pass
+            browser_process.wait(timeout=3)
     for item in reversed(list(children.values())):
         process = item['process']
         if process.poll() is None:
@@ -420,6 +513,7 @@ def operation(value):
     if kind == 'start':
         return start()
     if kind == 'close':
+        browser_close = browser_call({'command':'close'}) if browser_process and browser_process.poll() is None else None
         cleanup()
         logs = {}
         remaining = max(0, (P['max_bytes'] - 65536) // 2)
@@ -430,7 +524,7 @@ def operation(value):
                     data = read_bounded(path, remaining)
                     remaining -= len(data)
                     logs[name][stream + '_hex'] = data.hex()
-            return {'closed': True, 'native_stop_proof_required': True, 'log_capture': 'PASS', 'service_logs': logs}
+            return {'outcome': browser_close.get('outcome','PASS') if browser_close else 'PASS', 'closed': True, 'native_stop_proof_required': True, 'log_capture': 'PASS', 'service_logs': logs, 'browser': browser_close}
         except OverflowError:
             sizes = {name: {stream: path.stat().st_size for stream, path in item.items()} for name, item in log_sources().items()}
             return {'outcome': 'BLOCKED', 'closed': True, 'native_stop_proof_required': True,
@@ -442,6 +536,10 @@ def operation(value):
         return status()
     if kind == 'log':
         return log_page(value['service'], value['stream'], value['offset'], value['max_bytes'])
+    if kind == 'browser':
+        return browser_call(value['command'])
+    if kind == 'preview':
+        return preview_request(value)
     if kind == 'api':
         return api(value['service'], value['request'])
     if kind == 'database':
@@ -477,9 +575,11 @@ try:
             source_current = verify_source_manifest(ROOT, P)
             if not historical and not source_current:
                 outcome, uncertain = 'INCONCLUSIVE', True
-            reply = {'outcome': outcome, 'body': body, 'requires_reconciliation': uncertain, 'worker_source_current': source_current}
+            reply = {'outcome': outcome, 'body': body, 'requires_reconciliation': uncertain, 'worker_source_current': source_current, 'browser_artifacts': collect_browser_artifacts(body) if browser_process else {}}
         except StartupFailure as error:
             reply = {'outcome': 'FAIL', 'reason': 'service_readiness_failed', 'body': error.args[0], 'requires_reconciliation': False}
+        except BrowserUncertain as error:
+            reply = {'outcome':'INCONCLUSIVE','reason':str(error),'requires_reconciliation':True}
         except SourceChanged:
             reply = {'outcome': 'BLOCKED', 'reason': 'worker_source_changed_before_operation', 'requires_reconciliation': False}
         except FileNotFoundError:

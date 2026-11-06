@@ -48,6 +48,15 @@ async fn run(options: &args::Options) -> Result<Value> {
                 workspace.as_ref().unwrap(),
                 path.as_ref().unwrap(),
             ),
+            "baseline-accept" => melissa_cli::services::frontend::baseline::accept(
+                &app,
+                id.as_ref().unwrap(),
+                serde_json::from_value(
+                    melissa_model_gateway::strict_json(request.as_ref().unwrap())
+                        .map_err(|_| melissa_cli::Error::Usage("Referans JSON geçersiz."))?,
+                )
+                .map_err(|_| melissa_cli::Error::Usage("Referans seçimi geçersiz."))?,
+            ),
             "show" => Ok(
                 json!({"services":melissa_cli::services::settings::load(&app,workspace.as_ref().unwrap())?}),
             ),

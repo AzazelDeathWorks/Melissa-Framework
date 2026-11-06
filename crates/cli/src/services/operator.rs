@@ -149,12 +149,14 @@ impl App {
             json!({}),
         )?;
         let interactive = operation.is_none();
+        let mut preview = None;
         let result:Result<Value>=async{
    let start=drive(host.clone(),Operation::Start,&control,signal.clone()).await?;
    if start["outcome"]!="PASS"{return Ok(start)}
    let value=if let Some(op)=operation{drive(host.clone(),op,&control,signal.clone()).await?}else{
     use std::io::BufRead;
     println!("{}",start);
+    if let Some(browser)=&spec.browser {let owned=super::frontend::preview::Preview::start(host.clone(),browser.service.clone())?;println!("{}",json!({"event":"preview_ready","url":owned.url,"source_digest":start["source_digest"],"session_id":start["session_id"],"scope":"operator_loopback_http; WebSocket and service workers are verified in the owned browser"}));preview=Some(owned);}
     let(tx,mut rx)=tokio::sync::mpsc::unbounded_channel();
     let _reader=std::thread::Builder::new().name("service-terminal-input".into()).spawn(move||{for line in std::io::stdin().lock().lines(){if tx.send(line).is_err(){break;}}})?;
     let mut last=start.clone();
@@ -173,9 +175,11 @@ impl App {
      }
     }last
    };
+   drop(preview.take());
    let closed=if !signal.load(Ordering::Acquire){Some(drive(host.clone(),Operation::Close,&control,signal.clone()).await?)}else{None};
    Ok(json!({"result":value,"start":start,"close":closed}))
   }.await;
+        drop(preview);
         host.lock().map_err(|_| Error::Store)?.close()?;
         if !crate::engine::native_stop_proven(&store, id)? {
             return Err(Error::Reconciliation(

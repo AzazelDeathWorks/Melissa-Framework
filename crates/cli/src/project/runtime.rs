@@ -142,7 +142,7 @@ impl Runtime {
         let program = json!({"environment":self.contract.environment,"command":command,"required_commands":self.contract.checks.values().chain(self.contract.services.iter().flat_map(|s|s.services.values().map(|s|&s.command))).collect::<Vec<_>>(),"constraints":discovery.constraints,"preflight_only":preflight_only,"sync":self.contract.sync});
         let program = if let Some(services) = &self.contract.services {
             let mut program = program;
-            program["service_requirements"] = json!({"contract":!services.api_checks.is_empty(),"postgres":services.database.as_ref().is_some_and(|d|matches!(d.engine,melissa_web_development::plan::Database::Postgres))||services.rehearsals.values().any(|r|matches!(r.engine,melissa_web_development::plan::Database::Postgres))});
+            program["service_requirements"] = json!({"browser":services.browser.is_some(),"axe":services.browser.is_some(),"visual":services.browser.as_ref().is_some_and(|b|b.checks.values().any(|c|!c.visual.is_empty())),"devtools":services.browser.as_ref().is_some_and(|b|b.devtools),"contract":!services.api_checks.is_empty(),"postgres":services.database.as_ref().is_some_and(|d|matches!(d.engine,melissa_web_development::plan::Database::Postgres))||services.rehearsals.values().any(|r|matches!(r.engine,melissa_web_development::plan::Database::Postgres))});
             program
         } else {
             program

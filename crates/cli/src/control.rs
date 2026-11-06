@@ -116,11 +116,9 @@ fn aad(task: &str) -> String {
 fn write(path: &Path, key: &StoreKey, task: &str, value: &impl Serialize, replace: bool) -> Result {
     safe_path(path)?;
     let encrypted = key.seal(&bytes(value)?, aad(task).as_bytes())?;
-    let target = if replace {
-        path.with_extension(format!("{}.tmp", nonce()?))
-    } else {
-        path.to_path_buf()
-    };
+    // Readers enumerate request-*.enc. Never expose that name until the entire
+    // authenticated record is durable and the writer handle has closed.
+    let target = path.with_extension(format!("{}.tmp", nonce()?));
     let mut f = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -130,7 +128,37 @@ fn write(path: &Path, key: &StoreKey, task: &str, value: &impl Serialize, replac
     drop(f);
     if replace {
         fs::rename(target, path)?;
+    } else {
+        publish_new(&target, path)?;
     }
+    Ok(())
+}
+#[cfg(windows)]
+fn publish_new(source: &Path, destination: &Path) -> Result {
+    use std::os::windows::ffi::OsStrExt;
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // No REPLACE_EXISTING flag: a colliding request is preserved, never replaced.
+    if unsafe {
+        windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            0,
+        )
+    } == 0
+    {
+        return Err(Error::Io);
+    }
+    Ok(())
+}
+#[cfg(not(windows))]
+fn publish_new(source: &Path, destination: &Path) -> Result {
+    fs::hard_link(source, destination)?;
+    fs::remove_file(source)?;
     Ok(())
 }
 fn read<T: serde::de::DeserializeOwned>(
@@ -267,6 +295,52 @@ impl App {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+    #[test]
+    fn control_requests_publish_complete_records_and_never_replace_a_collision() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        App::init(&home).unwrap();
+        let app = App::open(&home).unwrap();
+        let task = "task_00000000000000000000000000000003";
+        fs::create_dir(app.home.join("tasks").join(task)).unwrap();
+        let control = Control::new(
+            &app,
+            task,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        control
+            .publish("agent", Value::Null, Value::Null, Value::Null, Value::Null)
+            .unwrap();
+        let unfinished = control.root.join("request-unpublished.tmp");
+        fs::write(&unfinished, b"partial unauthenticated bytes").unwrap();
+        control.poll().unwrap();
+        assert!(!control.cancel.load(Ordering::Acquire));
+        let request = Request {
+            schema_version: "melissa.cli-control-request/v1".into(),
+            task_id: task.into(),
+            session: control.session.clone(),
+            nonce: nonce().unwrap(),
+            action: "cancel".into(),
+        };
+        let path = control.root.join(format!("request-{}.enc", request.nonce));
+        write(&path, &app.key, task, &request, false).unwrap();
+        let original = fs::read(&path).unwrap();
+        assert!(
+            write(
+                &path,
+                &app.key,
+                task,
+                &json!({"forged":"replacement"}),
+                false
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+        control.poll().unwrap();
+        assert!(control.cancel.load(Ordering::Acquire));
+    }
     #[test]
     fn authenticated_requests_cannot_cross_tasks_sessions_or_forge_a_stopped_process() {
         let temp = tempfile::tempdir().unwrap();

@@ -955,7 +955,7 @@ pub(crate) fn plan(task: &TaskContractV1, e: &Execution) -> Result<Plan> {
             let input = &mut nodes.last_mut().ok_or(Error::Store)?.literal_input;
             input["project"] = project.public_summary()?;
             if project.services.is_some() {
-                input["service_workflow"] = json!({"api_contract":include_str!("../../../skills/workflows/api-contract/SKILL.md"),"database_migration":include_str!("../../../skills/workflows/database-migration/SKILL.md"),"vertical_slice":include_str!("../../../skills/workflows/feature-vertical-slice/SKILL.md"),"instructions":"Use project_services with the reviewed service bundle. Read readiness and exact logs, use registered API/DB operations, contract checks, business tests and migration rehearsals. Preserve failing source-bound records. Close the owned session before editing source and before submit_candidate. A ready server, a passing API contract and business correctness are distinct. Browser/frontend acceptance follows separately."});
+                input["service_workflow"] = json!({"api_contract":include_str!("../../../skills/workflows/api-contract/SKILL.md"),"database_migration":include_str!("../../../skills/workflows/database-migration/SKILL.md"),"vertical_slice":include_str!("../../../skills/workflows/feature-vertical-slice/SKILL.md"),"frontend_verify":include_str!("../../../skills/workflows/frontend-verify/SKILL.md"),"instructions":"Use project_services with the reviewed service bundle. Read readiness and exact logs, use registered API/DB operations, contract checks, business tests and migration rehearsals. Preserve failing source-bound records. Close the owned session before editing source and before submit_candidate. A ready server, a passing API contract and business correctness are distinct. Use the reviewed browser checks for frontend/API/DB flows. Functionality, axe accessibility and accepted visual baselines are separate results; a failed visual baseline must never be automatically replaced. Browser capabilities (WebSocket/service workers/DevTools) are frozen in the task."});
             }
 
             input["project_onboarding"] = json!(include_str!(
@@ -2198,7 +2198,10 @@ impl App {
                 gateway = gateway
                     .with_vision(melissa_model_gateway::vision::VisionPolicy {
                         initial_images: vec![],
-                        screenshot_tools: BTreeSet::from(["web_flow".into()]),
+                        screenshot_tools: BTreeSet::from([
+                            "web_flow".into(),
+                            "frontend_image".into(),
+                        ]),
                     })
                     .map_err(gw)?;
             }

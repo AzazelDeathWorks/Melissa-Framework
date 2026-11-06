@@ -54,6 +54,7 @@
     "code.patch_propose",
     "fs.patch",
     "git.diff",
+    "process.exec",
     "code.build",
     "code.tests",
     "code.lint",

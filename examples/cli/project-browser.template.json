@@ -1,0 +1,115 @@
+{
+  "backend": "compose",
+  "services": {
+    "api": {
+      "command": {
+        "executable": "node",
+        "argv": [
+          "apps/api/server.mjs"
+        ],
+        "cwd": "."
+      },
+      "port": 38171,
+      "ready": {
+        "path": "/health",
+        "status": 200,
+        "timeout_ms": 30000
+      },
+      "depends_on": [
+        "database"
+      ]
+    },
+    "web": {
+      "command": {
+        "executable": "npm",
+        "argv": [
+          "run",
+          "dev",
+          "--",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "38172"
+        ],
+        "cwd": "apps/web"
+      },
+      "port": 38172,
+      "ready": {
+        "path": "/",
+        "status": 200,
+        "timeout_ms": 30000
+      },
+      "depends_on": [
+        "api"
+      ]
+    }
+  },
+  "database": {
+    "engine": "sqlite",
+    "schema": "db/schema.sql",
+    "sample": "db/synthetic.sql",
+    "provenance": "synthetic"
+  },
+  "browser": {
+    "service": "web",
+    "allowed_services": [
+      "api"
+    ],
+    "websocket": false,
+    "service_workers": false,
+    "devtools": false,
+    "checks": {
+      "main-flow": {
+        "viewports": [
+          {
+            "name": "narrow",
+            "width": 390,
+            "height": 844
+          },
+          {
+            "name": "wide",
+            "width": 1280,
+            "height": 800
+          }
+        ],
+        "steps": [
+          {
+            "action": "navigate",
+            "path": "/"
+          },
+          {
+            "action": "fill",
+            "selector": "#title",
+            "value": "Synthetic item"
+          },
+          {
+            "action": "click",
+            "selector": "#save"
+          },
+          {
+            "action": "assert_text",
+            "selector": "#status",
+            "text": "Saved"
+          },
+          {
+            "action": "checkpoint",
+            "name": "saved"
+          }
+        ],
+        "accessibility": true,
+        "visual": [],
+        "fail_on_console_error": true
+      }
+    }
+  },
+  "statements": {},
+  "api_checks": {},
+  "rehearsals": {},
+  "business_checks": [],
+  "acceptance": [
+    {
+      "kind": "browser",
+      "name": "main-flow"
+    }
+  ]
+}

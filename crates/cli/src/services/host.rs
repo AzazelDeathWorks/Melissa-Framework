@@ -44,6 +44,16 @@ pub enum Operation {
     Business {
         name: String,
     },
+    Browser {
+        command: super::frontend::Command,
+    },
+    Preview {
+        service: String,
+        method: String,
+        path: String,
+        content_type: Option<String>,
+        body_hex: String,
+    },
     Close,
 }
 impl Operation {
@@ -103,6 +113,33 @@ impl Operation {
             }
             Self::Migration { name } if !spec.rehearsals.contains_key(name) => {
                 return Err(Error::Denied("Bilinmeyen migration provası."));
+            }
+            Self::Browser { command } => {
+                command.validate(
+                    spec.browser
+                        .as_ref()
+                        .ok_or(Error::Denied("Browser ayarı yok."))?,
+                )?;
+            }
+            Self::Preview {
+                service,
+                method,
+                path,
+                content_type,
+                body_hex,
+            } => {
+                if !spec.browser.as_ref().is_some_and(|b| b.service == *service)
+                    || !["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+                        .contains(&method.as_str())
+                    || !melissa_web_development::protocol::local_path(path)
+                    || content_type
+                        .as_ref()
+                        .is_some_and(|s| s.len() > 256 || s.contains(['\r', '\n', '\0']))
+                    || body_hex.len() > 2 * 1024 * 1024
+                    || super::frontend::baseline::unhex(body_hex).is_err()
+                {
+                    return Err(Error::Denied("Preview hedefi/gövdesi kapsam dışında."));
+                }
             }
             Self::Business { name } if !spec.business_checks.contains(name) => {
                 return Err(Error::Denied("Bilinmeyen iş kuralı kontrolü."));
@@ -205,7 +242,7 @@ impl Host {
             .keys()
             .map(|n| (n, crate::project_verification::check(&self.contract, n)))
             .collect();
-        let files = BTreeMap::from([
+        let mut files = BTreeMap::from([
             (
                 ".melissa-extension/services/worker.py".into(),
                 [
@@ -243,6 +280,18 @@ impl Host {
                 include_bytes!("../project_verification/worker.py").to_vec(),
             ),
         ]);
+        if let Some(browser) = &spec.browser {
+            let baselines = super::frontend::baseline::load(app, &repo, browser)?;
+            files.insert(".melissa-extension/services/browser-input.json".into(),bytes(&json!({"service":browser.service,"environment_digest":self.contract.environment.fingerprint()?,"origin":format!("http://127.0.0.1:{}",spec.services[&browser.service].port),"allowedOrigins":browser.allowed_services.iter().map(|s|format!("http://127.0.0.1:{}",spec.services[s].port)).collect::<Vec<_>>(),"websocket":browser.websocket,"serviceWorkers":browser.service_workers,"devtools":browser.devtools,"checks":browser.checks,"baselines":baselines}))?);
+            files.insert(
+                ".melissa-extension/services/legacy_browser.cjs".into(),
+                melissa_web_development::BROWSER_LIBRARY.as_bytes().to_vec(),
+            );
+            files.insert(
+                ".melissa-extension/services/browser.cjs".into(),
+                include_bytes!("frontend/browser.cjs").to_vec(),
+            );
+        }
         let command = Command {
             executable: "/opt/melissa-python/bin/python".into(),
             argv: vec![
@@ -369,7 +418,7 @@ impl Host {
                 &hex,
             )?;
         }
-        let reply = loop {
+        let mut reply = loop {
             if cancel.load(Ordering::Acquire) || now()? >= self.expires {
                 self.close()?;
                 return Err(Error::Reconciliation(
@@ -430,6 +479,42 @@ impl Host {
             }
             std::thread::sleep(Duration::from_millis(20));
         };
+        let source_current = repo.snapshot(&AtomicBool::new(false))?.digest == source;
+        let worker_source_current = reply["worker_source_current"].clone();
+        if let Some(artifacts) = reply
+            .get_mut("browser_artifacts")
+            .and_then(Value::as_object_mut)
+        {
+            for (key, artifact) in artifacts.iter_mut() {
+                let raw = super::frontend::baseline::unhex(
+                    artifact["data_hex"].as_str().ok_or(Error::Store)?,
+                )?;
+                if super::frontend::baseline::sha(&raw) != artifact["sha256"] {
+                    return Err(Error::Reconciliation("Browser kanıt özeti eşleşmedi."));
+                }
+                let id = format!("{receipt_id}:browser:{key}");
+                put(&mut self.store, &self.task, &id, "frontend.binary", &raw)?;
+                let mut meta = artifact.clone();
+                meta.as_object_mut().unwrap().remove("data_hex");
+                meta["artifact_id"] = json!(id);
+                meta["source_digest"] = json!(source);
+                meta["environment_digest"] = json!(self.contract.environment.fingerprint()?);
+                meta["workspace_binding"] = json!(super::frontend::baseline::binding(&repo));
+                meta["source_current"] = json!(source_current);
+                meta["worker_source_current"] = worker_source_current.clone();
+                meta["receipt_id"] = json!(receipt_id);
+                meta["blake3"] = json!(crate::digest(&raw));
+                meta["review_digest"] = json!(crate::digest(&bytes(&meta)?));
+                put(
+                    &mut self.store,
+                    &self.task,
+                    &format!("{id}:metadata"),
+                    "frontend.metadata",
+                    &bytes(&meta)?,
+                )?;
+                *artifact = meta;
+            }
+        }
         let detail = format!("{receipt_id}:detail");
         put(
             &mut self.store,
@@ -439,7 +524,7 @@ impl Host {
             &bytes(&reply)?,
         )?;
         let body = summary(reply["body"].clone());
-        let mut result = json!({"receipt_id":receipt_id,"session_id":sid,"source_digest":source,"source_current":repo.snapshot(&AtomicBool::new(false))?.digest==source,"worker_source_current":reply["worker_source_current"],"environment_digest":self.contract.environment.fingerprint()?,"input_digest":input_digest,"outcome":reply["outcome"],"reason":reply["reason"],"body":body,"detail_artifact":detail,"requires_reconciliation":reply["requires_reconciliation"],"model_calls":0,"task_accepted":false,"evidence_class":"public_project_service_observation","host_ports_published":false});
+        let mut result = json!({"receipt_id":receipt_id,"session_id":sid,"source_digest":source,"source_current":repo.snapshot(&AtomicBool::new(false))?.digest==source,"worker_source_current":reply["worker_source_current"],"environment_digest":self.contract.environment.fingerprint()?,"input_digest":input_digest,"outcome":reply["outcome"],"reason":reply["reason"],"body":body,"browser_artifacts":reply["browser_artifacts"],"detail_artifact":detail,"requires_reconciliation":reply["requires_reconciliation"],"model_calls":0,"task_accepted":false,"evidence_class":"public_project_service_observation","host_ports_published":false});
         if matches!(operation, Operation::Close) {
             let native = Runtime::wait(&app, &self.task, &sid, &cancel)?;
             self.runtime.close()?;

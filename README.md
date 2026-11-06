@@ -65,3 +65,5 @@ Büyük depolarda kaynak aktarımı, semantik gezinti ve yapısal değişiklik i
 Proje kontrolleri, erken doğrulama, gerçek proje debug ayarı ve hata tekrar üretimi: [doğrulama rehberi](docs/VERIFICATION_TR.md).
 
 Göreve ait servisler, API sözleşmesi ve ayrı DB migration provası: [servis rehberi](docs/SERVICES_TR.md).
+
+Frontend/browser verification: [source-bound previews, accessibility and accepted visual regression](docs/FRONTEND_VERIFY_TR.md).

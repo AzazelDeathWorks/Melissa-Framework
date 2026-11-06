@@ -47,6 +47,9 @@ pub fn verify(
     operations.extend(spec.acceptance.iter().map(|r| match r {
         Required::Contract { name } => Operation::Contract { name: name.clone() },
         Required::Migration { name } => Operation::Migration { name: name.clone() },
+        Required::Browser { name } => Operation::Browser {
+            command: super::frontend::Command::Verify { name: name.clone() },
+        },
     }));
     let check = (|| -> Result {
         for operation in operations {

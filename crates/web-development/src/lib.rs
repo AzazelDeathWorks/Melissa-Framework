@@ -75,3 +75,6 @@ pub(crate) fn put(
 /// Trusted reusable adapter code; callers still bind registration and source in their native permit.
 pub const WORKER_LIBRARY: &str = include_str!("worker.py");
 pub const SQL_LIBRARY: &str = include_str!("sql_runtime.py");
+
+/// Fixed browser adapter; callers must freeze origin and capability data.
+pub const BROWSER_LIBRARY: &str = include_str!("browser.cjs");
