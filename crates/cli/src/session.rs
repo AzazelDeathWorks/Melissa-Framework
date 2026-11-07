@@ -12,6 +12,8 @@ use std::{
     io::{BufRead, Write},
     path::{Path, PathBuf},
 };
+mod frontend;
+pub(crate) use frontend::FrontendSession;
 
 const HELP: &str = "Bir görev yaz veya aşağıdaki komutları kullan.\n\
   /mode plan|review|develop  Çalışma kipini seç\n\
@@ -76,27 +78,13 @@ pub async fn run(
     input: &mut impl BufRead,
     output: &mut impl Write,
 ) -> Result {
-    let workspace = absolute(workspace)?;
-    let home = absolute(home)?;
-    if !home.join("home.json").is_file() {
-        App::init(&home)?;
+    #[cfg(windows)]
+    if std::io::IsTerminal::is_terminal(&std::io::stdin())
+        && std::io::IsTerminal::is_terminal(&std::io::stdout())
+    {
+        return crate::console::run(home, workspace).await;
     }
-    let app = App::open(&home)?;
-    let environment = app.project_environment(&workspace)?;
-    let mut session = Session {
-        environment,
-        budget: None,
-        duration: 3_600_000,
-        extra_checks: Default::default(),
-        app,
-        workspace,
-        plan_dir: home.join("session-plans"),
-        acceptance: None,
-        draft: None,
-        task: None,
-        mode: Mode::Develop,
-        ui: Ui::new(),
-    };
+    let mut session = Session::new(home, workspace, Ui::new())?;
     session.ui.welcome(
         &session.workspace,
         session.app.configuration().is_ok(),
@@ -121,6 +109,30 @@ pub async fn run(
 }
 
 impl Session {
+    fn new(home: &Path, workspace: &Path, ui: Ui) -> Result<Self> {
+        let home = absolute(home)?;
+        let workspace = absolute(workspace)?;
+        if !home.join("home.json").is_file() {
+            App::init(&home)?;
+        }
+        let app = App::open(&home)?;
+        let environment = app.project_environment(&workspace)?;
+        Ok(Self {
+            environment,
+            budget: None,
+            duration: 3_600_000,
+            extra_checks: Default::default(),
+            app,
+            workspace,
+            plan_dir: home.join("session-plans"),
+            acceptance: None,
+            draft: None,
+            task: None,
+            mode: Mode::Develop,
+            ui,
+        })
+    }
+
     fn context(&self) -> &'static str {
         if self
             .task
@@ -152,6 +164,17 @@ impl Session {
         let result = match (command, argument) {
             ("/help", "") => return self.ui.help(HELP, output),
             ("/skills", "") | ("/extensions", "") => self.app.extension_catalog(&self.workspace)?,
+            ("/tasks", "") => self.app.list()?,
+            ("/memory", "") => self.app.memory(&self.workspace, "list", None, None)?,
+            ("/memory", argument) => {
+                let parts: Vec<_> = argument.split_whitespace().collect();
+                if parts.len() != 3 || !["accept", "reject", "forget"].contains(&parts[0]) {
+                    return Err(Error::Usage("/memory accept|reject|forget ID DIGEST"));
+                }
+                self.app
+                    .memory(&self.workspace, parts[0], Some(parts[1]), Some(parts[2]))?
+            }
+            ("/config-show", "") => self.app.configuration()?,
             ("/extensions", path) => self
                 .app
                 .configure_extensions(&self.workspace, &path_argument(path)?)?,
@@ -376,14 +399,14 @@ impl Session {
                     .draft
                     .as_ref()
                     .ok_or(Error::Usage("Önce bir amaç yaz."))?;
-                writeln!(output, "{}", display::json(&draft.plan)?)?;
+                self.ui.details(&draft.plan, output)?;
                 return self
                     .ui
                     .notice(&format!("Plan kaydı {}", draft.path.display()), output);
             }
             ("/details", "") => {
                 let value = self.app.progress(&self.task()?.id)?;
-                return Ok(writeln!(output, "{}", display::json(&value)?)?);
+                return self.ui.details(&value, output);
             }
             ("/create", "") => return self.create(output),
             ("/open", id) if !id.is_empty() => {
@@ -416,6 +439,9 @@ impl Session {
                     .await?
             }
             ("/diff", "") => self.app.diff(&self.task()?.id)?,
+            ("/diff-content", "") => self.app.diff_content(&self.task()?.id)?,
+            ("/logs", "") => self.app.logs(&self.task()?.id)?,
+            ("/preview", "") => self.app.preview(&self.task()?.id, None)?,
             ("/delivery", "") => self.app.delivery(&self.task()?.id, None)?,
             _ => return Err(Error::Usage("Oturum komutu geçersiz. /help yaz.")),
         };
@@ -587,7 +613,7 @@ impl Session {
     }
 }
 
-fn running_control(
+pub(crate) fn running_control(
     app: &App,
     id: &str,
     line: Option<&str>,

@@ -9,6 +9,28 @@ fn parse(a: &[&str]) -> melissa_cli::Result<args::Options> {
 }
 
 #[test]
+fn settings_entry_opens_the_dialog_and_keeps_explicit_automation_commands() {
+    for command in ["config", "settings"] {
+        assert!(matches!(
+            parse(&[command]).unwrap().command,
+            Command::Configure
+        ));
+    }
+    assert!(matches!(
+        parse(&["config", "show"]).unwrap().command,
+        Command::ConfigShow
+    ));
+    assert!(matches!(
+        parse(&["config", "import", "settings.json"])
+            .unwrap()
+            .command,
+        Command::ConfigImport(_)
+    ));
+    assert!(parse(&["settings", "unexpected"]).is_err());
+    assert!(parse(&["config", "unknown"]).is_err());
+}
+
+#[test]
 fn preparation_memory_and_replanning_commands_are_explicit_and_do_not_alias_run() {
     assert!(matches!(
         parse(&[

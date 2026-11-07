@@ -4,16 +4,20 @@ pub mod app;
 pub mod args;
 #[cfg(all(test, windows))]
 mod capabilities_tests;
+#[cfg(windows)]
+pub mod console;
 pub mod context_bridge;
 pub mod continuity;
 pub mod control;
 pub mod conversation;
 pub mod development;
 pub mod diagnostics;
+pub mod dispatch;
 pub mod display;
 pub mod domain;
 pub mod engine;
 pub mod extensions;
+pub mod frontend;
 pub mod instructions;
 pub mod maintenance;
 pub mod preparation;

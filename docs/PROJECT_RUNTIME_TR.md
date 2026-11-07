@@ -9,31 +9,23 @@ Model/görev kalite kabulü, komutun çalışmış olması ve yayın kabulü ayr
 Proje klasöründe `melissa` aç:
 
 ```text
-/config C:/MelissaPrivate/settings.json
-/budget 5
-/duration 60
-/project-doctor
+/config
 src/main.py içindeki hatayı düzelt ve testleri çalıştır
-/plan
-/create
-/details
-/approve
-/run
 ```
 
-`/budget`, yeni görevin toplam API harcama tercihidir; modelin düşünme veya
-çıktı kapasitesini azaltmaz. `/duration` dakika cinsinden toplam görev/yeni
-süreç süresini seçer. Var olan onaylı görevin bütçesi ve bitiş zamanı değişmez.
-Model ayarları veya harcama tercihi yoksa `/create` yalnız hazırlık kaydeder.
-Plan kipinde de hazırlık kaydedilir. Eski hazırlığı yürütme iznine çevirmek
-yerine `/new AMAÇ` ile incelenebilir yeni bir yürütme sözleşmesi oluşturulur;
-eski kayıtlar korunur. Bu adım yeni izin verdiği için önceki plan onayı yürütme
-onayı yerine kullanılmaz.
+`/config` sağlayıcı, model, isteğe bağlı harcama tavanı ve proje ortamını açar.
+Harcama tercihi modelin tam çıktı kapasitesini azaltmaz. Normal kullanıcı görev
+kimliği, recipe veya create/approve/run zinciri yazmaz. Model kaynağı inceleyip
+çalışmayı önerir; Uygula seçilince dosyalar ve gerçek kontrol komutları gösterilir.
+Son onay yalnız bu kaynak ve kapsam için geçerlidir. Yeni native sözleşmenin
+geçerlilik penceresi 24 saattir; önceden verilmiş onayın süresi uzatılmaz.
 
-Kabul komutu keşfedilemezse açık bir kontrol eklenebilir:
+`/plan` veya Shift+Tab yalnız araştırma ve planlama için kullanılır. Çalışma
+uygulanmadan önce kaynak değişirse eski öneriyle yürütülmez. Kontrol komutu
+keşfedilemezse modelden gerçek komutu planına eklemesi istenebilir:
 
 ```text
-/check {"executable":"python","argv":["-m","unittest","discover"],"cwd":"."}
+Mevcut testleri python -m unittest discover ile çalıştıracak bir plan hazırla.
 ```
 
 Kontroller beklenen gizli cevapları tahmin etmez. Modelin “test geçti” demesi
@@ -41,10 +33,11 @@ yeterli değildir; son kaynak üzerinde komutları Rust yürütücüsü ayrıca 
 
 ## Ortam seçmek
 
-Varsayılan ortam mevcut değişmez SDK image'idir. `/environment` seçimi gösterir;
-`/environment sha256:...` başka hazırlanmış bir image'i yalnız bu proje için
-seçer. Ayrıntılı ayar için [örnek JSON](../examples/cli/project-environment.template.json)
-kopyalanıp `/environment C:/MelissaPrivate/project-environment.json` ile yüklenir.
+Varsayılan ortam mevcut değişmez SDK image'idir. `/config` içindeki Proje ortamı
+yerel image'leri listeler ve hazırlanmış bir image'i yalnız bu proje için seçer.
+Image içinde gereken araç ve bağımlılıkların bulunması ayrıca doğrulanır.
+Gelişmiş ortam alanları kaynak deposundaki
+`examples/cli/project-environment.template.json` şemasında açıklanır.
 Tercih proje kök kimliğine bağlı şifreli olarak saklanır; global Node, Python,
 Rust veya paket yöneticisi varsayılanı değiştirilmez. Yeni görev bu tercihin
 tam özetini onaya bağlar; sonraki yapılandırma eski görevi sessizce değiştirmez.
@@ -85,7 +78,7 @@ Bağımlılık ve gerekli araçlar seçilen hazırlanmış image/cache'de bulunm
 Bu sürüm keyfi dış ağa veya host üzerinde paket kurulumuna izin vermez. Eksik
 bağımlılık PASS sayılmaz. Sync ve asıl komut aynı özel çalışma kopyasını kullanır;
 başka bir oturuma global kurulum sızmaz. Kalıcı image hazırlığı ayrı bir operatör
-işidir; `/environment-sync` host'a kurulum yapıldığı anlamına gelmez.
+işidir; proje sync işlemi host'a kurulum yapıldığı anlamına gelmez.
 
 ## Süreç oturumları
 
@@ -96,10 +89,12 @@ kontrol/ortam işlemlerini başlatır. Hiçbir model image, kaynak limiti, ağ v
 yetki seçemez. Host her gerçek çağrı için tam komut ve snapshot'a bağlı ayrı
 broker izni üretir. Başlatma yanıtı komutun bitişi veya test başarısı değildir.
 
-İnsan için onaylı görevin `/exec` komutu da executable/argv/cwd JSON nesnesi
-alır. `/preflight` ve `/environment-sync` model çağırmadan çalışır. Bu operatör
-işlemleri, durmuş süreç kanıtıyla görevi güvenli pause noktasında bırakır;
-model akışı daha sonra `/resume` ile aynı görevden başlar.
+İleri otomasyonda `melissa --json project exec TASK_ID --command-json JSON`
+executable/argv/cwd nesnesi alır. `project preflight TASK_ID` ve
+`project sync TASK_ID` model çağırmadan çalışır. Bu operatör işlemleri durmuş
+süreç kanıtıyla görevi güvenli pause noktasında bırakır. Günlük terminalde
+`/resume`, kayıtlı konuşmayı ve varsa duraklatılmış görevi açar. Otomasyonda
+`melissa task resume TASK_ID` özgün sözleşmeden devam eder.
 
 Başka terminalden süreç çıktısı ve kontrolü:
 

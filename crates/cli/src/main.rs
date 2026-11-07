@@ -1,321 +1,10 @@
 use melissa_cli::{
-    Result,
-    app::{App, default_home},
     args::{self, Command},
-    display, session,
+    display,
 };
-use serde_json::{Value, json};
+use serde_json::json;
 use std::io::{self, IsTerminal};
 
-async fn run(options: &args::Options) -> Result<Value> {
-    if matches!(options.command, Command::Doctor) {
-        return melissa_cli::views::doctor();
-    }
-    if matches!(options.command, Command::Profiles) {
-        return Ok(
-            json!({"command":"profiles","profiles":melissa_cli::app::profiles()?.profiles,"definition_only":true}),
-        );
-    }
-    if let Command::Maintenance {
-        action,
-        out,
-        source,
-        key_file,
-        ..
-    } = &options.command
-    {
-        if action == "keygen" {
-            return melissa_cli::maintenance::portable::keygen(out.as_ref().unwrap());
-        }
-        if action == "restore" {
-            return melissa_cli::maintenance::portable::restore(
-                source.as_ref().unwrap(),
-                out.as_ref().unwrap(),
-                key_file.as_ref().unwrap(),
-            );
-        }
-    }
-    let home = options.home.clone().map(Ok).unwrap_or_else(default_home)?;
-    if let Command::Session { workspace } = &options.command {
-        let workspace = workspace
-            .clone()
-            .map(Ok)
-            .unwrap_or_else(std::env::current_dir)?;
-        session::run(
-            &home,
-            &workspace,
-            &mut io::stdin().lock(),
-            &mut io::stdout().lock(),
-        )
-        .await?;
-        return Ok(Value::Null);
-    }
-    if matches!(options.command, Command::Init) {
-        return App::init(&home);
-    }
-    let app = App::open(&home)?;
-    match &options.command {
-        Command::Observe {
-            action,
-            id,
-            out,
-            endpoint,
-        } => match action.as_str() {
-            "diagnose" => app.diagnose(id),
-            "support" => app.support(id, out.as_ref().unwrap()),
-            _ => {
-                app.export_otlp(id, out.as_deref(), endpoint.as_deref())
-                    .await
-            }
-        },
-        Command::Maintenance {
-            action,
-            id,
-            out,
-            key_file,
-            ..
-        } => match action.as_str() {
-            "disk" => app.disk(id.as_ref().unwrap()),
-            "retention-preview" => app.retention_preview(id.as_ref().unwrap()),
-            "backup" => app.backup_task(
-                id.as_ref().unwrap(),
-                out.as_ref().unwrap(),
-                key_file.as_ref().unwrap(),
-            ),
-            _ => Err(melissa_cli::Error::Usage("Bakım komutu desteklenmiyor.")),
-        },
-        Command::Continuity {
-            id,
-            action,
-            request,
-            digest,
-            label,
-        } => match action.as_str() {
-            "continuity" | "checkpoints" => app.continuity(id),
-            "changes" => melissa_cli::continuity::undo::changes(&app, id),
-            "checkpoint" => app.checkpoint(id, label.as_ref().unwrap()),
-            "adopt-preview" => app.adopt_preview(id),
-            "adopt-source" => app.adopt_source(id, digest.as_ref().unwrap()),
-            _ => {
-                let selection = serde_json::from_value(
-                    melissa_model_gateway::strict_json(request.as_ref().unwrap())
-                        .map_err(|_| melissa_cli::Error::Usage("Geri alma JSON geçersiz."))?,
-                )
-                .map_err(|_| melissa_cli::Error::Usage("Geri alma seçimi geçersiz."))?;
-                if action == "undo-preview" {
-                    app.undo_preview(id, selection)
-                } else {
-                    app.undo(id, selection, digest.as_ref().unwrap())
-                }
-            }
-        },
-        Command::Services {
-            action,
-            id,
-            workspace,
-            path,
-            request,
-        } => match action.as_str() {
-            "configure" => melissa_cli::services::settings::configure(
-                &app,
-                workspace.as_ref().unwrap(),
-                path.as_ref().unwrap(),
-            ),
-            "baseline-accept" => melissa_cli::services::frontend::baseline::accept(
-                &app,
-                id.as_ref().unwrap(),
-                serde_json::from_value(
-                    melissa_model_gateway::strict_json(request.as_ref().unwrap())
-                        .map_err(|_| melissa_cli::Error::Usage("Referans JSON geçersiz."))?,
-                )
-                .map_err(|_| melissa_cli::Error::Usage("Referans seçimi geçersiz."))?,
-            ),
-            "show" => Ok(
-                json!({"services":melissa_cli::services::settings::load(&app,workspace.as_ref().unwrap())?}),
-            ),
-            _ => {
-                app.run_services(
-                    id.as_ref().unwrap(),
-                    request
-                        .as_ref()
-                        .map(|s| {
-                            melissa_model_gateway::strict_json(s)
-                                .map_err(|_| melissa_cli::Error::Usage("Servis JSON geçersiz."))
-                                .and_then(|v| {
-                                    serde_json::from_value(v).map_err(|_| {
-                                        melissa_cli::Error::Usage("Servis işlemi geçersiz.")
-                                    })
-                                })
-                        })
-                        .transpose()?,
-                )
-                .await
-            }
-        },
-        Command::Verification {
-            action,
-            id,
-            workspace,
-            path,
-            request,
-        } => match action.as_str() {
-            "configure" => melissa_cli::project_verification::settings::configure(
-                &app,
-                workspace.as_ref().unwrap(),
-                path.as_ref().unwrap(),
-            ),
-            "show" => Ok(
-                json!({"verification":melissa_cli::project_verification::settings::load(&app,workspace.as_ref().unwrap())?}),
-            ),
-            _ => {
-                app.run_project_verification(
-                    id.as_ref().unwrap(),
-                    serde_json::from_value(
-                        melissa_model_gateway::strict_json(request).map_err(|_| {
-                            melissa_cli::Error::Usage("Verification JSON geçersiz.")
-                        })?,
-                    )
-                    .map_err(|_| melissa_cli::Error::Usage("Verification isteği geçersiz."))?,
-                    action == "reproduce",
-                )
-                .await
-            }
-        },
-        Command::RepositoryInspect {
-            action,
-            workspace,
-            query,
-        } => melissa_cli::repository_inspect::run(&app, action, workspace, query),
-        Command::ProjectDoctor { workspace } => {
-            app.project_doctor(workspace, app.project_environment(workspace)?)
-        }
-        Command::Extension {
-            action,
-            workspace,
-            path,
-            digest,
-            id,
-            source,
-            query,
-        } => match action.as_str() {
-            "list" => app.extension_catalog(workspace.as_ref().ok_or(melissa_cli::Error::Io)?),
-            "configure" => app.configure_extensions(
-                workspace.as_ref().ok_or(melissa_cli::Error::Io)?,
-                path.as_ref().ok_or(melissa_cli::Error::Io)?,
-            ),
-            "import-skill" => app.import_skill(
-                path.as_ref().ok_or(melissa_cli::Error::Io)?,
-                digest.as_deref(),
-            ),
-            _ => {
-                app.resolve_docs(
-                    id.as_deref().ok_or(melissa_cli::Error::Io)?,
-                    source.as_deref().ok_or(melissa_cli::Error::Io)?,
-                    query.as_deref().ok_or(melissa_cli::Error::Io)?,
-                )
-                .await
-            }
-        },
-        Command::ProjectOperation {
-            id,
-            operation,
-            command,
-        } => {
-            app.run_project_operation(
-                id,
-                operation,
-                command
-                    .as_ref()
-                    .map(|s| {
-                        serde_json::from_str(s)
-                            .map_err(|_| melissa_cli::Error::Usage("--command-json geçersiz."))
-                    })
-                    .transpose()?,
-            )
-            .await
-        }
-        Command::ProjectPoll { id, session, after } => {
-            app.project_poll(id, session, *after, 32 * 1024)
-        }
-        Command::ProjectInput {
-            id,
-            session,
-            operation,
-            hex,
-        } => app.project_input(
-            id,
-            session,
-            &format!(
-                "operator:{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|_| melissa_cli::Error::Io)?
-                    .as_nanos()
-            ),
-            operation,
-            hex,
-        ),
-        Command::New {
-            workspace,
-            goal,
-            profile,
-            excludes,
-            recipe,
-        } => {
-            if let Some(recipe) = recipe {
-                app.create_execution(
-                    workspace,
-                    goal,
-                    excludes.clone(),
-                    melissa_cli::recipe::Recipe::read(recipe)?,
-                )
-            } else {
-                app.create(workspace, goal, profile, excludes.clone())
-            }
-        }
-        Command::ConfigImport(path) => app.configure(path),
-        Command::Memory {
-            workspace,
-            action,
-            id,
-            digest,
-        } => app.memory(workspace, action, id.as_deref(), digest.as_deref()),
-        Command::Prepare {
-            workspace,
-            goal,
-            out,
-            acceptance,
-        } => app.prepare(workspace, goal, out, acceptance.as_deref()),
-        Command::Replan { id, recipe } => {
-            app.replan(id, melissa_cli::recipe::Recipe::read(recipe)?)
-        }
-        Command::ConfigShow => app.configuration(),
-        Command::List => app.list(),
-        Command::Show(id) => app.show(id),
-        Command::Metrics(id) => app.metrics(id),
-        Command::Diff(id) => app.diff(id),
-        Command::Events(id) => app.events(id),
-        Command::Cancel(id) => app.cancel(id),
-        Command::Pause(id) => app.request_control(id, "pause"),
-        Command::Run(id) => app.run_task(id, false).await,
-        Command::Resume(id) => app.run_task(id, true).await,
-        Command::Progress(id) => app.progress(id),
-        Command::Logs(id) => app.logs(id),
-        Command::DiffContent(id) => app.diff_content(id),
-        Command::Delivery { id, out } => app.delivery(id, out.as_deref()),
-        Command::Preview { id, out } => app.preview(id, out.as_deref()),
-        Command::Wait { id, timeout_ms } => app.wait_task(id, *timeout_ms).await,
-        Command::Approve {
-            id,
-            request,
-            digest,
-        } => app.approve(id, request, digest),
-        Command::Evidence { id, artifact, out } => {
-            app.evidence(id, artifact.as_deref(), out.as_deref())
-        }
-        _ => Err(melissa_cli::Error::Usage("Komut görev akışında değil.")),
-    }
-}
 #[tokio::main]
 async fn main() {
     let mut cli_args = std::env::args_os().skip(1).peekable();
@@ -333,6 +22,12 @@ async fn main() {
         }
     };
     if matches!(options.command, Command::Help) {
+        println!(
+            "Melissa CLI\n\n  melissa                  Doğrudan sohbet aç\n  melissa config           Sağlayıcı ve model ayarlarını aç\n  melissa session --workspace PATH\n\nİsteğini doğrudan yaz. Plan için /plan veya Shift+Tab.\nSohbet içinde: Ayarlar /settings · Model /model · Geçmiş /resume · /help\n\nTeknik otomasyon komutları: melissa --help-all"
+        );
+        return;
+    }
+    if matches!(options.command, Command::HelpAll) {
         println!("{}", args::HELP);
         println!("{}", args::SESSION_HELP);
         println!("{}", args::PROJECT_HELP);
@@ -352,8 +47,12 @@ async fn main() {
         println!("melissa {}", env!("CARGO_PKG_VERSION"));
         return;
     }
-    match run(&options).await {
-        Ok(_) if matches!(options.command, Command::Session { .. }) => {}
+    match melissa_cli::dispatch::run(&options).await {
+        Ok(_)
+            if matches!(
+                options.command,
+                Command::Session { .. } | Command::Configure
+            ) => {}
         Ok(value) => match if options.json {
             display::json(&value)
         } else {

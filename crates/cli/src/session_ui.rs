@@ -34,6 +34,15 @@ const NOTICE: Color = Color::Rgb {
 };
 
 pub(super) const COMMANDS: &[(&str, &str)] = &[
+    ("/tasks", "Kaydedilmiş görevler"),
+    (
+        "/memory",
+        "[accept|reject|forget ID DIGEST] · proje belleği",
+    ),
+    ("/diff-content", "Kaynağa bağlı kod farkı ve özgün baytlar"),
+    ("/logs", "Görev olayları ve süreç kayıtları"),
+    ("/preview", "Kabul edilmiş kaynağın PNG önizlemesi"),
+    ("/config-show", "Anahtarı çözmeden model ayarlarını göster"),
     (
         "/diagnose",
         "Hatanın kaynağı, belirsizlik ve son checkpoint",
@@ -138,9 +147,27 @@ pub(super) struct Ui {
     pub interactive: bool,
     colors: bool,
     history: Vec<String>,
+    capture: Option<std::sync::Arc<std::sync::Mutex<Vec<Value>>>>,
 }
 
 impl Ui {
+    pub(crate) fn captured(events: std::sync::Arc<std::sync::Mutex<Vec<Value>>>) -> Self {
+        Self {
+            interactive: false,
+            colors: false,
+            history: vec![],
+            capture: Some(events),
+        }
+    }
+
+    fn record(&self, kind: &str, value: Value) {
+        if let Some(events) = &self.capture
+            && let Ok(mut events) = events.lock()
+        {
+            events.push(serde_json::json!({"kind":kind,"data":value}));
+        }
+    }
+
     pub fn new() -> Self {
         let interactive = std::io::stdin().is_terminal()
             && std::io::stdout().is_terminal()
@@ -155,6 +182,7 @@ impl Ui {
                 && ansi
                 && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty()),
             history: vec![],
+            capture: None,
         }
     }
 
@@ -169,7 +197,7 @@ impl Ui {
     fn width(&self) -> usize {
         crossterm::terminal::size()
             .map_or(80, |(width, _)| usize::from(width))
-            .clamp(12, 94)
+            .clamp(12, 240)
     }
 
     fn card(&self, title: &str, lines: &[String], output: &mut impl Write) -> Result {
@@ -258,6 +286,10 @@ impl Ui {
     }
 
     pub fn help(&self, plain: &str, output: &mut impl Write) -> Result {
+        self.record(
+            "help",
+            serde_json::json!({"text":plain,"commands":COMMANDS}),
+        );
         if !self.interactive {
             return Ok(writeln!(output, "{plain}")?);
         }
@@ -274,6 +306,7 @@ impl Ui {
     }
 
     pub fn notice(&self, message: &str, output: &mut impl Write) -> Result {
+        self.record("notice", serde_json::json!({"text":message}));
         if !self.interactive {
             return Ok(writeln!(output, "{message}")?);
         }
@@ -284,6 +317,10 @@ impl Ui {
     }
 
     pub fn draft(&self, plan: &Value, path: &Path, ready: bool, output: &mut impl Write) -> Result {
+        self.record(
+            "plan",
+            serde_json::json!({"plan":plan,"path":path,"ready":ready}),
+        );
         if !self.interactive {
             writeln!(output, "{}", display::json(plan)?)?;
             writeln!(
@@ -336,6 +373,7 @@ impl Ui {
     }
 
     pub fn result(&self, value: &Value, output: &mut impl Write) -> Result {
+        self.record("result", value.clone());
         if value["command"]
             .as_str()
             .is_some_and(|c| c.starts_with("observe ") || c.starts_with("maintenance "))
@@ -513,6 +551,11 @@ impl Ui {
             }
         };
         self.card(title, &lines, output)
+    }
+
+    pub(crate) fn details(&self, value: &Value, output: &mut impl Write) -> Result {
+        self.record("details", value.clone());
+        Ok(writeln!(output, "{}", display::json(value)?)?)
     }
 
     pub async fn working<F, C>(

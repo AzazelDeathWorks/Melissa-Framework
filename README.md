@@ -4,17 +4,19 @@ Rust tabanlı, geliştirme aşamasındaki ajan ve araç orkestrasyonu çatısı.
 
 Genel ajan/worker tanımları, skill paketleri, tipli sözleşmeler, kalıcılık, izin denetimi, araç bağlantıları, iş akışı ve hata toparlama kodları bulunur. Katalogdaki tanımlar, bütün ajanların aynı anda çalıştığı anlamına gelmez.
 
-## CLI — 0.3.0-alpha.3
+## CLI — 0.3.0-alpha.6
 
-Windows x64 önizlemesi için [kurulum ve ilk görev rehberi](docs/QUICKSTART_WINDOWS.md).
-Paketin yanındaki `install.ps1` tek komutla kullanıcı hesabına kurar. Ardından proje klasöründe `melissa` terminal oturumunu açar.
-Oturumda proje paneli, okunabilir görev kartları, Unicode metin düzenleme, ok tuşlarıyla geçmiş ve Tab ile komut tamamlama bulunur. `/details` kayda bağlı tam kapsamı gösterir.
-Plan/inceleme/geliştirme kipleri, kapsam farkları ve çalışan görevi yönlendirme için [konuşmalı oturum rehberi](docs/CONVERSATION_TR.md).
-Kullanıcı/proje skill'leri, onaylı MCP araçları, sürümlü dokümanlar ve hook'lar için [eklenti rehberi](docs/EXTENSIONS_TR.md).
-Güvenlik bildirimleri için [gizli bildirim yolu](SECURITY.md).
+Melissa tek bir terminal oturumudur. Proje klasöründe `melissa` yazın ve isteğinizi anlatın. Proje seçilmemişse terminalden klasör seçebilir veya oluşturabilirsiniz.
 
-Aktif ürün kapsamı 6 Core ve 12 Code profilidir. Diğer alanların genel tanımları
-korunur; derlenen CLI'ya dahil edilmez. Masaüstü arayüzü bu kapsamda yoktur.
+- `/config` veya `/settings`: sağlayıcı, güvenli anahtar saklama, model ve tercihler.
+- `/model`: kayıtlı modeller veya sağlayıcının desteklediği model listesi.
+- `/plan` veya Shift+Tab: proje dosyalarını değiştirmeden araştırma ve planlama.
+- `/resume`, `/diff`, `/undo`: konuşmaya dönme, değişiklik inceleme ve kontrollü geri alma.
+- Normal kullanımda develop/review seçimi veya create/approve/run komut zinciri gerekmez. Gerekli kesin çalışma onayı terminalde gösterilir.
+
+[Windows kurulumu](docs/QUICKSTART_WINDOWS.md) · [Terminal kullanımı](docs/CLI_TR.md) · [Teknik otomasyon](docs/CLI_CAPABILITIES_TR.md) · [Eklentiler](docs/EXTENSIONS_TR.md)
+
+Aktif ürün kapsamı 6 Core ve 12 Code profilidir. Genel tanımlar diğer alanları yeniden etkinleştirmez. Ürünün masaüstü GUI paketi kaldırılmıştır; web geliştirme, tarayıcı testi ve önizleme araçları korunur.
 
 - Proje bazlı şifreli bellek, kaynak yeniliği denetimi ve kullanıcı onaylı kayıtlar.
 - Skill paketleri, bağlam araçları ve izole yardımcı script çalıştırma.
@@ -27,8 +29,7 @@ korunur; derlenen CLI'ya dahil edilmez. Masaüstü arayüzü bu kapsamda yoktur.
 
 Desteklenen diller, çalışma sınırları ve komutlar:
 [CLI kullanım rehberi](docs/CLI_CAPABILITIES_TR.md).
-Görev taslağı yerel kurallarla hazırlanır. Özel tarif olmadan proje hazırlık
-görevi kaydedilebilir. Model ayarı, harcama tercihi ve incelenmiş ortamla
+Teknik otomasyondaki görev taslağı yerel kurallarla hazırlanır; terminal konuşmasındaki model planlaması ayrı bir akıştır. Model ayarı, harcama tercihi ve incelenmiş ortamla
 [genel proje yürütmesi](docs/PROJECT_RUNTIME_TR.md) de açılır: süreç oturumları,
 stdin/stdout/stderr, sürüm seçimi ve kilitli bağımlılık kontrolleri. Mevcut özel kabul tarifli yürütme ayrıca kullanıcı incelemesi
 gerektirir. Yeni bağlantılar için yerel testler çalıştırılmıştır; canlı model

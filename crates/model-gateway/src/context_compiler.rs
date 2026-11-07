@@ -281,6 +281,9 @@ impl ContextCompiler {
                     return Err(failure("incomplete native history before compaction"));
                 }
                 match response.protocol {
+                    crate::Protocol::OpenAiChatCompletions => {
+                        crate::chat_completions::validate_continuation(response)?
+                    }
                     crate::Protocol::OpenAiResponses => {
                         crate::openai::validate_history_response(response)?
                     }

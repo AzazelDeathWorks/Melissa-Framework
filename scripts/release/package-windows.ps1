@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$BinaryPath,
-    [Parameter(Mandatory)][string]$OutputRoot
+    [Parameter(Mandatory)][string]$OutputRoot,
+    [switch]$LocalPreview
 )
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
@@ -22,7 +23,18 @@ $revision = & git -C $repo rev-parse HEAD
 if ($LASTEXITCODE -ne 0 -or $revision -notmatch '^[0-9a-f]{40}$') { throw 'The release source revision could not be determined.' }
 if ($doctor.source_commit -ne $revision) { throw 'Build the binary with MELISSA_BUILD_COMMIT set to the exact source revision.' }
 $changes = & git -C $repo status --porcelain --untracked-files=normal
-if ($LASTEXITCODE -ne 0 -or $changes) { throw 'Build the release from a clean, committed checkout.' }
+if ($LASTEXITCODE -ne 0) { throw 'Source status could not be determined.' }
+if ($changes -and -not $LocalPreview) { throw 'Build the release from a clean, committed checkout. Use -LocalPreview only for an explicitly marked local candidate.' }
+$sourceFiles = & git -C $repo ls-files --cached --others --exclude-standard
+if ($LASTEXITCODE -ne 0) { throw 'Source inventory could not be determined.' }
+$sourceInventory = @($sourceFiles | Sort-Object -Unique | ForEach-Object {
+    $path = Join-Path $repo $_
+    if (Test-Path -LiteralPath $path -PathType Leaf) {
+        "$((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant())  $_"
+    }
+})
+$sha = [Security.Cryptography.SHA256]::Create()
+try { $sourceHash = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(($sourceInventory -join "`n"))))).Replace('-', '').ToLowerInvariant() } finally { $sha.Dispose() }
 $target = (New-Item -ItemType Directory -Path $OutputRoot -ErrorAction Stop).FullName
 $archiveName = "melissa-$version-windows-x64.zip"
 $archivePath = Join-Path $target $archiveName
@@ -32,18 +44,23 @@ $payload = [ordered]@{
     version = $version
     platform = 'windows-x64'
     source_commit = $revision
+    source_tree_sha256 = $sourceHash
+    source_dirty = [bool]$changes
+    local_preview = [bool]$LocalPreview
     executable_sha256 = $binaryHash
     sdk_worker_image_id = $doctor.isolated_SDK_image_id
 } | ConvertTo-Json
 $files = [ordered]@{
     'LICENSE' = Join-Path $repo 'LICENSE'
     'QUICKSTART.md' = Join-Path $repo 'docs\QUICKSTART_WINDOWS.md'
+    'CLI_TR.md' = Join-Path $repo 'docs\CLI_TR.md'
+    'PROJECT_RUNTIME_TR.md' = Join-Path $repo 'docs\PROJECT_RUNTIME_TR.md'
     'SECURITY.md' = Join-Path $repo 'SECURITY.md'
     'melissa.exe' = $binary
-    'quickstart.ps1' = Join-Path $PSScriptRoot 'quickstart-windows.ps1'
-    'settings.template.json' = Join-Path $repo 'examples\cli\settings.template.json'
 }
-$notices = Join-Path $repo 'third_party\licenses'
+$notices = Join-Path $target 'license-staging'
+& python (Join-Path $PSScriptRoot 'collect-rust-licenses.py') --repo $repo --out $notices
+if ($LASTEXITCODE -ne 0) { throw 'Exact dependency notice collection failed.' }
 foreach ($file in (Get-ChildItem -LiteralPath $notices -File -Recurse | Sort-Object FullName)) {
     $relative = $file.FullName.Substring($notices.Length + 1).Replace('\', '/')
     $files["licenses/$relative"] = $file.FullName

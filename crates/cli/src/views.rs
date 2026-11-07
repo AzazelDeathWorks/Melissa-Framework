@@ -361,10 +361,11 @@ pub fn doctor() -> Result<Value> {
     let c = crate::resources::catalog()?;
     Ok(json!({
         "command":"doctor","source_commit":option_env!("MELISSA_BUILD_COMMIT"),"host":std::env::consts::OS,"architecture":std::env::consts::ARCH,
-        "binary_digest":digest(&fs::read(executable)?),"profiles":c.profiles.len(),"workers":c.workers.len(),
+        "binary_digest":digest(&fs::read(&executable)?),"profiles":c.profiles.len(),"workers":c.workers.len(),
         "runtime_definitions":"bundled_and_validated_no_historical_evidence_claim","DPAPI":cfg!(windows),
         "isolated_SDK_image_present":image,"isolated_SDK_image_id":melissa_code_quality::protected::SDK_IMAGE,
-        "isolated_web_API_DB_image_present":web_image,"model_probe":"NOT_RUN","credential_read":false,"Tauri":false,
+        "isolated_web_API_DB_image_present":web_image,"model_probe":"NOT_RUN","credential_read":false,
+        "desktop_companion_present":executable.with_file_name("melissa-desktop.exe").is_file(),
         "release_readiness":readiness(cfg!(all(windows, target_arch = "x86_64")), engine.as_deref(), image)
     }))
 }

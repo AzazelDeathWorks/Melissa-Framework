@@ -44,6 +44,9 @@ fn request(protocol: Protocol, turns: usize) -> TurnRequest {
     for n in 0..turns {
         let id = format!("call{n}");
         let continuation = match protocol {
+            Protocol::OpenAiChatCompletions => vec![
+                json!({"role":"assistant","content":"","tool_calls":[{"id":id,"type":"function","function":{"name":"inspect","arguments":"{}"}}]}),
+            ],
             Protocol::OpenAiResponses => vec![
                 json!({"type":"reasoning","id":format!("reason{n}"),"summary":[],"encrypted_content":"opaque-signature"}),
                 json!({"type":"function_call","id":format!("fc{n}"),"call_id":id,"name":"inspect","arguments":"{}","status":"completed"}),

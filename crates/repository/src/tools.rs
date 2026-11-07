@@ -36,6 +36,7 @@ struct Host {
     read_error_observations: bool,
     recovery_observations: bool,
     portable_patch_wire: bool,
+    denied_read_observations: bool,
 }
 #[derive(Clone)]
 pub struct RepositoryDispatcher {
@@ -706,6 +707,7 @@ impl RepositoryDispatcher {
                 policy,
                 read_error_observations: false,
                 recovery_observations: false,
+                denied_read_observations: false,
                 portable_patch_wire: false,
             })),
         })
@@ -742,6 +744,15 @@ impl RepositoryDispatcher {
                 .map_err(|_| Error::Denied("repository host lock poisoned"))?;
             host.read_error_observations = true;
         }
+        Ok(self)
+    }
+    /// A proven, write-free visibility denial is an observation, never a grant.
+    /// Profile/task denials, alias faults, writes and unknown outcomes still stop.
+    pub fn with_denied_read_observations(self) -> crate::Result<Self> {
+        self.host
+            .lock()
+            .map_err(|_| Error::Denied("repository host lock poisoned"))?
+            .denied_read_observations = true;
         Ok(self)
     }
 }
@@ -803,6 +814,11 @@ impl ToolDispatcher for RepositoryDispatcher {
         let recover_stale = self.host.lock().is_ok_and(|h| h.recovery_observations);
         let recover_read = self.host.lock().is_ok_and(|h| h.read_error_observations)
             && route(&call.name).is_some_and(|(id, _)| !write_route(id));
+        let observe_denial = self.host.lock().is_ok_and(|h| h.denied_read_observations)
+            && matches!(
+                call.name.as_str(),
+                "fs_read" | "fs_hash" | "fs_absent" | "fs_directory"
+            );
         Box::pin(async move {
             let joined = tokio::task::spawn_blocking(move || {
                 host.lock()
@@ -814,6 +830,7 @@ impl ToolDispatcher for RepositoryDispatcher {
                 Ok(Ok(r))=>Ok(r),
                 Ok(Err(Error::AfterDispatch(_)))|Err(_)=>Ok(ToolExecution{content:json!({"status":"outcome_unknown","requires_reconciliation":true,"automatic_retry_allowed":false,"task_accepted":false}).to_string(),success:false,cancelled:false,requires_reconciliation:true,artifact_refs:vec![]}),
                 Ok(Err(Error::Cancelled))=>Ok(ToolExecution{content:json!({"status":"cancelled_before_effect","task_accepted":false}).to_string(),success:false,cancelled:true,requires_reconciliation:false,artifact_refs:vec![]}),
+                Ok(Err(Error::Denied("Git metadata is outside file capability" | "path is outside repository source visibility" | "path excluded by repository ignore rules"))) if observe_denial => Ok(ToolExecution { content: json!({"status":"BLOCKED","kind":"visibility_denied","executed":false,"workspace_write_dispatched":false,"requires_reconciliation":false,"automatic_retry_allowed":false,"instruction":"This path is outside the granted source view. No existence, content or identity is disclosed. Do not retry this access, including through alternate tools or aliases. Continue independent permitted work; if this access is essential, explain the blocked dependency and request a specific scope review.","task_accepted":false}).to_string(), success:false, cancelled:false, requires_reconciliation:false, artifact_refs:vec![] }),
                 Ok(Err(e @ Error::Stale(_))) if recover_stale=>Ok(ToolExecution{content:json!({"status":"stale_patch_rejected","message":e.to_string(),"workspace_write_dispatched":false,"requires_reconciliation":false,"task_accepted":false}).to_string(),success:false,cancelled:false,requires_reconciliation:false,artifact_refs:vec![]}),
                 Ok(Err(e)) if recover_read && known_read_input_error(&e)=>Ok(ToolExecution{content:json!({"status":"read_input_rejected","message":e.to_string(),"workspace_write_dispatched":false,"requires_reconciliation":false,"remediation":"Re-observe existing parents and exact current file versions. Create a parent only with an existing explicit write grant; use exact source bytes and line endings for a new proposal. Do not invent identities or change authorization.","task_accepted":false}).to_string(),success:false,cancelled:false,requires_reconciliation:false,artifact_refs:vec![]}),
                 Ok(Err(e))=>Err(err(e)),

@@ -10,8 +10,8 @@ use std::{
     ffi::OsString,
     path::PathBuf,
 };
-pub const HELP: &str = "Melissa CLI\n\n  melissa [--home PATH] [--json] init\n  melissa [--home PATH] [--json] profiles\n  melissa [--home PATH] [--json] task new --workspace PATH --goal TEXT [--profile ID] [--exclude PREFIX]...\n  melissa [--home PATH] [--json] task list\n  melissa [--home PATH] [--json] task show|diff|events|cancel ID\n  melissa [--home PATH] [--json] task approve ID --request REQUEST_ID --digest DIGEST\n  melissa [--home PATH] [--json] task evidence ID [--artifact ARTIFACT_ID --out NEW_FILE]\n\nTarifsiz görev yalnız incelemedir. Tarif ve kaynak bağlı onay sonrası task run model/izole worker çalıştırabilir.\nTauri ve masaüstü arayüzü kapsamdan çıkarılmıştır.\n";
-pub const EXECUTION_HELP: &str = "\nYürütme ve kontrol:\n  melissa doctor\n  melissa config import PATH | config show\n  melissa task new --workspace PATH --goal TEXT --recipe PRIVATE_RECIPE.json\n  melissa task plan|progress|logs|history ID\n  melissa task run ID | task resume ID\n  melissa task pause ID | task cancel ID\n  melissa task wait ID --timeout-ms 30000\n  melissa task diff ID --content\n  melissa task delivery ID [--out NEW_DIRECTORY]\n\nTarifsiz görev yalnız incelemedir. Tarifli görevde tam kaynak/ayar/kapsam onayı sonrası run ücretli model ve izole worker başlatabilir. Pause güvenli checkpoint bekler; iptal isteği durmuş süreç kanıtı değildir. Tauri/GUI yoktur.\n";
+pub const HELP: &str = "Melissa CLI\n\n  melissa [--home PATH] [--json] init\n  melissa [--home PATH] [--json] profiles\n  melissa [--home PATH] [--json] task new --workspace PATH --goal TEXT [--profile ID] [--exclude PREFIX]...\n  melissa [--home PATH] [--json] task list\n  melissa [--home PATH] [--json] task show|diff|events|cancel ID\n  melissa [--home PATH] [--json] task approve ID --request REQUEST_ID --digest DIGEST\n  melissa [--home PATH] [--json] task evidence ID [--artifact ARTIFACT_ID --out NEW_FILE]\n\nTarifsiz görev yalnız incelemedir. Tarif ve kaynak bağlı onay sonrası task run model/izole worker çalıştırabilir.\nBaşlamak için melissa yaz.\n";
+pub const EXECUTION_HELP: &str = "\nYürütme ve kontrol:\n  melissa doctor\n  melissa config import PATH | config show\n  melissa task new --workspace PATH --goal TEXT --recipe PRIVATE_RECIPE.json\n  melissa task plan|progress|logs|history ID\n  melissa task run ID | task resume ID\n  melissa task pause ID | task cancel ID\n  melissa task wait ID --timeout-ms 30000\n  melissa task diff ID --content\n  melissa task delivery ID [--out NEW_DIRECTORY]\n\nTarifsiz görev yalnız incelemedir. Tarifli görevde tam kaynak/ayar/kapsam onayı sonrası run ücretli model ve izole worker başlatabilir. Pause güvenli checkpoint bekler; iptal isteği durmuş süreç kanıtı değildir. Oturum ve otomasyon aynı kaynak/onay kurallarını kullanır.\n";
 #[derive(Debug)]
 pub struct Options {
     pub home: Option<PathBuf>,
@@ -21,6 +21,10 @@ pub struct Options {
 pub const DOMAIN_HELP: &str = "\nWeb/API/veritabanı (v2 özel tarif):\n  melissa task preview ID [--out NEW_DIRECTORY]\n  melissa task evidence ID [--artifact ARTIFACT_ID --out NEW_FILE]\n\nYerel tarayıcı/API/SQLite/PostgreSQL akışları sabit image üzerinde çalışır. Public development ve private final testleri ayrıdır. Preview kaynağa bağlı PNG ihracıdır; kalıcı web sunucusu açmaz.\n";
 #[derive(Debug)]
 pub enum Command {
+    UiRequest {
+        workspace: PathBuf,
+        request: String,
+    },
     Observe {
         action: String,
         id: String,
@@ -89,6 +93,7 @@ pub enum Command {
         hex: String,
     },
     Help,
+    HelpAll,
     Version,
     Session {
         workspace: Option<PathBuf>,
@@ -96,6 +101,7 @@ pub enum Command {
     Init,
     Profiles,
     Doctor,
+    Configure,
     ConfigImport(PathBuf),
     ConfigShow,
     Memory {
@@ -211,7 +217,15 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options> {
         .unwrap_or("--help")
     {
         "--help" | "-h" | "help" => Command::Help,
+        "--help-all" => Command::HelpAll,
         "--version" => Command::Version,
+        "ui" => {
+            let mut f = flags(&mut a, &["--workspace", "--request-json"])?;
+            Command::UiRequest {
+                workspace: required(&mut f, "--workspace")?.into(),
+                request: text(required(&mut f, "--request-json")?)?,
+            }
+        }
         "session" => {
             if json {
                 return Err(Error::Usage("Terminal oturumu --json ile kullanılamaz."));
@@ -531,12 +545,18 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options> {
                 digest: f.remove("--digest").map(text).transpose()?,
             }
         }
+        "settings" => Command::Configure,
         "config" => match a.next().map(text).transpose()?.as_deref() {
+            None => Command::Configure,
             Some("show") => Command::ConfigShow,
             Some("import") => Command::ConfigImport(PathBuf::from(
                 a.next().ok_or(Error::Usage("Config dosyası gerekli."))?,
             )),
-            _ => return Err(Error::Usage("config import PATH veya config show gerekli.")),
+            _ => {
+                return Err(Error::Usage(
+                    "Ayar ekranı için melissa config; teknik komutlar: config show veya config import PATH.",
+                ));
+            }
         },
         "task" => {
             let action = text(

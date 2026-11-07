@@ -1554,6 +1554,15 @@ impl Gateway {
                             }),
                         );
                         self.tool_receipt(&receipt, &mut result.artifact_refs)?;
+                        crate::visible_stream::publish_tool(
+                            &context.invocation_id,
+                            &call.name,
+                            if authority_denied {
+                                "reddedildi"
+                            } else {
+                                "başlatılmadı"
+                            },
+                        );
                     }
                 }
                 messages.push(Message::Assistant { response });
@@ -1698,12 +1707,26 @@ impl Gateway {
                     return self.complete(result);
                 }
                 let tool_started = std::time::Instant::now();
+                crate::visible_stream::publish_tool(
+                    &context.invocation_id,
+                    &call.name,
+                    "çalışıyor",
+                );
                 let mut observation = match dispatcher
                     .execute(call.clone(), context.clone(), Arc::clone(&combined))
                     .await
                 {
                     Ok(v) => v,
                     Err(e) => {
+                        crate::visible_stream::publish_tool(
+                            &context.invocation_id,
+                            &call.name,
+                            if e.kind == ErrorKind::Authorization {
+                                "reddedildi"
+                            } else {
+                                "belirsiz"
+                            },
+                        );
                         self.tool_receipt(
                             &crate::adapter::ToolReceipt::dispatch_error(
                                 &context,
@@ -1744,6 +1767,19 @@ impl Gateway {
                     tool_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
                 );
                 self.tool_receipt(&receipt, &mut result.artifact_refs)?;
+                crate::visible_stream::publish_tool(
+                    &context.invocation_id,
+                    &call.name,
+                    if observation.requires_reconciliation {
+                        "belirsiz"
+                    } else if observation.cancelled {
+                        "durduruldu"
+                    } else if observation.success {
+                        "tamamlandı"
+                    } else {
+                        "hata"
+                    },
+                );
                 result.tool_calls += 1;
                 if observation.success
                     && !observation.requires_reconciliation

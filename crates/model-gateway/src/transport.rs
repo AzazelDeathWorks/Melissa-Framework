@@ -48,6 +48,7 @@ impl std::fmt::Debug for ApiKey {
 pub enum EndpointTrust {
     RemoteHttps,
     LoopbackFixture,
+    LocalLoopback,
 }
 /// Request extensions are selected by the host, never by model-generated JSON.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +98,28 @@ impl std::fmt::Debug for ProviderEndpoint {
     }
 }
 impl ProviderEndpoint {
+    pub fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.key.0.is_empty() {
+            return request;
+        }
+        match self.protocol {
+            Protocol::OpenAiResponses | Protocol::OpenAiChatCompletions => {
+                request.bearer_auth(self.key.0.as_str())
+            }
+            Protocol::AnthropicMessages => request
+                .header("x-api-key", self.key.0.as_str())
+                .header("anthropic-version", "2023-06-01"),
+        }
+    }
+    pub fn without_authentication(mut self) -> Result<Self> {
+        if self.trust != EndpointTrust::LocalLoopback {
+            return Err(GatewayError::invalid(
+                "keyless endpoints require explicit local loopback trust",
+            ));
+        }
+        self.key = ApiKey(Zeroizing::new(String::new()));
+        Ok(self)
+    }
     pub fn with_prompt_cache(mut self, mode: PromptCache) -> Result<Self> {
         self.prompt_cache = mode;
         self.validate()?;
@@ -210,7 +233,7 @@ impl ProviderEndpoint {
                     ));
                 }
             }
-            EndpointTrust::LoopbackFixture => {
+            EndpointTrust::LoopbackFixture | EndpointTrust::LocalLoopback => {
                 // host() rather than host_str(): the latter keeps IPv6 brackets
                 // ("[::1]"), which never parse as an IpAddr.
                 let loopback = match url.host() {
@@ -342,7 +365,10 @@ impl HttpTransport {
         if self.json_object_output
             && let Some(schema) = &request.output_schema
         {
-            if endpoint.protocol != Protocol::OpenAiResponses {
+            if !matches!(
+                endpoint.protocol,
+                Protocol::OpenAiResponses | Protocol::OpenAiChatCompletions
+            ) {
                 return Err(GatewayError::unsupported(
                     "JSON-object mode requires Responses",
                 ));
@@ -356,7 +382,11 @@ impl HttpTransport {
             let mut json_request = request.clone();
             json_request.output_schema = None;
             let mut body = Self::body_with_limits(endpoint, &json_request, self.request_limits)?;
-            body["text"] = serde_json::json!({"format":{"type":"json_object"}});
+            if endpoint.protocol == Protocol::OpenAiChatCompletions {
+                body["response_format"] = serde_json::json!({"type":"json_object"});
+            } else {
+                body["text"] = serde_json::json!({"format":{"type":"json_object"}});
+            }
             return Ok(body);
         }
         Self::body_with_limits(endpoint, request, self.request_limits)
@@ -374,6 +404,9 @@ impl HttpTransport {
         stable.tools.sort_by(|a, b| a.name.cmp(&b.name));
         let request = &stable;
         let mut body = match endpoint.protocol {
+            Protocol::OpenAiChatCompletions => {
+                crate::chat_completions::build_request(request, limits)
+            }
             Protocol::OpenAiResponses => crate::openai::build_request_with_image_detail(
                 request,
                 limits,
@@ -434,6 +467,7 @@ impl HttpTransport {
         cancelled: Arc<AtomicBool>,
     ) -> AttemptOutcome {
         let begin = Instant::now();
+        let visible_stream = crate::visible_stream::next_stream();
         let mut delivery = Delivery::NotSent;
         let mut status = None;
         let mut provider_request_id = None;
@@ -452,7 +486,12 @@ impl HttpTransport {
             }
             endpoint.validate()?;
             limits.validate()?;
-            if self.local_only && endpoint.trust != EndpointTrust::LoopbackFixture {
+            if self.local_only
+                && !matches!(
+                    endpoint.trust,
+                    EndpointTrust::LoopbackFixture | EndpointTrust::LocalLoopback
+                )
+            {
                 return Err(GatewayError::unsupported(
                     "local-only gateway cannot contact a remote provider",
                 ));
@@ -464,11 +503,17 @@ impl HttpTransport {
                 .header("accept", "text/event-stream")
                 .json(&body)
                 .timeout(Duration::from_millis(timeout_ms));
-            send = match endpoint.protocol {
-                Protocol::OpenAiResponses => send.bearer_auth(endpoint.key.0.as_str()),
-                Protocol::AnthropicMessages => send
-                    .header("x-api-key", endpoint.key.0.as_str())
-                    .header("anthropic-version", "2023-06-01"),
+            send = if endpoint.key.0.is_empty() {
+                send
+            } else {
+                match endpoint.protocol {
+                    Protocol::OpenAiResponses | Protocol::OpenAiChatCompletions => {
+                        send.bearer_auth(endpoint.key.0.as_str())
+                    }
+                    Protocol::AnthropicMessages => send
+                        .header("x-api-key", endpoint.key.0.as_str())
+                        .header("anthropic-version", "2023-06-01"),
+                }
             };
             delivery = Delivery::PossiblySent;
             let response = match send.send().await {
@@ -620,6 +665,7 @@ impl HttpTransport {
             let mut parser = SseParser::new(limits);
             let mut openai = crate::openai::OpenAiDecoder::new(&request.model, limits);
             let mut anthropic = crate::anthropic::AnthropicDecoder::new(&request.model, limits);
+            let mut chat = crate::chat_completions::ChatDecoder::new(&request.model, limits);
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 if cancelled.load(Ordering::Acquire) {
@@ -648,14 +694,17 @@ impl HttpTransport {
                 for piece in chunk.chunks(16 * 1024) {
                     for event in parser.feed(piece)? {
                         match endpoint.protocol {
+                            Protocol::OpenAiChatCompletions => chat.push(&event)?,
                             Protocol::OpenAiResponses => openai.push(&event)?,
                             Protocol::AnthropicMessages => anthropic.push(&event)?,
                         }
+                        crate::visible_stream::publish(visible_stream, endpoint.protocol, &event);
                     }
                 }
             }
             parser.finish()?;
             match endpoint.protocol {
+                Protocol::OpenAiChatCompletions => chat.finish(),
                 Protocol::OpenAiResponses => openai.finish(),
                 Protocol::AnthropicMessages => anthropic.finish(),
             }

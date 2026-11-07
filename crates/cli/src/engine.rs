@@ -1855,6 +1855,8 @@ impl App {
             .map_err(gw)?
             .with_read_error_observations()
             .map_err(gw)?
+            .with_denied_read_observations()
+            .map_err(gw)?
             .with_recovery_observations()
             .map_err(gw)?;
             let repo_tool = if ["melissa.cli-recipe/v2", "melissa.cli-recipe/v3"]

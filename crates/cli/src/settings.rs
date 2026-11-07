@@ -18,11 +18,31 @@ use std::{
     path::{Path, PathBuf},
 };
 use zeroize::Zeroizing;
+pub(crate) fn validate_local_id(id: &str) -> Result {
+    if id.len() != 32
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(Error::Usage("Yerel kayıt kimliği geçersiz."));
+    }
+    Ok(())
+}
+pub(crate) fn local_endpoint(url: &url::Url) -> bool {
+    url.scheme() == "http"
+        && match url.host() {
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            _ => false,
+        }
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Credential {
     File { path: PathBuf },
     Environment { name: String },
+    Stored { home: PathBuf, id: String },
+    None,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -143,14 +163,13 @@ impl Settings {
             || self.request_timeout_ms > 1_800_000
             || !self.capabilities.tool_calling
             || !self.capabilities.streaming
-            || !(self.json_object || self.native_json_schema)
         {
             return Err(Error::Usage(
                 "Sağlayıcı/model/yetenek yapılandırması geçersiz.",
             ));
         }
         let u = url::Url::parse(&self.endpoint).map_err(|_| Error::Usage("Endpoint geçersiz."))?;
-        if u.scheme() != "https"
+        if !(u.scheme() == "https" || local_endpoint(&u))
             || !u.username().is_empty()
             || u.password().is_some()
             || u.query().is_some()
@@ -159,6 +178,16 @@ impl Settings {
             return Err(Error::Denied("Remote endpoint yalın HTTPS adresi olmalı."));
         }
         match &self.credential {
+            Credential::None if !local_endpoint(&u) => {
+                return Err(Error::Denied(
+                    "Anahtarsız bağlantı yalnız açık yerel loopback adresinde kullanılabilir.",
+                ));
+            }
+            Credential::None => (),
+            Credential::Stored { home, id } => {
+                absolute(home)?;
+                validate_local_id(id)?;
+            }
             Credential::File { path } => {
                 absolute(path)?;
             }
@@ -206,8 +235,9 @@ impl Settings {
                 "chat_completions_compatibility_implied":false
             },
             "rate_card_digest":m.rate_card.digest(),
-            "input_micro_usd_per_million":m.rate_card.input_micro_usd_per_million,
-            "output_micro_usd_per_million":m.rate_card.output_micro_usd_per_million
+            "pricing_status":if m.rate_card.source==melissa_model_gateway::routing::PriceSource::Unknown{"unknown"}else{"configured_not_invoice"},
+            "input_micro_usd_per_million":(m.rate_card.source!=melissa_model_gateway::routing::PriceSource::Unknown).then_some(m.rate_card.input_micro_usd_per_million),
+            "output_micro_usd_per_million":(m.rate_card.source!=melissa_model_gateway::routing::PriceSource::Unknown).then_some(m.rate_card.output_micro_usd_per_million)
         })).collect::<Vec<_>>())
     }
     pub(crate) fn endpoint_with_key(&self, key: ApiKey) -> Result<ProviderEndpoint> {
@@ -216,11 +246,20 @@ impl Settings {
             format!("provider:{}", self.provider_id),
             format!("authorization:provider:{}", self.provider_id),
             self.protocol,
-            EndpointTrust::RemoteHttps,
+            if url::Url::parse(&self.endpoint).is_ok_and(|u| local_endpoint(&u)) {
+                EndpointTrust::LocalLoopback
+            } else {
+                EndpointTrust::RemoteHttps
+            },
             &self.endpoint,
             key,
         )
         .map_err(|_| Error::Usage("Endpoint yapılandırması geçersiz."))?;
+        if matches!(self.credential, Credential::None) {
+            endpoint = endpoint
+                .without_authentication()
+                .map_err(|_| Error::Denied("Anahtarsız endpoint geçersiz."))?;
+        }
         endpoint = endpoint
             .with_prompt_cache(self.prompt_cache)
             .map_err(|_| Error::Usage("Sağlayıcı cache ayarı protokolle uyuşmuyor."))?;
@@ -240,6 +279,23 @@ impl Settings {
     }
     pub(crate) fn key(&self) -> Result<ApiKey> {
         match &self.credential {
+            Credential::None => ApiKey::new("local-keyless".into()).map_err(|_| Error::Store),
+            Credential::Stored { home, id } => {
+                let app = App::open(home)?;
+                validate_local_id(id)?;
+                let path = app.home.join("credentials").join(format!("{id}.enc"));
+                crate::app::safe_path(&path)?;
+                let encrypted = fs::read(path).map_err(|_| {
+                    Error::Unavailable("Kaydedilen anahtar bulunamadı; /config ile güncelle.")
+                })?;
+                let plain = Zeroizing::new(
+                    app.key
+                        .open(&encrypted, format!("melissa.credential/v1:{id}").as_bytes())?,
+                );
+                let secret = std::str::from_utf8(&plain).map_err(|_| Error::Store)?;
+                ApiKey::new(secret.into())
+                    .map_err(|_| Error::Denied("Kaydedilen anahtar geçersiz."))
+            }
             Credential::Environment { name } => ApiKey::from_env(name)
                 .map_err(|_| Error::Unavailable("Yapılandırılmış credential değişkeni açılamadı.")),
             Credential::File { path } => {
@@ -255,7 +311,7 @@ impl Settings {
                 if data.len() > 8192 {
                     return Err(Error::Denied("Credential dosyası boyutu geçersiz."));
                 }
-                ApiKey::new(data.trim().to_owned())
+                ApiKey::new(data.trim().trim_start_matches('\u{feff}').to_owned())
                     .map_err(|_| Error::Denied("Credential dosyası biçimi geçersiz."))
             }
         }
@@ -290,6 +346,21 @@ impl Settings {
     }
 }
 impl App {
+    pub(crate) fn save_settings(&self, value: &Settings) -> Result<Value> {
+        value.validate()?;
+        let encoded = self.key.seal(&bytes(value)?, b"melissa.cli.settings.v1")?;
+        let temp = self.home.join(format!("settings-{}.tmp", nonce()?));
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp)?;
+        file.write_all(&encoded)?;
+        file.sync_all()?;
+        drop(file);
+        crate::app::safe_path(&self.home.join("settings.enc"))?;
+        fs::rename(temp, self.home.join("settings.enc"))?;
+        self.configuration()
+    }
     pub fn configure(&self, path: &Path) -> Result<Value> {
         let path = absolute(path)?;
         let repo = melissa_repository::Repository::open(
@@ -304,24 +375,13 @@ impl App {
         for (_, model) in value.models() {
             let _ = model.context_compiler()?;
         }
-        let encoded = self.key.seal(&bytes(&value)?, b"melissa.cli.settings.v1")?;
-        let temp = self.home.join(format!("settings-{}.tmp", nonce()?));
-        let mut file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp)?;
-        file.write_all(&encoded)?;
-        file.sync_all()?;
-        drop(file);
-        crate::app::safe_path(&self.home.join("settings.enc"))?;
-        fs::rename(&temp, self.home.join("settings.enc"))?;
-        self.configuration()
+        self.save_settings(&value)
     }
     pub(crate) fn settings(&self) -> Result<Settings> {
         let repo = melissa_repository::Repository::open(&self.home, Default::default(), vec![])?;
         let (_, cipher) = repo
             .read("settings.enc")
-            .map_err(|_| Error::Usage("Önce config import PATH ile sağlayıcı ayarını kaydedin."))?;
+            .map_err(|_| Error::Usage("Sağlayıcı ayarı okunamadı. Sohbette /settings veya PowerShell'de melissa config ile bağlantını kontrol et."))?;
         let plain = Zeroizing::new(self.key.open(&cipher, b"melissa.cli.settings.v1")?);
         let s: Settings = decode(&plain)?;
         s.validate()?;
