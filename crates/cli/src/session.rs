@@ -575,7 +575,11 @@ impl Session {
             .ok_or(Error::Conflict(
                 "Görev projesi doğrulanamadı. Etkin çalıştırıcı kapandıktan sonra tekrar aç.",
             ))?;
-        if !workspace.eq_ignore_ascii_case(&self.workspace.to_string_lossy()) {
+        // Task records store the path resolved from the repository handle.
+        // Windows can supply the session with a short name for that same root.
+        let repo =
+            melissa_repository::Repository::open(&self.workspace, Default::default(), vec![])?;
+        if Path::new(workspace) != repo.root_path() {
             return Err(Error::Denied("Bu görev başka bir proje klasörüne bağlı."));
         }
         let id = value["task_id"].as_str().ok_or(Error::Store)?.to_owned();
