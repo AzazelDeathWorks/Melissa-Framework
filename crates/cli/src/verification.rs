@@ -40,6 +40,9 @@ impl Policy {
         }
     }
     pub fn plan(&self, recipe: &Recipe) -> Value {
+        if let Some(project) = &recipe.project {
+            return json!({"risk":self.risk,"acceptance_kind":"host_source_bound_project_checks","required_checks":project.checks,"private_oracle":false,"independent_host_execution":true,"release_security_license":"separate acceptance required"});
+        }
         json!({
             "risk":self.risk,
             "syntax_type":"source-bound checks after edits and approved SDK checks",

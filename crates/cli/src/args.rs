@@ -1,14 +1,17 @@
 use crate::{Error, Result};
+pub const EXTENSION_HELP: &str = "\nSkill/MCP/doküman/hook:\n  Oturum: /skills, /skill-import KLASOR, /extensions [JSON_DOSYASI]\n  melissa --json extension list --workspace PATH\n  melissa --json extension import-skill --path DIR [--digest BLAKE3]\n  melissa --json extension configure --workspace PATH --path JSON\n  melissa --json extension resolve --task TASK --source SOURCE --query TEXT\n  İçerik/ayarlar yeni görev onayına sabitlenir; eski göreve izin eklenmez. Belgeler: docs/EXTENSIONS_TR.md\n";
 pub const METRICS_HELP: &str =
     "\nGörev ölçümleri:\n  melissa [--home PATH] --json task metrics ID\n";
+pub const SESSION_HELP: &str = "\nTerminal oturumu:\n  melissa\n  melissa [--home PATH] session [--workspace PATH]\n\nGörevini yaz veya oturum komutları için /help yaz.";
+pub const PROJECT_HELP: &str = "\nGenel proje ortamı ve komutları:\n  Oturum: /config PATH, /budget USD, /environment [IMAGE|JSON_PATH], /project-doctor\n  Amaç yaz, /create, /details, /approve, /run\n  /preflight, /environment-sync veya /exec JSON_COMMAND modeli çağırmaz; /resume ile model akışı sürer.\n  melissa --json project doctor --workspace PATH\n  melissa --json project preflight|sync TASK_ID\n  melissa --json project exec TASK_ID --command-json JSON_COMMAND\n  melissa --json project poll TASK_ID SESSION_ID [--after N]\n  melissa --json project stdin TASK_ID SESSION_ID --hex HEX_BYTES\n  melissa --json project eof|cancel TASK_ID SESSION_ID\n  Komutlar private snapshot kullanır; host mount/host writeback/ağ yoktur. Belgeler: docs/PROJECT_RUNTIME_TR.md\n";
 pub const CAPABILITIES_HELP: &str = "\nProje belleği ve görev hazırlığı:\n  melissa task prepare --workspace PATH --goal TEXT --out NEW_FILE [--acceptance PRIVATE_RECIPE]\n  melissa memory list --workspace PATH\n  melissa memory accept|reject|forget --workspace PATH --id MEMORY_ID --digest REVIEW_DIGEST\n  melissa task replan ID --recipe REVIEWED_RECIPE\n\nPrepare yerel, incelenebilir taslak çıkarır; modeli çalıştırmaz veya kabul cevabı uydurmaz. Bellek önerileri operatör kabul edene kadar aramada kullanılmaz. Replan güvenli pause durumunda yalnız kalan uzman adımlarını değiştirir; çalışan adım korunur, revizyon o adım bittikten sonra etkinleşir. İlk dosya, kabul, süre ve maliyet yetkisi değişmez.\n";
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     path::PathBuf,
 };
-pub const HELP: &str = "Melissa CLI\n\n  melissa [--home PATH] [--json] init\n  melissa [--home PATH] [--json] profiles\n  melissa [--home PATH] [--json] task new --workspace PATH --goal TEXT [--profile ID] [--exclude PREFIX]...\n  melissa [--home PATH] [--json] task list\n  melissa [--home PATH] [--json] task show|diff|events|cancel ID\n  melissa [--home PATH] [--json] task approve ID --request REQUEST_ID --digest DIGEST\n  melissa [--home PATH] [--json] task evidence ID [--artifact ARTIFACT_ID --out NEW_FILE]\n\nTarifsiz görev yalnız incelemedir. Tarif ve kaynak bağlı onay sonrası task run model/izole worker çalıştırabilir.\nTauri ve masaüstü arayüzü kapsamdan çıkarılmıştır.\n";
-pub const EXECUTION_HELP: &str = "\nYürütme ve kontrol:\n  melissa doctor\n  melissa config import PATH | config show\n  melissa task new --workspace PATH --goal TEXT --recipe PRIVATE_RECIPE.json\n  melissa task plan|progress|logs|history ID\n  melissa task run ID | task resume ID\n  melissa task pause ID | task cancel ID\n  melissa task wait ID --timeout-ms 30000\n  melissa task diff ID --content\n  melissa task delivery ID [--out NEW_DIRECTORY]\n\nTarifsiz görev yalnız incelemedir. Tarifli görevde tam kaynak/ayar/kapsam onayı sonrası run ücretli model ve izole worker başlatabilir. Pause güvenli checkpoint bekler; iptal isteği durmuş süreç kanıtı değildir. Tauri/GUI yoktur.\n";
+pub const HELP: &str = "Melissa CLI\n\n  melissa [--home PATH] [--json] init\n  melissa [--home PATH] [--json] profiles\n  melissa [--home PATH] [--json] task new --workspace PATH --goal TEXT [--profile ID] [--exclude PREFIX]...\n  melissa [--home PATH] [--json] task list\n  melissa [--home PATH] [--json] task show|diff|events|cancel ID\n  melissa [--home PATH] [--json] task approve ID --request REQUEST_ID --digest DIGEST\n  melissa [--home PATH] [--json] task evidence ID [--artifact ARTIFACT_ID --out NEW_FILE]\n\nTarifsiz görev yalnız incelemedir. Tarif ve kaynak bağlı onay sonrası task run model/izole worker çalıştırabilir.\nBaşlamak için melissa yaz.\n";
+pub const EXECUTION_HELP: &str = "\nYürütme ve kontrol:\n  melissa doctor\n  melissa config import PATH | config show\n  melissa task new --workspace PATH --goal TEXT --recipe PRIVATE_RECIPE.json\n  melissa task plan|progress|logs|history ID\n  melissa task run ID | task resume ID\n  melissa task pause ID | task cancel ID\n  melissa task wait ID --timeout-ms 30000\n  melissa task diff ID --content\n  melissa task delivery ID [--out NEW_DIRECTORY]\n\nTarifsiz görev yalnız incelemedir. Tarifli görevde tam kaynak/ayar/kapsam onayı sonrası run ücretli model ve izole worker başlatabilir. Pause güvenli checkpoint bekler; iptal isteği durmuş süreç kanıtı değildir. Oturum ve otomasyon aynı kaynak/onay kurallarını kullanır.\n";
 #[derive(Debug)]
 pub struct Options {
     pub home: Option<PathBuf>,
@@ -18,11 +21,87 @@ pub struct Options {
 pub const DOMAIN_HELP: &str = "\nWeb/API/veritabanı (v2 özel tarif):\n  melissa task preview ID [--out NEW_DIRECTORY]\n  melissa task evidence ID [--artifact ARTIFACT_ID --out NEW_FILE]\n\nYerel tarayıcı/API/SQLite/PostgreSQL akışları sabit image üzerinde çalışır. Public development ve private final testleri ayrıdır. Preview kaynağa bağlı PNG ihracıdır; kalıcı web sunucusu açmaz.\n";
 #[derive(Debug)]
 pub enum Command {
+    UiRequest {
+        workspace: PathBuf,
+        request: String,
+    },
+    Observe {
+        action: String,
+        id: String,
+        out: Option<PathBuf>,
+        endpoint: Option<String>,
+    },
+    Maintenance {
+        action: String,
+        id: Option<String>,
+        out: Option<PathBuf>,
+        source: Option<PathBuf>,
+        key_file: Option<PathBuf>,
+    },
+    Continuity {
+        id: String,
+        action: String,
+        request: Option<String>,
+        digest: Option<String>,
+        label: Option<String>,
+    },
+    Services {
+        action: String,
+        id: Option<String>,
+        workspace: Option<PathBuf>,
+        path: Option<PathBuf>,
+        request: Option<String>,
+    },
+    Verification {
+        action: String,
+        id: Option<String>,
+        workspace: Option<PathBuf>,
+        path: Option<PathBuf>,
+        request: String,
+    },
+    RepositoryInspect {
+        action: String,
+        workspace: PathBuf,
+        query: PathBuf,
+    },
+    Extension {
+        action: String,
+        workspace: Option<PathBuf>,
+        path: Option<PathBuf>,
+        digest: Option<String>,
+        id: Option<String>,
+        source: Option<String>,
+        query: Option<String>,
+    },
+    ProjectDoctor {
+        workspace: PathBuf,
+    },
+    ProjectOperation {
+        id: String,
+        operation: String,
+        command: Option<String>,
+    },
+    ProjectPoll {
+        id: String,
+        session: String,
+        after: u64,
+    },
+    ProjectInput {
+        id: String,
+        session: String,
+        operation: String,
+        hex: String,
+    },
     Help,
+    HelpAll,
     Version,
+    Session {
+        workspace: Option<PathBuf>,
+    },
     Init,
     Profiles,
     Doctor,
+    Configure,
     ConfigImport(PathBuf),
     ConfigShow,
     Memory {
@@ -138,10 +217,318 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options> {
         .unwrap_or("--help")
     {
         "--help" | "-h" | "help" => Command::Help,
+        "--help-all" => Command::HelpAll,
         "--version" => Command::Version,
+        "ui" => {
+            let mut f = flags(&mut a, &["--workspace", "--request-json"])?;
+            Command::UiRequest {
+                workspace: required(&mut f, "--workspace")?.into(),
+                request: text(required(&mut f, "--request-json")?)?,
+            }
+        }
+        "session" => {
+            if json {
+                return Err(Error::Usage("Terminal oturumu --json ile kullanılamaz."));
+            }
+            let mut f = flags(&mut a, &["--workspace"])?;
+            Command::Session {
+                workspace: f.remove("--workspace").map(PathBuf::from),
+            }
+        }
         "init" => Command::Init,
         "profiles" => Command::Profiles,
         "doctor" => Command::Doctor,
+        "services" => {
+            let action = text(
+                a.next()
+                    .ok_or(Error::Usage("services configure|show|session|run gerekli."))?,
+            )?;
+            if !["configure", "show", "session", "run", "baseline-accept"]
+                .contains(&action.as_str())
+            {
+                return Err(Error::Usage("Bilinmeyen services işlemi."));
+            }
+            let id = if ["session", "run", "baseline-accept"].contains(&action.as_str()) {
+                Some(text(
+                    a.next().ok_or(Error::Usage("Görev kimliği gerekli."))?,
+                )?)
+            } else {
+                None
+            };
+            let allowed: &[&str] = match action.as_str() {
+                "configure" => &["--workspace", "--path"],
+                "show" => &["--workspace"],
+                "run" | "baseline-accept" => &["--request-json"],
+                _ => &[],
+            };
+            let mut f = flags(&mut a, allowed)?;
+            let workspace = f.remove("--workspace").map(PathBuf::from);
+            let path = f.remove("--path").map(PathBuf::from);
+            let request = f.remove("--request-json").map(text).transpose()?;
+            if (id.is_none() && workspace.is_none())
+                || (action == "configure" && path.is_none())
+                || (["run", "baseline-accept"].contains(&action.as_str()) && request.is_none())
+            {
+                return Err(Error::Usage("Servis seçenekleri eksik."));
+            }
+            Command::Services {
+                action,
+                id,
+                workspace,
+                path,
+                request,
+            }
+        }
+        "verification" => {
+            let action = text(a.next().ok_or(Error::Usage(
+                "verification configure|show|verify|reproduce gerekli.",
+            ))?)?;
+            if !["configure", "show", "verify", "reproduce"].contains(&action.as_str()) {
+                return Err(Error::Usage("Bilinmeyen verification işlemi."));
+            }
+            let id = if ["verify", "reproduce"].contains(&action.as_str()) {
+                Some(text(
+                    a.next().ok_or(Error::Usage("Görev kimliği gerekli."))?,
+                )?)
+            } else {
+                None
+            };
+            let allowed: &[&str] = match action.as_str() {
+                "show" => &["--workspace"],
+                "configure" => &["--workspace", "--path"],
+                _ => &["--request-json"],
+            };
+            let mut f = flags(&mut a, allowed)?;
+            let workspace = f.remove("--workspace").map(PathBuf::from);
+            let path = f.remove("--path").map(PathBuf::from);
+            let request = f
+                .remove("--request-json")
+                .map(text)
+                .transpose()?
+                .unwrap_or_else(|| "{}".into());
+            if (id.is_none() && workspace.is_none())
+                || (action == "configure" && path.is_none())
+                || (id.is_some() && (workspace.is_some() || path.is_some()))
+                || (action == "show" && path.is_some())
+            {
+                return Err(Error::Usage("Verification seçenekleri işlemle eşleşmiyor."));
+            }
+            Command::Verification {
+                action,
+                id,
+                workspace,
+                path,
+                request,
+            }
+        }
+        "repository" => {
+            let action = text(a.next().ok_or(Error::Usage(
+                "repository impact-map|structural-patch --workspace PATH --query JSON gerekli.",
+            ))?)?;
+            if !["impact-map", "structural-patch"].contains(&action.as_str()) {
+                return Err(Error::Usage("Bilinmeyen repository işlemi."));
+            }
+            let mut f = flags(&mut a, &["--workspace", "--query"])?;
+            Command::RepositoryInspect {
+                action,
+                workspace: PathBuf::from(
+                    f.remove("--workspace")
+                        .ok_or(Error::Usage("--workspace gerekli."))?,
+                ),
+                query: PathBuf::from(
+                    f.remove("--query")
+                        .ok_or(Error::Usage("--query gerekli."))?,
+                ),
+            }
+        }
+        "extension" => {
+            let action = text(a.next().ok_or(Error::Usage(
+                "extension list|configure|import-skill|resolve gerekli.",
+            ))?)?;
+            if !["list", "configure", "import-skill", "resolve"].contains(&action.as_str()) {
+                return Err(Error::Usage("Bilinmeyen extension işlemi."));
+            }
+            let mut f = flags(
+                &mut a,
+                &[
+                    "--workspace",
+                    "--path",
+                    "--digest",
+                    "--task",
+                    "--source",
+                    "--query",
+                ],
+            )?;
+            let workspace = f.remove("--workspace").map(PathBuf::from);
+            let path = f.remove("--path").map(PathBuf::from);
+            let digest = f.remove("--digest").map(text).transpose()?;
+            let id = f.remove("--task").map(text).transpose()?;
+            let source = f.remove("--source").map(text).transpose()?;
+            let query = f.remove("--query").map(text).transpose()?;
+            if match action.as_str() {
+                "list" => {
+                    workspace.is_none()
+                        || path.is_some()
+                        || digest.is_some()
+                        || id.is_some()
+                        || source.is_some()
+                        || query.is_some()
+                }
+                "configure" => {
+                    workspace.is_none()
+                        || path.is_none()
+                        || digest.is_some()
+                        || id.is_some()
+                        || source.is_some()
+                        || query.is_some()
+                }
+                "import-skill" => {
+                    workspace.is_some()
+                        || path.is_none()
+                        || id.is_some()
+                        || source.is_some()
+                        || query.is_some()
+                }
+                _ => {
+                    id.is_none()
+                        || source.is_none()
+                        || query.is_none()
+                        || workspace.is_some()
+                        || path.is_some()
+                        || digest.is_some()
+                }
+            } {
+                return Err(Error::Usage("Extension seçenekleri işlemle uyuşmuyor."));
+            }
+            Command::Extension {
+                action,
+                workspace,
+                path,
+                digest,
+                id,
+                source,
+                query,
+            }
+        }
+        "project" => {
+            let action = text(a.next().ok_or(Error::Usage(
+                "project doctor|preflight|sync|exec|poll|stdin|eof|cancel gerekli.",
+            ))?)?;
+            match action.as_str() {
+                "doctor" => {
+                    let mut f = flags(&mut a, &["--workspace"])?;
+                    Command::ProjectDoctor {
+                        workspace: required(&mut f, "--workspace")?.into(),
+                    }
+                }
+                "preflight" | "sync" | "exec" => {
+                    let id = text(a.next().ok_or(Error::Usage("Görev kimliği gerekli."))?)?;
+                    let mut f = flags(&mut a, &["--command-json"])?;
+                    let command = f.remove("--command-json").map(text).transpose()?;
+                    if (action == "exec") != command.is_some() {
+                        return Err(Error::Usage("Yalnız exec için --command-json gerekli."));
+                    }
+                    Command::ProjectOperation {
+                        id,
+                        operation: action,
+                        command,
+                    }
+                }
+                "poll" => {
+                    let id = text(a.next().ok_or(Error::Usage("Görev kimliği gerekli."))?)?;
+                    let session = text(a.next().ok_or(Error::Usage("Süreç oturumu gerekli."))?)?;
+                    let mut f = flags(&mut a, &["--after"])?;
+                    let after = f
+                        .remove("--after")
+                        .map(text)
+                        .transpose()?
+                        .map(|v| {
+                            v.parse::<u64>()
+                                .map_err(|_| Error::Usage("--after sayısal olmalı."))
+                        })
+                        .transpose()?
+                        .unwrap_or(0);
+                    Command::ProjectPoll { id, session, after }
+                }
+                "stdin" | "eof" | "cancel" => {
+                    let id = text(a.next().ok_or(Error::Usage("Görev kimliği gerekli."))?)?;
+                    let session = text(a.next().ok_or(Error::Usage("Süreç oturumu gerekli."))?)?;
+                    let mut f = flags(&mut a, &["--hex"])?;
+                    let hex = f.remove("--hex").map(text).transpose()?.unwrap_or_default();
+                    if action != "stdin" && !hex.is_empty() {
+                        return Err(Error::Usage("Yalnız stdin --hex alır."));
+                    }
+                    Command::ProjectInput {
+                        id,
+                        session,
+                        operation: action,
+                        hex,
+                    }
+                }
+                _ => return Err(Error::Usage("Proje komutu bilinmiyor.")),
+            }
+        }
+        "observe" => {
+            let action = text(
+                a.next()
+                    .ok_or(Error::Usage("observe diagnose|support|otlp gerekli."))?,
+            )?;
+            let id = text(a.next().ok_or(Error::Usage("Görev kimliği gerekli."))?)?;
+            let allowed: &[&str] = match action.as_str() {
+                "diagnose" => &[],
+                "support" => &["--out"],
+                "otlp" => &["--out", "--endpoint"],
+                _ => return Err(Error::Usage("Gözlem işlemi bilinmiyor.")),
+            };
+            let mut f = flags(&mut a, allowed)?;
+            let out = f.remove("--out").map(PathBuf::from);
+            let endpoint = f.remove("--endpoint").map(text).transpose()?;
+            if action == "support" && out.is_none() {
+                return Err(Error::Usage("Destek paketi için --out gerekli."));
+            }
+            Command::Observe {
+                action,
+                id,
+                out,
+                endpoint,
+            }
+        }
+        "maintenance" => {
+            let action = text(a.next().ok_or(Error::Usage(
+                "maintenance disk|retention-preview|backup|restore|keygen gerekli.",
+            ))?)?;
+            let id = if ["disk", "retention-preview", "backup"].contains(&action.as_str()) {
+                Some(text(
+                    a.next().ok_or(Error::Usage("Görev kimliği gerekli."))?,
+                )?)
+            } else {
+                None
+            };
+            let allowed: &[&str] = match action.as_str() {
+                "disk" | "retention-preview" => &[],
+                "backup" => &["--out", "--key-file"],
+                "restore" => &["--from", "--out", "--key-file"],
+                "keygen" => &["--out"],
+                _ => return Err(Error::Usage("Bakım işlemi bilinmiyor.")),
+            };
+            let mut f = flags(&mut a, allowed)?;
+            let out = f.remove("--out").map(PathBuf::from);
+            let source = f.remove("--from").map(PathBuf::from);
+            let key_file = f.remove("--key-file").map(PathBuf::from);
+            if (["backup", "restore", "keygen"].contains(&action.as_str()) && out.is_none())
+                || (["backup", "restore"].contains(&action.as_str()) && key_file.is_none())
+                || (action == "restore" && source.is_none())
+            {
+                return Err(Error::Usage("Bakım/yedek seçenekleri eksik."));
+            }
+            Command::Maintenance {
+                action,
+                id,
+                out,
+                source,
+                key_file,
+            }
+        }
         "memory" => {
             let action = text(
                 a.next()
@@ -158,12 +545,18 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options> {
                 digest: f.remove("--digest").map(text).transpose()?,
             }
         }
+        "settings" => Command::Configure,
         "config" => match a.next().map(text).transpose()?.as_deref() {
+            None => Command::Configure,
             Some("show") => Command::ConfigShow,
             Some("import") => Command::ConfigImport(PathBuf::from(
                 a.next().ok_or(Error::Usage("Config dosyası gerekli."))?,
             )),
-            _ => return Err(Error::Usage("config import PATH veya config show gerekli.")),
+            _ => {
+                return Err(Error::Usage(
+                    "Ayar ekranı için melissa config; teknik komutlar: config show veya config import PATH.",
+                ));
+            }
         },
         "task" => {
             let action = text(
@@ -186,6 +579,36 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options> {
                     Command::Replan {
                         id,
                         recipe: required(&mut f, "--recipe")?.into(),
+                    }
+                }
+                "continuity" | "checkpoints" | "checkpoint" | "changes" | "undo-preview"
+                | "undo" | "adopt-preview" | "adopt-source" => {
+                    let id = text(a.next().ok_or(Error::Usage("Görev kimliği gerekli."))?)?;
+                    let allowed: &[&str] = match action.as_str() {
+                        "checkpoint" => &["--label"],
+                        "undo-preview" => &["--request-json"],
+                        "undo" => &["--request-json", "--digest"],
+                        "adopt-source" => &["--digest"],
+                        _ => &[],
+                    };
+                    let mut f = flags(&mut a, allowed)?;
+                    let request = f.remove("--request-json").map(text).transpose()?;
+                    let digest = f.remove("--digest").map(text).transpose()?;
+                    let label = f.remove("--label").map(text).transpose()?;
+                    if (["undo-preview", "undo"].contains(&action.as_str()) && request.is_none())
+                        || (["undo", "adopt-source"].contains(&action.as_str()) && digest.is_none())
+                        || (action == "checkpoint" && label.is_none())
+                    {
+                        return Err(Error::Usage(
+                            "Checkpoint/geri alma inceleme seçenekleri eksik.",
+                        ));
+                    }
+                    Command::Continuity {
+                        id,
+                        action,
+                        request,
+                        digest,
+                        label,
                     }
                 }
                 "list" => Command::List,
@@ -341,3 +764,13 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options> {
         command,
     })
 }
+
+pub const REPOSITORY_HELP: &str = "\nDepo analizi (model/API çağırmaz):\n  melissa --json repository impact-map|structural-patch --workspace PATH --query JSON_FILE\n  Belgeler: docs/REPOSITORY_SCALE_TR.md\n";
+
+pub const VERIFICATION_HELP: &str = "\nProje doğrulama (model/API çağırmaz):\n  melissa --json verification configure --workspace PATH --path JSON_FILE\n  melissa --json verification show --workspace PATH\n  melissa --json verification reproduce TASK [--request-json JSON]\n  melissa --json verification verify TASK [--request-json JSON]\n  scripts/verify-change.ps1 ve scripts/reproduce-failure.ps1\n  Belgeler: docs/VERIFICATION_TR.md; sonuç PASS değilse çıkış kodu 7.\n";
+
+pub const SERVICES_HELP: &str = "\nProje servisleri (model sağlayıcısını çağırmaz):\n  /services [JSON_DOSYASI]  Yeni görevler için servis tercihi\n  melissa --json services configure --workspace PATH --path JSON\n  melissa --json services show --workspace PATH\n  melissa --json services session TASK\n  melissa --json services run TASK --request-json JSON_OPERATION\n  Belgeler: docs/SERVICES_TR.md ve docs/FRONTEND_VERIFY_TR.md. Browser ayarında session canlı preview_ready URL verir. Oturum foreground; JSON komut veya /close, EOF.\n  services baseline-accept TASK --request-json JSON_ACCEPT: yalnız operatörün incelediği checkpoint PNG ve tam review_digest; oturum kapalı olmalı.\n";
+
+pub const CONTINUITY_HELP: &str = "\nUzun görev, checkpoint ve geri alma (model çağırmaz):\n  melissa --json task continuity|checkpoints|changes ID\n  melissa --json task checkpoint ID --label TEXT\n  melissa --json task undo-preview ID --request-json JSON_SELECTION\n  melissa --json task undo ID --request-json JSON_SELECTION --digest REVIEW_DIGEST\n  melissa --json task adopt-preview ID\n  melissa --json task adopt-source ID --digest REVIEW_DIGEST\n  task resume yalnız özgün güvenli kaynak/harcama sınırından devam eder. Değişmiş kaynağı açık inceleme fresh uzman koşularına bağlar. Belgeler: docs/CONTINUITY_TR.md\n";
+
+pub const OBSERVABILITY_HELP: &str = "\nTanılama ve güvenli bakım (model çağırmaz):\n  melissa --json observe diagnose TASK\n  melissa --json observe support TASK --out NEW_DIRECTORY\n  melissa --json observe otlp TASK [--out NEW_JSON] [--endpoint http://127.0.0.1:4318/v1/traces]\n  melissa --json maintenance disk|retention-preview TASK\n  melissa --json maintenance keygen --out NEW_PRIVATE_KEY_FILE\n  melissa --json maintenance backup TASK --out NEW_ARCHIVE_DIR --key-file PRIVATE_KEY_FILE\n  melissa --json maintenance restore --from ARCHIVE_DIR --out NEW_HOME --key-file PRIVATE_KEY_FILE\n  Temizleme yalnız önizleme; yedek yeni home'a kanıt olarak döner, otomatik resume yok. docs/OBSERVABILITY_TR.md\n";

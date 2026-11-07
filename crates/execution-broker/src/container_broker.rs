@@ -102,6 +102,16 @@ impl ContainerBroker {
         snapshot: &Snapshot,
         permit: PermitRequest,
     ) -> BrokerResult<SignedContainerPermit> {
+        self.issue_permit_mode(task_id, request, snapshot, permit, false)
+    }
+    pub fn issue_permit_mode(
+        &self,
+        task_id: &str,
+        request: ContainerRequest,
+        snapshot: &Snapshot,
+        permit: PermitRequest,
+        snapshot_only: bool,
+    ) -> BrokerResult<SignedContainerPermit> {
         if permit.resource_id != self.resource_id {
             return Err(BrokerError::Denied(
                 "container permit outside resource".into(),
@@ -109,7 +119,7 @@ impl ContainerBroker {
         }
         snapshot.validate(request.limits.disk_bytes)?;
         let task = self.store.journal().task(task_id)?;
-        Ok(self.authority.issue_container(
+        Ok(self.authority.issue_container_mode(
             &self.catalog,
             &task.contract,
             request,
@@ -117,6 +127,7 @@ impl ContainerBroker {
             permit,
             &self.policy.snapshot()?,
             unix_ms()?,
+            snapshot_only,
         )?)
     }
     pub fn execute(

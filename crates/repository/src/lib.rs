@@ -12,11 +12,15 @@ pub mod discovery;
 #[cfg(windows)]
 mod file_journal;
 pub mod git;
+pub mod git_context;
 pub mod graph;
+pub mod impact;
 pub mod patch;
 mod paths;
 pub mod polyglot;
 pub mod snapshot;
+mod source_ignore;
+pub mod structural;
 pub mod symbols;
 pub mod tools;
 pub mod unified;

@@ -48,6 +48,7 @@ impl std::fmt::Debug for ApiKey {
 pub enum EndpointTrust {
     RemoteHttps,
     LoopbackFixture,
+    LocalLoopback,
 }
 /// Request extensions are selected by the host, never by model-generated JSON.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +68,22 @@ pub struct ProviderEndpoint {
     request_policy: ProviderRequestPolicy,
     reviewed_origin: Option<String>,
     openai_image_detail: crate::openai::ImageDetail,
+    prompt_cache: PromptCache,
+}
+/// Explicit provider capability chosen by the host; disabled for unknown
+/// compatible endpoints. This is a cache hint, never evidence of a cache hit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCache {
+    #[default]
+    Disabled,
+    OpenaiMemory,
+    AnthropicEphemeral,
+}
+impl PromptCache {
+    pub fn is_disabled(&self) -> bool {
+        *self == Self::Disabled
+    }
 }
 impl std::fmt::Debug for ProviderEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -81,7 +98,44 @@ impl std::fmt::Debug for ProviderEndpoint {
     }
 }
 impl ProviderEndpoint {
+    pub fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.key.0.is_empty() {
+            return request;
+        }
+        match self.protocol {
+            Protocol::OpenAiResponses | Protocol::OpenAiChatCompletions => {
+                request.bearer_auth(self.key.0.as_str())
+            }
+            Protocol::AnthropicMessages => request
+                .header("x-api-key", self.key.0.as_str())
+                .header("anthropic-version", "2023-06-01"),
+        }
+    }
+    pub fn without_authentication(mut self) -> Result<Self> {
+        if self.trust != EndpointTrust::LocalLoopback {
+            return Err(GatewayError::invalid(
+                "keyless endpoints require explicit local loopback trust",
+            ));
+        }
+        self.key = ApiKey(Zeroizing::new(String::new()));
+        Ok(self)
+    }
+    pub fn with_prompt_cache(mut self, mode: PromptCache) -> Result<Self> {
+        self.prompt_cache = mode;
+        self.validate()?;
+        Ok(self)
+    }
     pub fn validate(&self) -> Result<()> {
+        if !matches!(
+            (self.prompt_cache, self.protocol),
+            (PromptCache::Disabled, _)
+                | (PromptCache::OpenaiMemory, Protocol::OpenAiResponses)
+                | (PromptCache::AnthropicEphemeral, Protocol::AnthropicMessages)
+        ) {
+            return Err(GatewayError::invalid(
+                "prompt cache capability does not match provider protocol",
+            ));
+        }
         let _ = Self::new(
             self.provider_id.clone(),
             self.resource_id.clone(),
@@ -179,7 +233,7 @@ impl ProviderEndpoint {
                     ));
                 }
             }
-            EndpointTrust::LoopbackFixture => {
+            EndpointTrust::LoopbackFixture | EndpointTrust::LocalLoopback => {
                 // host() rather than host_str(): the latter keeps IPv6 brackets
                 // ("[::1]"), which never parse as an IpAddr.
                 let loopback = match url.host() {
@@ -205,6 +259,7 @@ impl ProviderEndpoint {
             request_policy: ProviderRequestPolicy::Standard,
             reviewed_origin: None,
             openai_image_detail: crate::openai::ImageDetail::Original,
+            prompt_cache: PromptCache::Disabled,
         })
     }
 }
@@ -310,7 +365,10 @@ impl HttpTransport {
         if self.json_object_output
             && let Some(schema) = &request.output_schema
         {
-            if endpoint.protocol != Protocol::OpenAiResponses {
+            if !matches!(
+                endpoint.protocol,
+                Protocol::OpenAiResponses | Protocol::OpenAiChatCompletions
+            ) {
                 return Err(GatewayError::unsupported(
                     "JSON-object mode requires Responses",
                 ));
@@ -324,7 +382,11 @@ impl HttpTransport {
             let mut json_request = request.clone();
             json_request.output_schema = None;
             let mut body = Self::body_with_limits(endpoint, &json_request, self.request_limits)?;
-            body["text"] = serde_json::json!({"format":{"type":"json_object"}});
+            if endpoint.protocol == Protocol::OpenAiChatCompletions {
+                body["response_format"] = serde_json::json!({"type":"json_object"});
+            } else {
+                body["text"] = serde_json::json!({"format":{"type":"json_object"}});
+            }
             return Ok(body);
         }
         Self::body_with_limits(endpoint, request, self.request_limits)
@@ -338,7 +400,13 @@ impl HttpTransport {
         limits: RequestLimits,
     ) -> Result<Value> {
         endpoint.validate()?;
+        let mut stable = request.clone();
+        stable.tools.sort_by(|a, b| a.name.cmp(&b.name));
+        let request = &stable;
         let mut body = match endpoint.protocol {
+            Protocol::OpenAiChatCompletions => {
+                crate::chat_completions::build_request(request, limits)
+            }
             Protocol::OpenAiResponses => crate::openai::build_request_with_image_detail(
                 request,
                 limits,
@@ -348,6 +416,36 @@ impl HttpTransport {
                 crate::anthropic::build_request_with_limits(request, limits)
             }
         }?;
+        match endpoint.prompt_cache {
+            PromptCache::Disabled => (),
+            PromptCache::OpenaiMemory => {
+                let prefix = serde_json::to_vec(&(
+                    &endpoint.provider_id,
+                    &endpoint.resource_id,
+                    &request.model,
+                    &request.system_prompt,
+                    &request.tools,
+                    &request.output_schema,
+                ))
+                .map_err(|_| GatewayError::invalid("cache prefix"))?;
+                body["prompt_cache_key"] =
+                    Value::String(blake3::hash(&prefix).to_hex().to_string());
+                body["prompt_cache_retention"] = Value::String("in-memory".into());
+            }
+            PromptCache::AnthropicEphemeral => {
+                // One explicit breakpoint on the static prefix. Do not cache a
+                // reduced transcript or change the model's thinking/output.
+                if !request.system_prompt.is_empty() {
+                    body["system"] = serde_json::json!([{"type":"text","text":request.system_prompt,"cache_control":{"type":"ephemeral"}}]);
+                } else if let Some(last) = body
+                    .get_mut("tools")
+                    .and_then(Value::as_array_mut)
+                    .and_then(|t| t.last_mut())
+                {
+                    last["cache_control"] = serde_json::json!({"type":"ephemeral"});
+                }
+            }
+        }
         if endpoint.request_policy == ProviderRequestPolicy::ReviewedSingleAttempt {
             body["gateway"] = serde_json::json!({
                 "retry": {
@@ -369,6 +467,7 @@ impl HttpTransport {
         cancelled: Arc<AtomicBool>,
     ) -> AttemptOutcome {
         let begin = Instant::now();
+        let visible_stream = crate::visible_stream::next_stream();
         let mut delivery = Delivery::NotSent;
         let mut status = None;
         let mut provider_request_id = None;
@@ -387,7 +486,12 @@ impl HttpTransport {
             }
             endpoint.validate()?;
             limits.validate()?;
-            if self.local_only && endpoint.trust != EndpointTrust::LoopbackFixture {
+            if self.local_only
+                && !matches!(
+                    endpoint.trust,
+                    EndpointTrust::LoopbackFixture | EndpointTrust::LocalLoopback
+                )
+            {
                 return Err(GatewayError::unsupported(
                     "local-only gateway cannot contact a remote provider",
                 ));
@@ -399,11 +503,17 @@ impl HttpTransport {
                 .header("accept", "text/event-stream")
                 .json(&body)
                 .timeout(Duration::from_millis(timeout_ms));
-            send = match endpoint.protocol {
-                Protocol::OpenAiResponses => send.bearer_auth(endpoint.key.0.as_str()),
-                Protocol::AnthropicMessages => send
-                    .header("x-api-key", endpoint.key.0.as_str())
-                    .header("anthropic-version", "2023-06-01"),
+            send = if endpoint.key.0.is_empty() {
+                send
+            } else {
+                match endpoint.protocol {
+                    Protocol::OpenAiResponses | Protocol::OpenAiChatCompletions => {
+                        send.bearer_auth(endpoint.key.0.as_str())
+                    }
+                    Protocol::AnthropicMessages => send
+                        .header("x-api-key", endpoint.key.0.as_str())
+                        .header("anthropic-version", "2023-06-01"),
+                }
             };
             delivery = Delivery::PossiblySent;
             let response = match send.send().await {
@@ -555,6 +665,7 @@ impl HttpTransport {
             let mut parser = SseParser::new(limits);
             let mut openai = crate::openai::OpenAiDecoder::new(&request.model, limits);
             let mut anthropic = crate::anthropic::AnthropicDecoder::new(&request.model, limits);
+            let mut chat = crate::chat_completions::ChatDecoder::new(&request.model, limits);
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 if cancelled.load(Ordering::Acquire) {
@@ -583,14 +694,17 @@ impl HttpTransport {
                 for piece in chunk.chunks(16 * 1024) {
                     for event in parser.feed(piece)? {
                         match endpoint.protocol {
+                            Protocol::OpenAiChatCompletions => chat.push(&event)?,
                             Protocol::OpenAiResponses => openai.push(&event)?,
                             Protocol::AnthropicMessages => anthropic.push(&event)?,
                         }
+                        crate::visible_stream::publish(visible_stream, endpoint.protocol, &event);
                     }
                 }
             }
             parser.finish()?;
             match endpoint.protocol {
+                Protocol::OpenAiChatCompletions => chat.finish(),
                 Protocol::OpenAiResponses => openai.finish(),
                 Protocol::AnthropicMessages => anthropic.finish(),
             }

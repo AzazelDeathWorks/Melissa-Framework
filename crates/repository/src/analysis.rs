@@ -202,6 +202,7 @@ impl AnalysisPlan {
             serde_json::to_vec(&payload)?,
         );
         let request = ContainerRequest {
+            backend: Default::default(),
             schema_version: "melissa.container-exec/v1".into(),
             image_id: image.into(),
             executable: "/usr/bin/python3".into(),

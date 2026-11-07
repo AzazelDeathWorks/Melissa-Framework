@@ -57,6 +57,7 @@ for i in range(10):
 print(json.dumps({'cases':results,'count':len(results),'held_out':False,'real_ai':False}))
 "#;
     let request = ContainerRequest {
+        backend: Default::default(),
         schema_version: "melissa.container-exec/v1".into(),
         image_id: COMPLETE_IMAGE.into(),
         executable: PYTHON.into(),

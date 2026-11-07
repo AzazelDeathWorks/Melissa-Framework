@@ -1,0 +1,28 @@
+{
+  "checks": {
+    "operator-1": {
+      "kind": "syntax",
+      "repetitions": 1
+    },
+    "operator-2": {
+      "kind": "test",
+      "repetitions": 1,
+      "report": {
+        "path": "reports/tests.xml",
+        "format": "junit"
+      }
+    }
+  },
+  "after_edit": [
+    "operator-1"
+  ],
+  "reproduce": [
+    "operator-2"
+  ],
+  "debug": {
+    "language": "python",
+    "entry": "main.py",
+    "cwd": ".",
+    "argv": []
+  }
+}

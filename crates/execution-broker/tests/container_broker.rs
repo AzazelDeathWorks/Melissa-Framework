@@ -126,6 +126,7 @@ fn fixture_with_controls(script: &str, controls: bool) -> Fixture {
     )
     .unwrap();
     let request = ContainerRequest {
+        backend: Default::default(),
         schema_version: "melissa.container-exec/v1".into(),
         image_id: IMAGE.into(),
         executable: "/bin/sh".into(),
@@ -201,6 +202,73 @@ fn identity(id: &str) -> InvocationIdentity {
         generation: 1,
         idempotency_key: None,
     }
+}
+
+#[test]
+fn snapshot_only_permit_cannot_be_promoted_to_host_write_authority_or_change_legacy_binding() {
+    let mut f = fixture("printf unused");
+    let legacy = permit(&f, "legacy-shape");
+    assert!(
+        serde_json::to_value(&legacy.binding)
+            .unwrap()
+            .get("snapshot_only")
+            .is_none()
+    );
+    let mut policy = f.broker.policy_control().snapshot().unwrap();
+    policy
+        .grants
+        .get_mut("auth:container")
+        .unwrap()
+        .allowed_effects = BTreeSet::from(["process.execute_scoped".into()]);
+    f.broker.policy_control().replace(policy).unwrap();
+    let time = unix_ms().unwrap();
+    let request = PermitRequest {
+        permit_id: "snapshot-only".into(),
+        nonce: "snapshot-only-nonce".into(),
+        principal_id: "principal:host".into(),
+        profile_id: "melissa.code.implementer".into(),
+        resource_id: RESOURCE.into(),
+        authorization_ref: "auth:container".into(),
+        not_before_unix_ms: time,
+        expires_at_unix_ms: time + 60_000,
+    };
+    let signed = f
+        .broker
+        .issue_permit_mode(TASK, f.request.clone(), &f.snapshot, request.clone(), true)
+        .unwrap();
+    assert_eq!(
+        signed.permit.allowed_effects,
+        vec!["process.execute_scoped"]
+    );
+    assert!(
+        f.broker
+            .issue_permit(TASK, f.request.clone(), &f.snapshot, request)
+            .is_err()
+    );
+    let mut forged = signed;
+    forged.binding.snapshot_only = false;
+    forged
+        .permit
+        .allowed_effects
+        .push("workspace.apply_patch_scoped".into());
+    assert!(
+        f.broker
+            .execute(
+                TASK,
+                &forged,
+                &f.snapshot,
+                &identity("forged-snapshot"),
+                &AtomicBool::new(false)
+            )
+            .is_err()
+    );
+    assert!(
+        f.broker
+            .store()
+            .journal()
+            .invocation("inv:forged-snapshot")
+            .is_err()
+    );
 }
 
 #[test]
@@ -588,4 +656,36 @@ fn separately_signed_inspect_and_cancel_reach_the_real_container_watcher_and_per
             .is_ok()
     );
     f.broker.store().integrity_check().unwrap();
+}
+
+#[test]
+fn compose_creation_is_bound_to_the_exact_signed_request_and_legacy_default_wire() {
+    let mut f = fixture("printf unused");
+    let signed = permit(&f, "backend-wire");
+    assert!(
+        serde_json::to_value(&signed.binding.request)
+            .unwrap()
+            .get("backend")
+            .is_none()
+    );
+    let mut changed = signed;
+    changed.binding.request.backend = melissa_container_executor::CreationBackend::Compose;
+    assert!(
+        f.broker
+            .execute(
+                TASK,
+                &changed,
+                &f.snapshot,
+                &identity("backend-swap"),
+                &AtomicBool::new(false)
+            )
+            .is_err()
+    );
+    assert!(
+        f.broker
+            .store()
+            .journal()
+            .attempt("attempt:backend-swap")
+            .is_err()
+    );
 }

@@ -22,10 +22,20 @@ pub struct ContextBridge {
 }
 impl ToolDispatcher for ContextBridge {
     fn definitions(&self) -> Vec<BoundTool> {
-        self.inner.definitions()
+        let mut defs = self.inner.definitions();
+        for d in &mut defs {
+            if d.definition.name == "memory_propose" {
+                d.definition.parameters["properties"]["kind"] = serde_json::json!({"type":"string","enum":["project_decision","user_preference","transient_state","failure_experience","unclassified"]});
+                d.definition.parameters["properties"]["expires_after_ms"] =
+                    serde_json::json!({"type":"integer","minimum":1});
+                d.definition.description.push_str(" Optional kind distinguishes project_decision/user_preference/transient_state/failure_experience. Transient state requires expires_after_ms and stays in this task. Host captures creation time and Git provenance. No kind grants authority or becomes accepted automatically.");
+            }
+        }
+        defs
     }
     fn validate_call(&self, c: &ToolCall) -> melissa_model_gateway::Result<()> {
-        self.inner.validate_call(c)
+        let (native, _, _) = memory_call(c)?;
+        self.inner.validate_call(&native)
     }
     fn execute<'a>(
         &'a mut self,
@@ -51,7 +61,37 @@ impl ToolDispatcher for ContextBridge {
                 // Host review runs after it ends, preventing lost concurrent edits.
                 self.project = Some(project);
             }
-            let result = self.inner.execute(c, ctx, cancel).await;
+            let (native, kind, ttl) = memory_call(&c)?;
+            let context = ctx.clone();
+            let is_proposal = c.name == "memory_propose";
+            let mut result = self.inner.execute(native, ctx, cancel).await;
+            if is_proposal
+                && let Ok(value) = &mut result
+                && value.success
+            {
+                let created = crate::app::now().map_err(map)?;
+                let metadata = melissa_skill_context::state::MemoryMetadata {
+                    kind: kind.unwrap_or(melissa_skill_context::state::MemoryKind::Unclassified),
+                    created_at_ms: created,
+                    task_id: context.task_id.clone(),
+                    git: melissa_repository::git_context::observe(&self.repo),
+                    expires_at_ms: ttl.map(|ttl| created.saturating_add(ttl)),
+                };
+                let id = format!("memory:{}", context.invocation_id);
+                let digest = self
+                    .inner
+                    .host()
+                    .lock()
+                    .map_err(|_| map(Error::Store))?
+                    .memory_book_mut()
+                    .annotate(&id, metadata.clone())
+                    .map_err(|_| map(Error::Store))?;
+                let mut content: serde_json::Value =
+                    serde_json::from_str(&value.content).map_err(|_| map(Error::Store))?;
+                content["observation"]["data"]["metadata"] = serde_json::json!(metadata);
+                content["observation"]["data"]["proposal_digest"] = serde_json::json!(digest);
+                value.content = content.to_string();
+            }
             if !memory {
                 return result;
             }
@@ -241,4 +281,39 @@ pub fn runtime(
         },
         project: None,
     })
+}
+
+fn memory_call(
+    call: &ToolCall,
+) -> melissa_model_gateway::Result<(
+    ToolCall,
+    Option<melissa_skill_context::state::MemoryKind>,
+    Option<u64>,
+)> {
+    if call.name != "memory_propose" {
+        return Ok((call.clone(), None, None));
+    }
+    let mut value = melissa_model_gateway::strict_json(&call.arguments)?;
+    let map = value
+        .as_object_mut()
+        .ok_or_else(|| GatewayError::invalid("memory proposal object"))?;
+    let kind = map
+        .remove("kind")
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| GatewayError::invalid("memory kind"))?;
+    let ttl = map
+        .remove("expires_after_ms")
+        .map(|v| {
+            v.as_u64()
+                .filter(|n| *n > 0)
+                .ok_or_else(|| GatewayError::invalid("memory expiry"))
+        })
+        .transpose()?;
+    if kind == Some(melissa_skill_context::state::MemoryKind::TransientState) && ttl.is_none() {
+        return Err(GatewayError::invalid("transient memory requires expiry"));
+    }
+    let mut native = call.clone();
+    native.arguments = value.to_string();
+    Ok((native, kind, ttl))
 }

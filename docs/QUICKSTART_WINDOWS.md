@@ -1,45 +1,46 @@
-# Windows x64 preview
+# Windows'ta Melissa
 
-The preview uses a Windows x64 CLI and Docker Desktop with the Linux engine for isolated build and test jobs. An offline task preparation example also runs without Docker or model credentials. These are separate checks.
+Windows x64 önizlemesidir. Güncel yerel aday: **0.3.0-alpha.6**. Bu belge, bu adayın GitHub'da yayımlandığı anlamına gelmez.
 
-## Verify and unpack
+## Kurulum
 
-Download the Windows ZIP and its SHA-256 list from the same release. Run `Get-FileHash -Algorithm SHA256 <zip>` and compare the value with `SHA256SUMS.txt`. Extract the ZIP to a new directory. Its manifest identifies the source commit, executable hash and required SDK worker image.
-
-In the extracted directory, run:
+Güvendiğiniz Melissa paket klasöründe `install.ps1`, sürüm ZIP'i ve `SHA256SUMS.txt` birlikte bulunur. PowerShell'de:
 
 ```powershell
-.\melissa.exe --version
-.\melissa.exe doctor
-.\quickstart.ps1 -OutputRoot C:\MelissaDemo
+.\install.ps1
 ```
 
-Choose a new output directory. The example creates a scratch workspace, a separate faulty control and an inspectable recipe. It checks that the inspection task recorded zero model calls. It also prints the paths for the next step. Use `-RequireWorker` if you want the command to require a ready Docker engine and the exact SDK worker.
-
-If Doctor reports the Linux engine is unavailable, start Docker Desktop in Linux container mode. If it reports a missing SDK worker, use a verified archive from the matching release. Compare the archive hash, run `docker image load --input <worker-archive>`, then rerun `doctor`. The full image ID must match the release manifest. A tag alone does not verify an image. Builds from the repositoryâ€™s toolchain recipes can require a reviewed immutable image registration.
-
-## Run the example with your own model connection
-
-Copy `settings.template.json` outside the example workspace. Fill in your endpoint, exact model identifier, declared capabilities, context size, output capacity and verified rate card. Keep the API key in a user-scoped environment variable or private file. The template values are placeholders. Use a model connection you have tested for streaming and tools.
-
-Use the paths returned by the example. Review the file scope and acceptance cases in the prepared recipe. These expected answers are synthetic demo material. Keep real acceptance recipes outside the source workspace.
+Kurucu kullanıcı hesabına kurar; yönetici yetkisi istemez. Yeni bir terminal açın:
 
 ```powershell
-$homePath = 'C:\MelissaDemo\melissa-home'
-$source = 'C:\MelissaDemo\workspace'
-$recipe = 'C:\MelissaDemo\prepared-recipe.json'
-.\melissa.exe --home $homePath config import C:\MelissaDemo\provider-settings.json
-$task = .\melissa.exe --home $homePath --json task new --workspace $source --goal 'Reverse the JSON array in main.py' --recipe $recipe | ConvertFrom-Json
-.\melissa.exe --home $homePath task plan $task.task_id
+melissa
 ```
 
-The task plan shows the approval request ID and digest. Approve only after reviewing the files, cost and duration. Starting the task can incur provider charges.
+Sohbet doğrudan açılır; proje seçimi zorunlu değildir. Dosyalarla çalışırken gerektiğinde klasör bağlanır. Başka bir klasörü açıkça seçmek için:
 
 ```powershell
-.\melissa.exe --home $homePath task approve $task.task_id --request <request-id> --digest <digest>
-.\melissa.exe --home $homePath task run $task.task_id
-.\melissa.exe --home $homePath task progress $task.task_id
-.\melissa.exe --home $homePath task delivery $task.task_id --out C:\MelissaDemo\delivery
+melissa session --workspace C:\Projects\example
 ```
 
-Delivery is available after independent protected verification. For support, share the CLI version, worker readiness and a redacted error message. Keep the task store, recipe, private settings and source content private.
+Dağıtımda bir masaüstü GUI bulunmaz. CLI'ın kurulması için Tauri, WebView veya bir Node frontend kurulumu gerekmez. Kod testleri için gereken proje araçları/worker ayrı bir konudur.
+
+## İlk kullanım
+
+1. Sohbet içinde `/settings` açın veya PowerShell'de `melissa config` yazın; sağlayıcı ekleyin. JSON dosyası hazırlamak gerekmez.
+2. API uyumluluğunu seçin. **Base URL** alanına sağlayıcının sunucu adresini yazın (örnek: `https://api.example.com/v1`). **API anahtarı** sonraki ayrı, maskeli alanda sorulur. Ardından modeli seçin. Model bilgisini sağlayıcı sunmuyorsa belgelenen tam kapasiteyi belirtin.
+3. API kullanım tercihine karar verin. Bağlantı kontrolü ile gerçek model çağrısı aynı kabul değildir.
+4. İsteğinizi yazın: örneğin “Bu projeyi açıkla” veya “Giriş ekranındaki hatayı düzelt”.
+5. Değişiklikten önce kesin kapsamı inceleyin. Normal kullanıcı görev tarifi veya JSON hazırlamaz.
+
+Planlamak için `/plan` veya Shift+Tab kullanın. Plan kaynak dosyalarını değiştiremez. Shift+Tab ile normal moda dönünce çalışma kapsamı incelenebilir; Plan açıkken uygulama başlatılmaz.
+
+`/model` modelleri, `/resume` konuşmaları, `/diff` kod farkını ve `/undo` kontrollü geri almayı açar. Ayrıntılı [terminal rehberi](CLI_TR.md).
+
+## Sorun giderme
+
+- Komut bulunamıyorsa kurulumdan sonra yeni terminal açın. Çalışan terminalin PATH'i eski olabilir.
+- Model ayarı kaydedildiyse fakat bağlantı çalışmıyorsa `/config` içinden adres, protokol ve kimlik bilgisini kontrol edin. Anahtarı hata raporuna yapıştırmayın.
+- Kod çalıştırma ortamı eksikse Docker Desktop'ın Linux motorunu ve sürümle eşleşen hazırlanmış worker'ı kontrol edin. Proje ortamı ayarlardan seçilir; rastgele bir image'in seçilmesi SDK uygunluğunu kanıtlamaz.
+- Bozuk veya yarım kayıtları silmeyin. Belirsiz model çağrısı otomatik tekrarlanmaz; `/resume` kayıtları koruyarak devam tercihini gösterir.
+
+Teknik otomasyon komutları `melissa --help-all` içindedir. Yerel test, gerçek model kalitesi veya temiz Windows kabulü demek değildir.

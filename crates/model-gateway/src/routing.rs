@@ -35,6 +35,10 @@ impl Measurements {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PriceSource {
+    Unknown,
+    OperatorDeclared {
+        note: String,
+    },
     Fixture,
     VerifiedHostRateCard {
         source_url: String,
@@ -53,6 +57,12 @@ pub struct RateCard {
 impl RateCard {
     pub fn validate(&self, endpoint: &ProviderEndpoint) -> Result<()> {
         match &self.source {
+            PriceSource::Unknown => (),
+            PriceSource::OperatorDeclared { note } => {
+                if note.trim().is_empty() || note.len() > 256 {
+                    return Err(GatewayError::invalid("operator price note"));
+                }
+            }
             PriceSource::Fixture => {
                 if endpoint.trust != EndpointTrust::LoopbackFixture {
                     return Err(GatewayError::invalid(
@@ -83,6 +93,11 @@ impl RateCard {
     }
     /// Conservative accounted upper bound under this host rate-card, not an invoice.
     pub fn upper_bound(&self, input: u64, output: u64) -> Result<u64> {
+        if self.source == PriceSource::Unknown {
+            return Err(GatewayError::invalid(
+                "pricing unknown; configure a host rate card before budgeted execution",
+            ));
+        }
         let rate = self
             .input_micro_usd_per_million
             .max(
@@ -103,6 +118,9 @@ impl RateCard {
             .map_err(|_| GatewayError::invalid("price does not fit budget"))
     }
     pub fn usage_upper_bound(&self, usage: &Usage) -> Result<Option<u64>> {
+        if self.source == PriceSource::Unknown {
+            return Ok(None);
+        }
         match (usage.input_tokens, usage.output_tokens) {
             (Some(i), Some(o)) => self.upper_bound(i, o).map(Some),
             _ => Ok(None),

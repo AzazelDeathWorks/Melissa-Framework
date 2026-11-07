@@ -10,8 +10,10 @@ mod runtime;
 
 pub const EXECUTION_CONTRACT: &str = "linux.docker.readonly-tmpfs/v1";
 const MAX_CAPTURE: u64 = 64 * 1024 * 1024;
-pub const MAX_SNAPSHOT_BYTES: u64 = MAX_CAPTURE;
-pub const MAX_SNAPSHOT_FILES: usize = 1024;
+// Input admission is independent of captured output. Worker disk limits remain
+// authoritative; these are physical transport ceilings, never truncation.
+pub const MAX_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024;
+pub const MAX_SNAPSHOT_FILES: usize = 100_000;
 pub type ExecutorResult<T = ()> = Result<T, ExecutorError>;
 
 #[derive(Debug)]
@@ -61,11 +63,26 @@ pub struct ContainerLimits {
     pub output_bytes: u64,
     /// Linux cgroup pids includes threads and the one trusted keeper process.
     pub max_processes: u32,
+    /// Zero explicitly disables workspace archive capture.
     pub export_bytes: u64,
+}
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CreationBackend {
+    #[default]
+    Docker,
+    Compose,
+}
+impl CreationBackend {
+    pub fn is_default(&self) -> bool {
+        *self == Self::Docker
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContainerRequest {
+    #[serde(default, skip_serializing_if = "CreationBackend::is_default")]
+    pub backend: CreationBackend,
     pub schema_version: String,
     pub image_id: String,
     pub executable: String,
@@ -141,9 +158,9 @@ impl ContainerRequest {
         }
         let l = &self.limits;
         if l.wall_time_ms == 0
-            || l.wall_time_ms > 1_800_000
+            || l.wall_time_ms > i64::MAX as u64 / 1_000_000
             || l.cpu_time_ms == 0
-            || l.cpu_time_ms > 1_800_000
+            || l.cpu_time_ms > i64::MAX as u64 / 1_000_000
             || !(1..=10_000).contains(&l.cpu_rate_basis_points)
         {
             return bad("wall/CPU bounds");
@@ -161,7 +178,7 @@ impl ContainerRequest {
         }
         if l.output_bytes > MAX_CAPTURE
             || l.export_bytes > MAX_CAPTURE
-            || l.export_bytes < 1024
+            || (l.export_bytes != 0 && l.export_bytes < 1024)
             || l.max_processes > 4096
         {
             return bad("output/export/pid bounds");
@@ -230,7 +247,7 @@ impl Snapshot {
         )
     }
     pub fn digest(&self) -> ExecutorResult<String> {
-        self.validate(MAX_CAPTURE)?;
+        self.validate(MAX_SNAPSHOT_BYTES)?;
         let mut hash = blake3::Hasher::new();
         hash.update(b"melissa.container-snapshot/v1\0");
         for (name, data) in &self.files {

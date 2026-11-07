@@ -1,0 +1,21 @@
+{
+  "mcp": {},
+  "docs": {
+    "next-docs": {
+      "package": "next",
+      "ecosystem": "node",
+      "endpoint": {
+        "url": "https://context7.com",
+        "auth_env": "CONTEXT7_API_KEY",
+        "loopback": false,
+        "timeout_ms": 60000,
+        "max_bytes": 2097152
+      },
+      "versions": { "16.2.9": "/vercel/next.js/v16.2.9" },
+      "context7": true,
+      "search_path": null
+    }
+  },
+  "hooks": [],
+  "helpers": {}
+}

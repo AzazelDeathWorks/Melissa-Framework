@@ -44,6 +44,8 @@ pub struct Recipe {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain: Option<crate::domain::DomainRecipe>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<crate::project::Contract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_schema: Option<Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub report_checks: Vec<crate::domain::Expectation>,
@@ -107,8 +109,12 @@ impl Recipe {
         Ok(recipe)
     }
     pub fn validate(&self) -> Result {
-        if !["melissa.cli-recipe/v1", "melissa.cli-recipe/v2"]
-            .contains(&self.schema_version.as_str())
+        if ![
+            "melissa.cli-recipe/v1",
+            "melissa.cli-recipe/v2",
+            "melissa.cli-recipe/v3",
+        ]
+        .contains(&self.schema_version.as_str())
             || self.agents.is_empty()
             || self.agents.len() > 128
             || self.wall_time_ms == 0
@@ -118,13 +124,17 @@ impl Recipe {
             || self.max_cost_micro_usd == 0
             || self.max_cost_micro_usd > i64::MAX as u64
             || self.writable_paths.len() > 10000
-            || (self.domain.is_none() && !melissa_workflow::plan::path(&self.entry))
+            || (self.domain.is_none()
+                && self.project.is_none()
+                && !melissa_workflow::plan::path(&self.entry))
         {
             return Err(Error::Usage(
                 "Yürütme tarifi/kota/program kapsamı geçersiz.",
             ));
         }
-        absolute(&self.negative_workspace)?;
+        if self.project.is_none() {
+            absolute(&self.negative_workspace)?;
+        }
         let catalog = resources::catalog()?;
         for s in &self.agents {
             let p = catalog
@@ -141,7 +151,7 @@ impl Recipe {
                         .capability_ceiling
                         .iter()
                         .any(|e| e == "workspace.apply_patch_scoped")
-                        || self.writable_paths.is_empty()))
+                        || (self.writable_paths.is_empty() && self.project.is_none())))
             {
                 return Err(Error::Denied("Uzmanın araç/yazma kapsamı uygun değil."));
             }
@@ -161,7 +171,24 @@ impl Recipe {
                 return Err(Error::Denied("Yazma listesinde korunan dosya var."));
             }
         }
-        if let Some(domain) = &self.domain {
+        if let Some(project) = &self.project {
+            if self.schema_version != "melissa.cli-recipe/v3"
+                || self.domain.is_some()
+                || !self.entry.is_empty()
+                || !self.checks.is_empty()
+                || !self.development_checks.is_empty()
+                || !self.report_checks.is_empty()
+                || self.candidate_schema.is_some()
+                || !self.negative_workspace.as_os_str().is_empty()
+            {
+                return Err(Error::Usage(
+                    "Proje yürütmesi özel oracle/domain alanlarıyla karıştırılamaz.",
+                ));
+            }
+            project.validate()?;
+        } else if self.schema_version == "melissa.cli-recipe/v3" {
+            return Err(Error::Usage("v3 proje sözleşmesi eksik."));
+        } else if let Some(domain) = &self.domain {
             if self.schema_version != "melissa.cli-recipe/v2"
                 || !self.entry.is_empty()
                 || !self.checks.is_empty()
@@ -238,6 +265,9 @@ impl Recipe {
         }
     }
     pub fn acceptance_digest(&self) -> Result<String> {
+        if let Some(project) = &self.project {
+            return Ok(crate::digest(&crate::app::bytes(project)?));
+        }
         let base = match &self.domain {
             Some(d) => d.acceptance_digest()?,
             None => self.suite()?.digest().into(),
@@ -278,6 +308,9 @@ impl Recipe {
         .map_err(|_| Error::Usage("No valid public development suite is configured."))
     }
     pub fn public_plan(&self) -> Value {
+        if let Some(project) = &self.project {
+            return json!({"agents":self.agents,"writable_paths":self.writable_paths,"protected_paths":self.protected_paths,"project":project.public_summary().unwrap_or(serde_json::Value::Null),"scope_amendments":"operator-approved paths at safe pause/resume; same task, budget and deadline","acceptance_kind":"host_source_bound_project_checks","private_oracle":false,"max_cost_micro_usd":self.max_cost_micro_usd,"wall_time_ms":self.wall_time_ms,"source_access":"visible_snapshot_only_no_host_writeback"});
+        }
         if let Some(domain) = &self.domain {
             return json!({"agents":self.agents,"writable_paths":self.writable_paths,"protected_paths":self.protected_paths,"workload":domain.public_plan(),"expected_answers_sent_to_model":false,"max_cost_micro_usd":self.max_cost_micro_usd,"wall_time_ms":self.wall_time_ms});
         }

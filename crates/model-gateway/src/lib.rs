@@ -1,7 +1,9 @@
 //! CODE-04 provider-independent, host-controlled model generation. Model output
 //! never creates tool authority or constitutes independent task acceptance.
+pub mod adapter;
 pub mod agent_loop;
 pub mod anthropic;
+pub mod chat_completions;
 pub mod checkpoint;
 pub mod context_compiler;
 pub mod context_intelligence;
@@ -18,6 +20,7 @@ pub mod tools;
 pub mod transcript;
 pub mod transport;
 mod types;
+pub mod visible_stream;
 pub mod vision;
 pub use sse::SseEvent;
 pub use types::*;

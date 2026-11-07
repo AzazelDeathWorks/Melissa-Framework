@@ -1,0 +1,31 @@
+{
+  "status": "NOT_RUN",
+  "requirement": "",
+  "source_digest": "",
+  "environment_digest": "",
+  "evidence": [],
+  "limitations": [],
+  "task_accepted": false,
+  "measurement_scope": "",
+  "baseline": {
+    "status": "NOT_RUN",
+    "samples": []
+  },
+  "changed": {
+    "status": "NOT_RUN",
+    "samples": []
+  },
+  "diagnosis_classes": [],
+  "support_export": {
+    "status": "NOT_RUN",
+    "redaction_verified": false
+  },
+  "otel_export": {
+    "status": "NOT_RUN",
+    "collector_delivery": "NOT_RUN"
+  },
+  "record_maintenance": {
+    "status": "NOT_RUN",
+    "deletion_performed": false
+  }
+}

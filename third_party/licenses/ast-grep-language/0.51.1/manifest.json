@@ -1,0 +1,7 @@
+{
+  "name": "ast-grep-language",
+  "version": "0.51.1",
+  "license": "MIT",
+  "source": "https://github.com/ast-grep/ast-grep/blob/5a204b1ef3facef94de125d990dddc7cf90011c0/LICENSE",
+  "crate_vcs_commit": "5a204b1ef3facef94de125d990dddc7cf90011c0"
+}

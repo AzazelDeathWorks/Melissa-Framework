@@ -52,7 +52,36 @@ struct TransportReceipt {
 impl App {
     pub fn metrics(&self, id: &str) -> Result<Value> {
         let store = self.store(id)?;
-        report(&store, id)
+        let mut value = report(&store, id)?;
+        let mut measurements = store
+            .list_artifacts(id)?
+            .into_iter()
+            .filter(|a| a.logical_type == "cli.host-measurement")
+            .map(|a| {
+                store
+                    .get_artifact(id, &a.artifact_id)
+                    .map_err(Error::from)
+                    .and_then(|raw| {
+                        crate::app::decode::<crate::process_measurement::Measurement>(&raw)
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if let Ok(live) = self.live(id)
+            && let Some(sample) = live.host_measurement
+        {
+            measurements.push(sample);
+        }
+        value["metrics"]["host_process_measurements"] = json!(measurements);
+        value["metrics"]["peak_host_rss_bytes"] = json!(
+            measurements
+                .iter()
+                .filter_map(|m| m.latest.process_lifetime_peak_working_set_bytes)
+                .max()
+        );
+        value["metrics"]["host_measurement_scope"] = json!(
+            "CLI process lifetime peak, not task-only/worker RAM; transfer I/O is not physical disk I/O"
+        );
+        Ok(value)
     }
 }
 

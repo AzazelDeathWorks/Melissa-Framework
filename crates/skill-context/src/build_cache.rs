@@ -145,6 +145,7 @@ impl NativeBuildPlan {
             }
         }
         let request = ContainerRequest {
+            backend: Default::default(),
             schema_version: "melissa.container-exec/v1".into(),
             image_id: melissa_build_test::toolchain::COMPLETE_IMAGE.into(),
             executable: melissa_build_test::toolchain::PYTHON.into(),

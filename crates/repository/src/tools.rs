@@ -36,6 +36,7 @@ struct Host {
     read_error_observations: bool,
     recovery_observations: bool,
     portable_patch_wire: bool,
+    denied_read_observations: bool,
 }
 #[derive(Clone)]
 pub struct RepositoryDispatcher {
@@ -53,6 +54,21 @@ mod read_bindings;
 pub use read_bindings::{RepositoryRead, RepositoryReadDispatcher, RepositoryReadPolicy};
 
 const ROUTES: &[(&str, &str, &str)] = &[
+    (
+        "code_impact_map",
+        "code.references",
+        "Map source-bound transitive import/package/test candidates. Unresolved aliases and syntax gaps are explicit; this is not a complete build dependency graph.",
+    ),
+    (
+        "code_structural_search",
+        "code.symbols",
+        "Search selected visible Rust/Python/JS/TS/TSX files with ast-grep patterns. Exact source hashes, all matches or an explicit capacity error; structural candidates are not LSP references.",
+    ),
+    (
+        "code_structural_propose",
+        "code.patch_propose",
+        "Generate a multi-file ast-grep rewrite proposal over explicitly selected current files. No writes. Apply only through fs_patch and its existing reviewed path scope; stale preimages and overlapping edits are rejected.",
+    ),
     (
         "fs_read_page",
         "fs.read",
@@ -231,6 +247,8 @@ struct PortablePatchArg {
     proposal_json: String,
 }
 enum Parsed {
+    Impact(crate::impact::Query),
+    Structural(crate::structural::Query),
     ReadPage(ReadPageArg),
     ArtifactPage(ArtifactPageArg),
     Discover(crate::discovery::DiscoveryOptions),
@@ -262,6 +280,18 @@ fn parse(call: &ToolCall) -> melissa_model_gateway::Result<Parsed> {
     }
     let v = melissa_model_gateway::strict_json(&call.arguments)?;
     let p = match call.name.as_str() {
+        "code_impact_map" => Parsed::Impact(decode(v)?),
+        "code_structural_search" | "code_structural_propose" => {
+            let q: crate::structural::Query = decode(v)?;
+            if (call.name == "code_structural_search" && q.rewrite.is_some())
+                || (call.name == "code_structural_propose" && q.rewrite.is_none())
+            {
+                return Err(GatewayError::invalid(
+                    "structural search/proposal rewrite mode",
+                ));
+            }
+            Parsed::Structural(q)
+        }
         "fs_read_page" => Parsed::ReadPage(decode(v)?),
         "fs_artifact_page" => Parsed::ArtifactPage(decode(v)?),
         "fs_discover" => Parsed::Discover(decode(v)?),
@@ -414,6 +444,8 @@ impl Host {
         self.put(&binding_id,"repository_tool_binding",&serde_json::to_vec(&json!({"task":c.task_id,"profile":c.profile_id,"run":c.run_id,"request":c.request_id,"invocation":c.invocation_id,"attempt":c.attempt_id,"generation":c.generation,"wire_call_id":call.id,"wire_name":call.name,"canonical_tool":canonical,"arguments_digest":digest(call.arguments.as_bytes()),"root_identity":self.repo.root_identity()}))?)?;
         let mut artifacts = vec![binding_id];
         let value = match parsed {
+            Parsed::Impact(q) => serde_json::to_value(self.repo.impact_map(&q, cancel)?)?,
+            Parsed::Structural(q) => serde_json::to_value(self.repo.structural(&q, cancel)?)?,
             Parsed::ReadPage(p) => {
                 let (v, bytes) = self.repo.read(&p.before.path)?;
                 if v != p.before {
@@ -444,11 +476,20 @@ impl Host {
                 if digest(&bytes) != p.digest {
                     return Err(Error::Stale("artifact page digest"));
                 }
+                let observed = envelope
+                    .pointer("/result/source_digest")
+                    .or_else(|| envelope.pointer("/result/snapshot_digest"))
+                    .and_then(Value::as_str);
+                let freshness = match observed {
+                    Some(d) if self.repo.snapshot(cancel)?.digest == d => "CURRENT",
+                    Some(_) => "STALE",
+                    None => "UNKNOWN",
+                };
                 page(
                     &bytes,
                     p.offset,
                     p.max_bytes,
-                    json!({"artifact_id":p.artifact_id,"digest":p.digest}),
+                    json!({"artifact_id":p.artifact_id,"digest":p.digest,"source_freshness":freshness,"historical_evidence":true}),
                 )?
             }
             Parsed::Discover(p) => serde_json::to_value(self.repo.discover(&p, cancel)?)?,
@@ -666,6 +707,7 @@ impl RepositoryDispatcher {
                 policy,
                 read_error_observations: false,
                 recovery_observations: false,
+                denied_read_observations: false,
                 portable_patch_wire: false,
             })),
         })
@@ -702,6 +744,15 @@ impl RepositoryDispatcher {
                 .map_err(|_| Error::Denied("repository host lock poisoned"))?;
             host.read_error_observations = true;
         }
+        Ok(self)
+    }
+    /// A proven, write-free visibility denial is an observation, never a grant.
+    /// Profile/task denials, alias faults, writes and unknown outcomes still stop.
+    pub fn with_denied_read_observations(self) -> crate::Result<Self> {
+        self.host
+            .lock()
+            .map_err(|_| Error::Denied("repository host lock poisoned"))?
+            .denied_read_observations = true;
         Ok(self)
     }
 }
@@ -763,6 +814,11 @@ impl ToolDispatcher for RepositoryDispatcher {
         let recover_stale = self.host.lock().is_ok_and(|h| h.recovery_observations);
         let recover_read = self.host.lock().is_ok_and(|h| h.read_error_observations)
             && route(&call.name).is_some_and(|(id, _)| !write_route(id));
+        let observe_denial = self.host.lock().is_ok_and(|h| h.denied_read_observations)
+            && matches!(
+                call.name.as_str(),
+                "fs_read" | "fs_hash" | "fs_absent" | "fs_directory"
+            );
         Box::pin(async move {
             let joined = tokio::task::spawn_blocking(move || {
                 host.lock()
@@ -774,6 +830,7 @@ impl ToolDispatcher for RepositoryDispatcher {
                 Ok(Ok(r))=>Ok(r),
                 Ok(Err(Error::AfterDispatch(_)))|Err(_)=>Ok(ToolExecution{content:json!({"status":"outcome_unknown","requires_reconciliation":true,"automatic_retry_allowed":false,"task_accepted":false}).to_string(),success:false,cancelled:false,requires_reconciliation:true,artifact_refs:vec![]}),
                 Ok(Err(Error::Cancelled))=>Ok(ToolExecution{content:json!({"status":"cancelled_before_effect","task_accepted":false}).to_string(),success:false,cancelled:true,requires_reconciliation:false,artifact_refs:vec![]}),
+                Ok(Err(Error::Denied("Git metadata is outside file capability" | "path is outside repository source visibility" | "path excluded by repository ignore rules"))) if observe_denial => Ok(ToolExecution { content: json!({"status":"BLOCKED","kind":"visibility_denied","executed":false,"workspace_write_dispatched":false,"requires_reconciliation":false,"automatic_retry_allowed":false,"instruction":"This path is outside the granted source view. No existence, content or identity is disclosed. Do not retry this access, including through alternate tools or aliases. Continue independent permitted work; if this access is essential, explain the blocked dependency and request a specific scope review.","task_accepted":false}).to_string(), success:false, cancelled:false, requires_reconciliation:false, artifact_refs:vec![] }),
                 Ok(Err(e @ Error::Stale(_))) if recover_stale=>Ok(ToolExecution{content:json!({"status":"stale_patch_rejected","message":e.to_string(),"workspace_write_dispatched":false,"requires_reconciliation":false,"task_accepted":false}).to_string(),success:false,cancelled:false,requires_reconciliation:false,artifact_refs:vec![]}),
                 Ok(Err(e)) if recover_read && known_read_input_error(&e)=>Ok(ToolExecution{content:json!({"status":"read_input_rejected","message":e.to_string(),"workspace_write_dispatched":false,"requires_reconciliation":false,"remediation":"Re-observe existing parents and exact current file versions. Create a parent only with an existing explicit write grant; use exact source bytes and line endings for a new proposal. Do not invent identities or change authorization.","task_accepted":false}).to_string(),success:false,cancelled:false,requires_reconciliation:false,artifact_refs:vec![]}),
                 Ok(Err(e))=>Err(err(e)),
@@ -843,6 +900,20 @@ fn schema(id: &str) -> Value {
             )
         }
         "fs_search" => object(json!({"bytes":bytes}), &["bytes"]),
+        "code_impact_map" => object(
+            json!({"paths":{"type":"array","minItems":1,"items":path}}),
+            &["paths"],
+        ),
+        "code_structural_search" | "code_structural_propose" => {
+            let props = json!({"language":{"type":"string","enum":["rust","python","javascript","typescript","tsx"]},"paths":{"type":"array","minItems":1,"items":path},"pattern":{"type":"string","minLength":1,"maxLength":65536},"rewrite":{"type":"string","maxLength":65536}});
+            if id == "code_structural_propose" {
+                object(props, &["language", "paths", "pattern", "rewrite"])
+            } else {
+                let mut props = props;
+                props.as_object_mut().unwrap().remove("rewrite");
+                object(props, &["language", "paths", "pattern"])
+            }
+        }
         "code_references" => object(
             json!({"name":{"type":"string","minLength":1,"maxLength":1024}}),
             &["name"],
@@ -902,11 +973,14 @@ impl ToolRouter {
 }
 impl ToolDispatcher for ToolRouter {
     fn definitions(&self) -> Vec<BoundTool> {
-        self.children
+        let mut definitions: Vec<_> = self
+            .children
             .iter()
             .flat_map(|c| c.definitions())
             .filter(|t| self.routes.contains_key(&t.definition.name))
-            .collect()
+            .collect();
+        definitions.sort_by(|a, b| a.definition.name.cmp(&b.definition.name));
+        definitions
     }
     fn validate_call(&self, c: &ToolCall) -> melissa_model_gateway::Result<()> {
         self.children[*self

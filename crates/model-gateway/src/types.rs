@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 pub enum Protocol {
     OpenAiResponses,
     AnthropicMessages,
+    OpenAiChatCompletions,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

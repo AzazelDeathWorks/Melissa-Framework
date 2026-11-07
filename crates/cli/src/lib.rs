@@ -4,18 +4,34 @@ pub mod app;
 pub mod args;
 #[cfg(all(test, windows))]
 mod capabilities_tests;
+#[cfg(windows)]
+pub mod console;
 pub mod context_bridge;
+pub mod continuity;
 pub mod control;
+pub mod conversation;
 pub mod development;
+pub mod diagnostics;
+pub mod dispatch;
 pub mod display;
 pub mod domain;
 pub mod engine;
+pub mod extensions;
+pub mod frontend;
+pub mod instructions;
+pub mod maintenance;
 pub mod preparation;
+mod process_measurement;
+pub mod project;
 pub mod project_memory;
 pub mod recipe;
 mod repository_signals;
 pub mod resources;
+pub mod services;
+pub mod session;
+mod session_ui;
 pub mod settings;
+mod tool_adapter;
 pub mod views;
 pub type Result<T = ()> = std::result::Result<T, Error>;
 #[derive(Debug)]
@@ -100,3 +116,7 @@ pub mod model_tools;
 mod telemetry;
 
 mod verification;
+
+pub mod repository_inspect;
+
+pub mod project_verification;

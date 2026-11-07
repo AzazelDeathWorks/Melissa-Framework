@@ -28,6 +28,7 @@ fn crash_case(semantic: bool) {
         let mut limits = support::limits();
         limits.wall_time_ms = 30_000;
         let request = ContainerRequest {
+            backend: Default::default(),
             schema_version: "melissa.container-exec/v1".into(),
             image_id: IMAGE.into(),
             executable: "/bin/sh".into(),

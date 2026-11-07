@@ -496,6 +496,7 @@ impl ProtectedQa {
     }
     fn request(&self, executable: &str, argv: Vec<String>) -> ContainerRequest {
         ContainerRequest {
+            backend: Default::default(),
             schema_version: "melissa.container-exec/v1".into(),
             image_id: SDK_IMAGE.into(),
             executable: executable.into(),
@@ -962,6 +963,7 @@ trait QualityLimits {
 impl QualityLimits for ContainerLimits {
     fn validate_quality(&self) -> Result {
         ContainerRequest {
+            backend: Default::default(),
             schema_version: "melissa.container-exec/v1".into(),
             image_id: SDK_IMAGE.into(),
             executable: "/usr/bin/true".into(),

@@ -9,7 +9,14 @@ Canlı AI kabulü bu çalışma kapsamında **NOT_RUN**; sağlayıcı çağrıs�
 
 | Alan | Davranış | Sınır |
 | --- | --- | --- |
-| Proje belleği | `memory_search` ve `memory_propose`; proje kimliğine bağlı şifreli kayıt, yeni oturumdan açma, kaynak yeniliği kontrolü | Öneriler operatör kabul edene kadar geri çağrılmaz. Başka proje bilgisi karışmaz; değişen kaynak eski bilgiyi geçersiz kılar. |
+| Araç ön kontrolü ve sonuç kaydı | Host kaynak/ortam bağlamı, şema/argüman özetleri, ayrı `tool.preflight` ve `tool.receipt` kanıtları | Araç PASS sonucu görev kabulü değildir; çalışmayan veya belirsiz işlem başarı sayılmaz. [Ayrıntılar](TOOL_ADAPTERS_TR.md). |
+| Konuşmalı oturum ve proje talimatı | Plan/review/develop; kapsam farkları, kalıcı mesajlar, hedefli soru/yanıt ve çalışan görev kontrolü; kullanıcı/kök/alt klasör AGENTS.md yenilemesi | Hazırlık tek başına yürütme izni değildir. Açık proje sözleşmesi, ortam, bütçe ve onayla genel yürütme etkinleşir. Canlı model token akışı yerine aşama/olay ilerlemesi gösterilir. [Ayrıntılar](CONVERSATION_TR.md). |
+| Genel proje ortamı ve süreçleri | Manifestten komut keşfi; projeye özel image/sürüm seçimi; Cargo, npm/pnpm/yarn, uv/pip ve mise; uzun süreç, ham stdout/stderr, stdin, poll/wait/cancel | Host mount/ağ/global kurulum yok; eksik ortam BLOCKED. Salt okunur uzman yalnız onaylı komutları çalıştırır. Son kaynakta komut kabulü ayrı yürütülür. [Ayrıntılar](PROJECT_RUNTIME_TR.md). |
+| Büyük depo ve refactor | Erken ignore, kaynak gövdesi reuse, gerçek LSP tip/alias/monorepo gezintisi, etki adayları ve ast-grep önerileri | Semantik rename/build grafı garantisi değildir; uygulama mevcut scoped patch yolundadır. [Ayrıntılar](REPOSITORY_SCALE_TR.md). |
+| Proje belleği ve süreklilik | Türlü bellek, host tarih/branch kaydı, kaynağa bağlı karar/deneyim, süreli görev durumu, kullanıcı tercihi; checkpoint/kalan iş ve onaylı kaynak benimseme | Öneriler operatör kabul edene kadar geri çağrılmaz. Eski karar/deneyim tutulur; görünürlük, branch ve süre kontrol edilir. Hindsight eklenmez. [Ayrıntılar](CONTINUITY_TR.md). |
+| Güvenli geri alma | Native makbuzdan tur veya seçili editlerin ters işlemi; önizleme/inceleme özeti, tam içerik ve kullanıcı çatışma denetimi | Dosya ve tekil boş dizin etkileri; API/DB/Git geçmişi geri alınmaz. Çoklu işlem atomik değildir; kısmi/belirsiz etki devamı durdurur. [Ayrıntılar](CONTINUITY_TR.md). |
+| Tanılama, ölçüm ve kayıt bakımı | Kayda bağlı hata sınıfları, Windows host süreç ölçümü, açık OTLP export, temizlenmiş destek paketi, disk/retention önizlemesi ve şifreli görev backup/restore | Ölçüm kapsamı açık; silme otomatik değildir. Restore yeni home'a kanıt olarak döner, run/resume yetkisi taşımaz. [Ayrıntılar](OBSERVABILITY_TR.md). |
+| Kullanıcı/proje eklentileri | Yeniden derlemeden SKILL.md import/katalog/tam yükleme/resource/helper; onaylı HTTP/stdio MCP; kurulu sürümden Context7/resmi doküman; native hook'lar | Paketler görev onayına sabitlenir. Dış metin yeni izin vermez; belirsiz çağrı tekrarlanmaz. Gerçek servis ve canlı model kabulü ayrıca gerekir. [Ayrıntılar](EXTENSIONS_TR.md). |
 | Skill ve bağlam | Pinin tamamını yükleme; kaynak arama, template/factory, gerçek izole Python helper, ortak scriptler | Model komut, interpreter, kök klasör veya yetki seçemez. Helper sonucu aday/gözlemdir. |
 | Anlamsal gezinti | `code_semantic`: gerçek rust-analyzer, TypeScript dil sunucusu veya Pyright üzerinden definition, references, symbols, hover, diagnostics | Dil sorgulanan dosyadan seçilir. Konumlar sıfır tabanlı UTF-16; build scriptleri kapalı. Eski `code_references` yalnız sözdizimsel aramadır. |
 | Erken kontrol | Başarılı patch/create/delete/move sonrasında güncel kaynakta grammar ve yetkili SDK check | `mutation_applied:true`, yazının zaten uygulandığını belirtir. Kontrol başarısızsa eski patch tekrar gönderilmez. Bu kontrol son kabul değildir. |
@@ -21,7 +28,9 @@ Model bağlamı ve çıktı-token ayarları düşürülmedi. Çekirdeğin mevcut
 istek/araç, disk, worker ve geçmiş boyutu sınırları geçerlidir; sınırsız çalışma
 iddiası yoktur. Geçmiş otomatik özetlenip silinmez. SDK işlemleri mevcut sabit
 image ve ağsız izole worker kullanır; bağımlılık/SDK yokluğu PASS sayılmaz.
-CLI'nın bu geliştirme worker bağında tek işlem için 90 saniye duvar süresi vardır.
+Eski sabit SDK araçlarında tek işlem için 90 saniye duvar süresi vardır; genel
+proje süreçlerinde süre onaylanan proje ortamı ve görev bitiş zamanından gelir.
+Genel proje modunda sabit SDK build/test araçları yerine seçilen ortam kullanılır.
 Yalnız HTML/CSS/SQL gibi bu grammar/SDK kümesi dışındaki kaynaklarda erken
 kontrol `NOT_RUN` kalır; Python kontrolü uydurulmaz. İlgili domain araçları ve
 ayrı son doğrulama kullanılmaya devam eder. Karma depolarda kontrol dışındaki
@@ -253,7 +262,11 @@ melissa --json task prepare --workspace C:/Projects/example --goal 'src/main.py 
 ```
 
 Çıktı kaynak özeti, önerilen uzmanlar, olası yazma kapsamı ve eksik kabul
-girdilerini içerir. Varsayılan taslak `ready_to_create:false` olur. Kabul tarifi
+girdilerini içerir. Varsayılan taslak `ready_to_create:false` (özel yürütme
+tarifi hazır değil), `ready_to_record_project_task:true` olur. Terminalde
+`/create` özel oracle olmadan bu hazırlığı kaydeder; model yapılandırması,
+açık `/budget` ve kabul komutları varsa onaya bağlı genel proje yürütmesini
+oluşturur. [Ortam bağlantısı ve süreçler](PROJECT_RUNTIME_TR.md). Kabul tarifi
 hazırsa `--acceptance C:/MelissaPrivate/acceptance.json` eklenebilir: özel oracle,
 süre/maliyet ve dosya yetkileri şablondan alınır; öneri şablonun dosya kapsamını
 genişletemez. Ortaya çıkan tarif yine incelenir ve normal `task new`, kaynak
@@ -332,3 +345,9 @@ Test kayıtları özel geliştirme klasöründe tutulur. Eski başarısız denem
 silinmez; son test sonucu onları geçmişte başarılı olmuş gibi değiştirmez.
 Bu sürüm için yeni canlı model, büyük depo karşılaştırması, temiz Windows,
 dağıtım ZIP'i veya public yayın kabulü iddia edilmez.
+
+Proje kontrolleri, erken doğrulama, gerçek proje debug ayarı ve hata tekrar üretimi: [doğrulama rehberi](VERIFICATION_TR.md).
+
+Göreve ait servisler, API sözleşmesi ve ayrı DB migration provası: [servis rehberi](SERVICES_TR.md).
+
+Genel proje browser ve canlı önizleme: [frontend doğrulama](FRONTEND_VERIFY_TR.md).

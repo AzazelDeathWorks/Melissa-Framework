@@ -1,0 +1,16 @@
+{
+  "image_id": "sha256:fd18bccfbb336754152a58054354bcea114919c38c07ab40a25ced856f613c1e",
+  "limits": {
+    "wall_time_ms": 3600000,
+    "cpu_time_ms": 3600000,
+    "cpu_rate_basis_points": 10000,
+    "memory_bytes": 2147483648,
+    "disk_bytes": 536870912,
+    "output_bytes": 4194304,
+    "max_processes": 128,
+    "export_bytes": 0
+  },
+  "versions": {},
+  "executables": {},
+  "use_mise": false
+}

@@ -58,10 +58,19 @@ impl GitPlan {
         limits: ContainerLimits,
         cancel: &AtomicBool,
     ) -> Result<Self> {
-        if source.excluded_prefixes != [".git"] {
+        if source.excluded_prefixes != [".git"]
+            || repo.source_visibility().protects_sensitive_paths()
+        {
             return Err(Error::Denied(
                 "Git requires an exact capture without generated-file exclusions",
             ));
+        }
+        if source
+            .files
+            .iter()
+            .any(|file| crate::SourceVisibilityPolicy::sensitive_path(&file.path))
+        {
+            return Err(Error::Denied("exact Git capture contains sensitive paths"));
         }
         repo.validate_snapshot(source, cancel)?;
         let mut files = BTreeMap::new();
@@ -224,6 +233,7 @@ impl GitPlan {
             }
         }
         let request = ContainerRequest {
+            backend: Default::default(),
             schema_version: "melissa.container-exec/v1".into(),
             image_id: image_id.into(),
             executable,

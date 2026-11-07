@@ -15,6 +15,89 @@ mod tests {
     use melissa_local_store::{ArtifactRequest, StoreConfig, StoreKey};
     use serde_json::json;
     #[test]
+    fn frontend_images_require_exact_owned_metadata_receipt_and_binary() {
+        let d = tempfile::tempdir().unwrap();
+        let mut store = LocalStore::open(
+            &d.path().join("store"),
+            StoreKey::from_bytes([158; 32]),
+            StoreConfig::default(),
+        )
+        .unwrap();
+        let task: melissa_core_contracts::wire::TaskContractV1 = serde_json::from_slice(
+            include_bytes!("../../../tests/fixtures/code01/wire/task-contract-v1.json"),
+        )
+        .unwrap();
+        store.journal_mut().create_task(&task).unwrap();
+        let png = include_bytes!("../tests/fixtures/code10-real-browser.png").to_vec();
+        let metadata = json!({"artifact_id":"frontend-png","receipt_id":"frontend-receipt","kind":"png","bytes":png.len(),"blake3":format!("blake3:{}",blake3::hash(&png)),"source_digest":"owned-source","source_current":true});
+        let receipt = json!({"browser_artifacts":{"a1":metadata}});
+        for (id, kind, data) in [
+            ("frontend-png", "cli.frontend.binary", png.clone()),
+            (
+                "frontend-png:metadata",
+                "cli.frontend.metadata",
+                serde_json::to_vec(&metadata).unwrap(),
+            ),
+            (
+                "frontend-receipt",
+                "cli.services.receipt",
+                serde_json::to_vec(&receipt).unwrap(),
+            ),
+        ] {
+            store
+                .put_artifact(
+                    &ArtifactRequest {
+                        artifact_id: id.into(),
+                        task_id: task.task_id.clone(),
+                        content_type: "application/json".into(),
+                        logical_type: kind.into(),
+                        schema_version: "v1".into(),
+                        retain_until_ms: 0,
+                        legal_hold: false,
+                    },
+                    &data,
+                )
+                .unwrap();
+        }
+        let policy = VisionPolicy {
+            initial_images: vec![],
+            screenshot_tools: BTreeSet::from(["frontend_image".into()]),
+        };
+        let mut result = ToolExecution {
+            content: json!({"service_image":metadata}).to_string(),
+            success: true,
+            cancelled: false,
+            requires_reconciliation: false,
+            artifact_refs: vec!["frontend-png".into(), "frontend-png:metadata".into()],
+        };
+        assert!(
+            policy
+                .tool_images(&store, &task.task_id, "frontend_image", &result)
+                .unwrap()
+                == vec![InlinePng::new(png).unwrap()]
+        );
+        assert!(
+            policy
+                .tool_images(&store, "foreign-task", "frontend_image", &result)
+                .is_err()
+        );
+        result.content =
+            json!({"service_image":{"artifact_id":"frontend-png","kind":"png","blake3":"forged"}})
+                .to_string();
+        assert!(
+            policy
+                .tool_images(&store, &task.task_id, "frontend_image", &result)
+                .is_err()
+        );
+        result.content = json!({"service_image":metadata}).to_string();
+        result.artifact_refs.pop();
+        assert!(
+            policy
+                .tool_images(&store, &task.task_id, "frontend_image", &result)
+                .is_err()
+        );
+    }
+    #[test]
     fn binary_png_requires_native_receipt_matching_reply_source_and_bytes() {
         let d = tempfile::tempdir().unwrap();
         let mut store = LocalStore::open(
@@ -256,6 +339,72 @@ impl VisionPolicy {
             return Ok(vec![]);
         }
         let value = crate::strict_json(&result.content)?;
+        if name == "frontend_image" {
+            let image = &value["service_image"];
+            let id = image["artifact_id"]
+                .as_str()
+                .ok_or_else(|| GatewayError::invalid("frontend image ID"))?;
+            let metadata_id = format!("{id}:metadata");
+            if !result.artifact_refs.contains(&metadata_id)
+                || !result.artifact_refs.iter().any(|r| r == id)
+            {
+                return Err(GatewayError::invalid("frontend image references"));
+            }
+            let meta = store
+                .artifact_metadata(task, &metadata_id)
+                .map_err(|_| GatewayError::invalid("frontend metadata ownership"))?;
+            let authenticated: serde_json::Value = serde_json::from_slice(
+                &store
+                    .get_artifact(task, &metadata_id)
+                    .map_err(|_| GatewayError::invalid("frontend metadata"))?,
+            )
+            .map_err(|_| GatewayError::invalid("frontend metadata JSON"))?;
+            if meta.logical_type != "cli.frontend.metadata"
+                || authenticated != *image
+                || image["kind"] != "png"
+            {
+                return Err(GatewayError::invalid("frontend image native binding"));
+            }
+            let receipt_id = image["receipt_id"]
+                .as_str()
+                .ok_or_else(|| GatewayError::invalid("frontend receipt ID"))?;
+            if store
+                .artifact_metadata(task, receipt_id)
+                .map_err(|_| GatewayError::invalid("frontend receipt ownership"))?
+                .logical_type
+                != "cli.services.receipt"
+            {
+                return Err(GatewayError::invalid("frontend receipt type"));
+            }
+            let receipt: serde_json::Value = serde_json::from_slice(
+                &store
+                    .get_artifact(task, receipt_id)
+                    .map_err(|_| GatewayError::invalid("frontend receipt"))?,
+            )
+            .map_err(|_| GatewayError::invalid("frontend receipt JSON"))?;
+            if !receipt["browser_artifacts"]
+                .as_object()
+                .is_some_and(|artifacts| artifacts.values().any(|v| v == image))
+            {
+                return Err(GatewayError::invalid(
+                    "frontend image absent from native receipt",
+                ));
+            }
+            let raw = store
+                .get_artifact(task, id)
+                .map_err(|_| GatewayError::invalid("frontend image bytes"))?;
+            if store
+                .artifact_metadata(task, id)
+                .map_err(|_| GatewayError::invalid("frontend image ownership"))?
+                .logical_type
+                != "cli.frontend.binary"
+                || image["blake3"] != format!("blake3:{}", blake3::hash(&raw))
+                || image["bytes"] != raw.len() as u64
+            {
+                return Err(GatewayError::invalid("frontend image native digest"));
+            }
+            return Ok(vec![InlinePng::new(raw)?]);
+        }
         let reply = &value["reply"];
         let hex = reply["body"]["png_hex"].as_str();
         if hex.is_none() && reply["body"]["binary_artifact"]["kind"] != "png" {

@@ -12,6 +12,7 @@ use std::{
 
 const ENGINE: &str = "npipe:////./pipe/dockerDesktopLinuxEngine";
 include!("runtime_recovery.rs");
+include!("runtime_compose.rs");
 const CONTROL_LIMIT: usize = 1024 * 1024;
 // A single, non-root PID1 both reaps adopted children and owns the independent
 // deadline. A shell plus a bootstrap sleep needlessly occupied two PID slots
@@ -243,6 +244,13 @@ struct Docker {
 }
 #[cfg(windows)]
 fn pin_client(executable: &std::path::Path) -> ExecutorResult<(File, Vec<File>, String)> {
+    pin_client_mode(executable, true)
+}
+#[cfg(windows)]
+fn pin_client_mode(
+    executable: &std::path::Path,
+    single_link: bool,
+) -> ExecutorResult<(File, Vec<File>, String)> {
     use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
     use windows_sys::Win32::Storage::FileSystem::*;
     let mut ancestors = Vec::new();
@@ -283,7 +291,7 @@ fn pin_client(executable: &std::path::Path) -> ExecutorResult<(File, Vec<File>, 
         return Err(std::io::Error::last_os_error().into());
     }
     if info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0
-        || info.nNumberOfLinks != 1
+        || (single_link && info.nNumberOfLinks != 1)
         || file.metadata()?.len() > 128 * 1024 * 1024
     {
         return Err(fail(
@@ -726,7 +734,8 @@ pub(crate) fn run_interactive(
     if cancelled.load(Ordering::Acquire) {
         return Err(ExecutorError::CancelledBeforeLaunch);
     }
-    let docker = Docker::new()?;
+    let mut docker = Docker::new()?;
+    let _compose_pin = prepare_compose_client(&mut docker, request.backend)?;
     let (status, info) = docker.get("/info")?;
     if status != 200
         || info["OSType"] != "linux"
@@ -835,8 +844,12 @@ pub(crate) fn run_interactive(
         "--",
         &guest_deadline_seconds.to_string(),
     ]));
-    let id = String::from_utf8(docker.checked(&args, None, CONTROL_LIMIT)?)
-        .map_err(|_| fail("non-UTF8 container identity"))?;
+    let id = if request.backend == CreationBackend::Compose {
+        compose_create(&docker, request, &name, &nonce, guest_deadline_seconds)?
+    } else {
+        String::from_utf8(docker.checked(&args, None, CONTROL_LIMIT)?)
+            .map_err(|_| fail("non-UTF8 container identity"))?
+    };
     let id = id.trim();
     if id.len() != 64 || !id.bytes().all(|v| v.is_ascii_hexdigit()) {
         return Err(fail("invalid created container identity"));
@@ -1163,7 +1176,10 @@ pub(crate) fn run_interactive(
     }
     // The only remaining process is the protected keeper. A bounded
     // unprivileged tar now sees tmpfs without any workload writer present.
-    let (export_status, export) = if stop_failed || namespace_stopped {
+    let (export_status, export) = if l.export_bytes == 0 && !stop_failed && !namespace_stopped {
+        // An explicit zero allowance disables export; it never means unlimited.
+        (Some(0), Output::default())
+    } else if stop_failed || namespace_stopped {
         (None, Output::default())
     } else {
         docker.capture(

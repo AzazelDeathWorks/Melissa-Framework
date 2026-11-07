@@ -41,6 +41,11 @@ impl StoreKey {
         Ok(Self(bytes))
     }
 
+    /// Trusted-host portable backup. Never return or persist a raw store key.
+    pub fn wrap_for_backup(&self, recipient: &StoreKey, aad: &[u8]) -> StoreResult<Vec<u8>> {
+        recipient.seal(&*self.0, aad)
+    }
+
     /// Each call uses a fresh OS-random 192-bit nonce. Domain-separated AAD is
     /// required from the owner of the stored record.
     pub fn seal(&self, plaintext: &[u8], aad: &[u8]) -> StoreResult<Vec<u8>> {

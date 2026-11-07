@@ -17,6 +17,16 @@ use serde::{Deserialize, Serialize};
 
 const CONTAINER_MAC_DOMAIN: &[u8] = b"melissa.execution-broker.container-permit-mac/v1\0";
 const EFFECTS: [&str; 2] = ["process.execute_scoped", "workspace.apply_patch_scoped"];
+fn effects(snapshot_only: bool) -> &'static [&'static str] {
+    if snapshot_only {
+        &["process.execute_scoped"]
+    } else {
+        &EFFECTS
+    }
+}
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 fn identifier(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
 }
@@ -71,6 +81,10 @@ pub fn container_arguments_digest(request: &ContainerRequest) -> PolicyResult<St
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContainerPermitBinding {
+    /// No host mounts or writeback. Writes inside the private disposable copy
+    /// are not host source mutations. This never authorizes applying exports.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub snapshot_only: bool,
     pub schema_version: String,
     pub key_id: String,
     pub policy_digest: String,
@@ -134,6 +148,29 @@ impl PermitAuthority {
         policy: &HostPolicy,
         now: u64,
     ) -> PolicyResult<SignedContainerPermit> {
+        self.issue_container_mode(
+            catalog,
+            task,
+            container,
+            snapshot_digest,
+            request,
+            policy,
+            now,
+            false,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_container_mode(
+        &self,
+        catalog: &Catalog,
+        task: &TaskContractV1,
+        container: ContainerRequest,
+        snapshot_digest: String,
+        request: PermitRequest,
+        policy: &HostPolicy,
+        now: u64,
+        snapshot_only: bool,
+    ) -> PolicyResult<SignedContainerPermit> {
         request_valid(&container)?;
         for value in [
             &request.permit_id,
@@ -158,7 +195,7 @@ impl PermitAuthority {
                 tool_id: "process.exec".into(),
                 resource_id: request.resource_id,
                 arguments_digest: container_arguments_digest(&container)?,
-                allowed_effects: EFFECTS.iter().map(|s| (*s).into()).collect(),
+                allowed_effects: effects(snapshot_only).iter().map(|s| (*s).into()).collect(),
                 not_before_unix_ms: request.not_before_unix_ms,
                 expires_at_unix_ms: request.expires_at_unix_ms,
                 max_invocations: 1,
@@ -171,6 +208,7 @@ impl PermitAuthority {
                 signature_or_mac: "pending-authentication".into(),
             },
             binding: ContainerPermitBinding {
+                snapshot_only,
                 schema_version: "melissa.container-permit-binding/v1".into(),
                 key_id: policy.key_id.clone(),
                 policy_digest: policy.digest()?,
@@ -232,7 +270,7 @@ fn check_container(
     let request = &binding.request;
     demand(
         permit.tool_id == "process.exec"
-            && permit.allowed_effects == EFFECTS
+            && permit.allowed_effects == effects(binding.snapshot_only)
             && permit.arguments_digest == container_arguments_digest(request)?
             && binding.execution_digest
                 == container_execution_digest(request, &binding.snapshot_digest)?
@@ -286,7 +324,7 @@ fn check_container(
     demand(
         profile.tool_ids.iter().any(|s| s == "process.exec")
             && profile.worker_types.iter().any(|s| s == "generic")
-            && EFFECTS.iter().all(|e| {
+            && effects(binding.snapshot_only).iter().all(|e| {
                 profile.authority.capability_ceiling.iter().any(|s| s == e)
                     && !profile.authority.forbidden_effects.iter().any(|s| s == e)
             }),
@@ -318,7 +356,9 @@ fn check_container(
             && grant.profile_id == binding.profile_id
             && grant.resource_id == permit.resource_id
             && grant.process_digest == binding.execution_digest
-            && EFFECTS.iter().all(|s| grant.allowed_effects.contains(*s)),
+            && effects(binding.snapshot_only)
+                .iter()
+                .all(|s| grant.allowed_effects.contains(*s)),
         "container host grant scope mismatch",
     )?;
     demand(

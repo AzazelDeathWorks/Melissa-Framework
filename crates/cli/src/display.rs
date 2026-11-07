@@ -28,6 +28,64 @@ pub fn safe(text: &str) -> String {
         .collect()
 }
 pub fn human(v: &Value) -> Result<String> {
+    if v["command"]
+        .as_str()
+        .is_some_and(|c| c.starts_with("observe ") || c.starts_with("maintenance "))
+    {
+        return json(v);
+    }
+    if v["command"] == "task continuity" {
+        let mut out = format!(
+            "Görev sürekliliği: {}\nDurum: {} · aşama: {}\nKaynak: {}\nİşlemler uzlaştırılmış: {}\n",
+            safe(v["task_id"].as_str().unwrap_or("?")),
+            safe(v["state"].as_str().unwrap_or("?")),
+            safe(v["last_control_phase"].as_str().unwrap_or("unknown")),
+            safe(v["source_digest"].as_str().unwrap_or("?")),
+            v["settled"]
+        );
+        if let Some(checkpoints) = v["checkpoints"].as_array() {
+            out.push_str(&format!("Checkpoint: {}\n", checkpoints.len()));
+            for checkpoint in checkpoints {
+                out.push_str(&format!(
+                    "  {} · {} · kaynak {}\n",
+                    safe(checkpoint["id"].as_str().unwrap_or("?")),
+                    safe(
+                        checkpoint["label"]
+                            .as_str()
+                            .or_else(|| checkpoint["phase"].as_str())
+                            .unwrap_or("kayıt")
+                    ),
+                    if checkpoint["source_current"] == true {
+                        "güncel"
+                    } else {
+                        "eski veya bilinmiyor"
+                    }
+                ));
+            }
+        }
+        if let Some(steps) = v["remaining_milestones"].as_array() {
+            out.push_str(&format!("Kalan uzman adımı: {}\n", steps.len()));
+            for step in steps {
+                out.push_str(&format!(
+                    "  {} · {} · {}\n",
+                    safe(step["id"].as_str().unwrap_or("?")),
+                    safe(step["profile"].as_str().unwrap_or("?")),
+                    safe(step["state"].as_str().unwrap_or("?"))
+                ));
+            }
+        }
+        out.push_str(&format!(
+            "Model: {} etkin / {} belirsiz · kayıtlı maliyet {} mikro USD\n",
+            v["model_budget"]["active_requests"],
+            v["model_budget"]["unknown_requests"],
+            v["model_budget"]["known_cost_micro_usd"]
+        ));
+        out.push_str(
+            "Aynı güvenli kaynak: /resume. Kaynak değiştiyse önce /adopt-preview ile incele.\n",
+        );
+        return Ok(out);
+    }
+
     if let Some(id) = v["task_id"].as_str() {
         let mut out = format!("Görev: {}\n", safe(id));
         if let Some(state) = v["state"].as_str() {
@@ -104,6 +162,7 @@ pub fn human(v: &Value) -> Result<String> {
             || v.get("plan").is_some()
             || v.get("preparation").is_some()
             || v.get("metrics").is_some()
+            || v["command"] == "task adopt-source"
         {
             out.push_str(&json(v)?);
         }

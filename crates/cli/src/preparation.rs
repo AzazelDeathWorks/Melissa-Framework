@@ -56,6 +56,22 @@ impl App {
         out: &Path,
         acceptance: Option<&Path>,
     ) -> Result<Value> {
+        self.prepare_mode(
+            workspace,
+            goal,
+            out,
+            acceptance,
+            crate::conversation::Mode::Develop,
+        )
+    }
+    pub fn prepare_mode(
+        &self,
+        workspace: &Path,
+        goal: &str,
+        out: &Path,
+        acceptance: Option<&Path>,
+        mode: crate::conversation::Mode,
+    ) -> Result<Value> {
         if goal.trim().is_empty() || goal.len() > 16384 {
             return Err(Error::Usage("Görev amacı geçersiz."));
         }
@@ -73,9 +89,15 @@ impl App {
             ));
         }
         let repo = Repository::open(&root, Limits::default(), vec![])?;
+        self.require_separate_workspace(&repo)?;
         let snap = repo.snapshot(&AtomicBool::new(false))?;
         let acceptance_template = acceptance.map(Recipe::read).transpose()?;
         let (role, write) = intent(goal);
+        let (role, write) = match mode {
+            crate::conversation::Mode::Plan => ("repository-analyst", false),
+            crate::conversation::Mode::Review => ("reviewer", false),
+            crate::conversation::Mode::Develop => (role, write),
+        };
         let mentioned = snap
             .files
             .iter()
@@ -169,14 +191,15 @@ impl App {
             Step { profile, goal: format!("{purpose}. Task goal: {goal}"), write: can_write }
         }).collect::<Vec<_>>();
         let adaptive = json!({
+            "mode":mode,"write_intent":write,"source_digest":snap.digest,"guidance":crate::instructions::load(&self.home,&repo,&AtomicBool::new(false))?,
             "task_goal":goal, "complexity":melissa_workflow::adaptive::complexity(&signals),
-            "signals":signals, "dependency_evidence":dependency_evidence,
+            "signals":signals, "specialist_selection":melissa_workflow::adaptive::selection_explanation(&signals,&agents.iter().map(|s|s.profile.clone()).collect::<Vec<_>>()), "dependency_evidence":dependency_evidence,
             "scope":{"inspected_paths":affected,"proposed_writes":writable},
-            "acceptance_criteria":if acceptance_template.is_some(){"operator acceptance template; private expected values withheld"}else{"operator input required"},
+            "acceptance_criteria":if acceptance_template.is_some(){"operator acceptance template; private expected values withheld"}else{"reviewed project requirements and source-bound checks; execution/environment contract in Phase 3; no private oracle invented"},
             "risk":{"high_risk":signals.high_risk,"authority_expansion_allowed":false},
             "authorized_budget":acceptance_template.as_ref().map(|r|json!({"max_cost_micro_usd":r.max_cost_micro_usd,"wall_time_ms":r.wall_time_ms})), "constraints":["original task authority","one active specialist","operator-owned acceptance"],
             "milestones":agents.iter().enumerate().map(|(i,s)| json!({"id":format!("step-{i}"),"goal":s.goal,"profile":s.profile,"write":s.write,"dependencies":if i==0{vec![]}else{vec![format!("step-{}",i-1)]}})).collect::<Vec<_>>(), "required_specialists":agents.iter().map(|s| &s.profile).collect::<Vec<_>>(),
-            "verification_strategy":"specialist tests, independent final review, then protected host QA",
+            "verification_strategy":if acceptance_template.is_some(){"specialist tests, independent final review, then protected host QA"}else{"discover project checks and retain baseline, implementation and final review evidence; not executed in preparation"},
             "budget_estimate":"unknown until provider configuration and measured usage are available"
         });
         let mut ready = false;
@@ -193,12 +216,12 @@ impl App {
             ready = true;
             serde_json::to_value(r).map_err(|_| Error::Store)?
         } else {
-            json!({"agents":agents,"writable_paths":writable,"protected_paths":tests,"language_hint":crate::development::detected_language(&repo)?.map(|l|l.wire()),"development":"pinned SDK build/check/lint/native test discovery","required_operator_inputs":["entry/domain contract","private acceptance checks and separate negative workspace","task duration and cost authorization"]})
+            json!({"agents":agents,"writable_paths":writable,"protected_paths":tests,"language_hint":crate::development::detected_language(&repo)?.map(|l|l.wire()),"development":"project environment/execution contract in Phase 3","required_operator_inputs":["reviewed project requirements and checks","task duration and cost authorization before execution"],"private_oracle_required":false})
         };
         if repo.snapshot(&AtomicBool::new(false))?.digest != snap.digest {
             return Err(Error::Conflict("Source changed during task preparation."));
         }
-        let draft = json!({"schema_version":"melissa.cli-preparation/v1","goal":goal,"workspace":root,"source_digest":snap.digest,"source_files":snap.files.len(),"adaptive_plan":adaptive,"method":"offline source inspection and explicit intent rules; not an LLM plan","ready_to_create":ready,"recipe":recipe,"approval_required_before_execution":true,"model_calls":0,"missing_acceptance_invented":false});
+        let draft = json!({"schema_version":"melissa.cli-preparation/v1","goal":goal,"workspace":root,"source_digest":snap.digest,"source_files":snap.files.len(),"adaptive_plan":adaptive,"method":"offline source inspection and explicit intent rules; not an LLM plan","ready_to_create":ready,"ready_to_record_project_task":true,"recipe":recipe,"approval_required_before_execution":true,"model_calls":0,"missing_acceptance_invented":false});
         let body = if ready {
             bytes(&draft["recipe"])?
         } else {
@@ -211,7 +234,7 @@ impl App {
         file.write_all(&body)?;
         file.sync_all()?;
         Ok(
-            json!({"command":"task prepare","out":out,"sha":digest(&body),"preparation":draft,"next":if ready{"Review the recipe, then task new --recipe and the normal source-bound approval."}else{"Review the draft; provide a trusted acceptance template with --acceptance. Expected answers are never guessed."}}),
+            json!({"command":"task prepare","out":out,"sha":digest(&body),"preparation":draft,"next":if ready{"Review the recipe, then task new --recipe and the normal source-bound approval."}else{"In the terminal session use /create to record the reviewed project brief without a private oracle. General execution/environment binding follows in Phase 3."}}),
         )
     }
     pub fn replan(&self, id: &str, recipe: Recipe) -> Result<Value> {
@@ -342,6 +365,13 @@ pub(crate) fn activate_pending(
         return Ok(false);
     }
     let n = next - 1;
+    if store
+        .journal()
+        .checkpoint(&format!("cli:discarded-plan:{n}"), task)
+        .is_ok()
+    {
+        return Ok(false);
+    }
     let applied = format!("cli:applied-plan:{n}");
     match store.journal().checkpoint(&applied, task) {
         Ok(_) => return Ok(false),

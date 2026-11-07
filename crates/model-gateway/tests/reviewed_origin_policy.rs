@@ -49,6 +49,9 @@ fn standard_openai_and_anthropic_bodies_remain_byte_identical() {
         let endpoint = endpoint(protocol, "https://other-provider.example/v1/generation");
         let turn = request();
         let expected = match protocol {
+            Protocol::OpenAiChatCompletions => {
+                melissa_model_gateway::chat_completions::build_request(&turn, Default::default())
+            }
             Protocol::OpenAiResponses => melissa_model_gateway::openai::build_request(&turn),
             Protocol::AnthropicMessages => melissa_model_gateway::anthropic::build_request(&turn),
         }

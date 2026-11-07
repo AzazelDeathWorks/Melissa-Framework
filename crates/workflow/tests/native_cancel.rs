@@ -28,7 +28,7 @@ async fn workflow_root_cancel_stops_actual_admitted_container_process_tree() {
         &[],
         support::limits(),
     );
-    let mut request=ContainerRequest{schema_version:"melissa.container-exec/v1".into(),image_id:COMPLETE_IMAGE.into(),executable:PYTHON.into(),argv:vec!["-I".into(),"-S".into(),"-c".into(),"import subprocess,pathlib,time; pathlib.Path('started').write_text('CODE08_WORKER_STARTED'); child=subprocess.Popen(['sleep','30']); time.sleep(30)".into()],cwd:".".into(),env:BTreeMap::new(),limits:support::limits()};
+    let mut request=ContainerRequest{backend:Default::default(),schema_version:"melissa.container-exec/v1".into(),image_id:COMPLETE_IMAGE.into(),executable:PYTHON.into(),argv:vec!["-I".into(),"-S".into(),"-c".into(),"import subprocess,pathlib,time; pathlib.Path('started').write_text('CODE08_WORKER_STARTED'); child=subprocess.Popen(['sleep','30']); time.sleep(30)".into()],cwd:".".into(),env:BTreeMap::new(),limits:support::limits()};
     request.limits.wall_time_ms = 30000;
     let snapshot = Snapshot {
         files: BTreeMap::from([("owned.txt".into(), b"owned source".to_vec())]),

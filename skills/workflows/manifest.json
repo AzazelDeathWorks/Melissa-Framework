@@ -1,0 +1,86 @@
+{
+  "schema_version": "melissa.workflow-skill-templates/v1",
+  "packages": [
+    {
+      "name": "repo-onboarding",
+      "version": "1.0.0",
+      "owner_profile": "melissa.code.repository-analyst",
+      "entry": "repo-onboarding/SKILL.md",
+      "status": "instruction_template",
+      "feature_acceptance": "separate_evidence_required"
+    },
+    {
+      "name": "bug-repro-fix",
+      "version": "1.1.0",
+      "owner_profile": "melissa.code.debugger",
+      "entry": "bug-repro-fix/SKILL.md",
+      "status": "instruction_template",
+      "feature_acceptance": "separate_evidence_required"
+    },
+    {
+      "name": "feature-vertical-slice",
+      "version": "1.2.0",
+      "owner_profile": "melissa.code.implementer",
+      "entry": "feature-vertical-slice/SKILL.md",
+      "status": "instruction_template",
+      "feature_acceptance": "separate_evidence_required"
+    },
+    {
+      "name": "safe-refactor",
+      "version": "1.1.0",
+      "owner_profile": "melissa.code.implementer",
+      "entry": "safe-refactor/SKILL.md",
+      "status": "instruction_template",
+      "feature_acceptance": "separate_evidence_required"
+    },
+    {
+      "name": "frontend-verify",
+      "version": "1.1.0",
+      "owner_profile": "melissa.code.frontend",
+      "entry": "frontend-verify/SKILL.md",
+      "status": "instruction_template",
+      "feature_acceptance": "separate_evidence_required"
+    },
+    {
+      "name": "api-contract",
+      "version": "1.1.0",
+      "owner_profile": "melissa.code.backend",
+      "entry": "api-contract/SKILL.md",
+      "status": "instruction_template",
+      "feature_acceptance": "separate_evidence_required"
+    },
+    {
+      "name": "database-migration",
+      "version": "1.1.0",
+      "owner_profile": "melissa.code.database",
+      "entry": "database-migration/SKILL.md",
+      "status": "instruction_template",
+      "feature_acceptance": "separate_evidence_required"
+    },
+    {
+      "name": "dependency-upgrade",
+      "version": "1.0.0",
+      "owner_profile": "melissa.code.implementer",
+      "entry": "dependency-upgrade/SKILL.md",
+      "status": "instruction_template",
+      "feature_acceptance": "separate_evidence_required"
+    },
+    {
+      "name": "performance-triage",
+      "version": "1.1.0",
+      "owner_profile": "melissa.code.debugger",
+      "entry": "performance-triage/SKILL.md",
+      "status": "instruction_template",
+      "feature_acceptance": "separate_evidence_required"
+    },
+    {
+      "name": "release-pr",
+      "version": "1.0.0",
+      "owner_profile": "melissa.code.reviewer",
+      "entry": "release-pr/SKILL.md",
+      "status": "instruction_template",
+      "feature_acceptance": "separate_evidence_required"
+    }
+  ],
+  "activation": "explicit import or copy into user/project skills directory; no implicit runtime authority"
+}

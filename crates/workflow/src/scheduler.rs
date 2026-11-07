@@ -595,10 +595,7 @@ impl Scheduler {
         }
         if let Some(ledger) = &s.adaptive {
             require(
-                !ledger
-                    .repeated_failures
-                    .values()
-                    .any(|n| *n >= s.plan.max_no_progress),
+                !crate::adaptive::repeated_approach(ledger, s.plan.max_no_progress),
                 Kind::Conflict,
                 "repeated host check failures require intervention",
             )?;
@@ -980,6 +977,84 @@ impl Scheduler {
     }
     /// Host-observed source state. The caller reads through the task's pinned
     /// repository capability; model tools cannot populate this receipt.
+    pub fn restart_observed_source(
+        &mut self,
+        source: &str,
+        review_ref: &str,
+        catalog: &Catalog,
+    ) -> Result<State> {
+        let state = self.state()?;
+        self.fresh(&state)?;
+        idle(&self.store, &self.task)?;
+        require(
+            crate::plan::hash(source) && !review_ref.is_empty() && review_ref.len() <= 256,
+            Kind::Invalid,
+            "source reconciliation identity",
+        )?;
+        let proof = self.store.artifact_metadata(&self.task, review_ref)?;
+        require(
+            proof.logical_type == "cli.continuity.adoption",
+            Kind::Authority,
+            "explicit operator source review required",
+        )?;
+        let proof: Value =
+            serde_json::from_slice(&self.store.get_artifact(&self.task, review_ref)?)?;
+        require(
+            proof["source_digest"] == source
+                && proof["operator"] == "explicit_cli_review"
+                && proof["previous_plan_digest"] == state.plan.digest()?,
+            Kind::Authority,
+            "source review does not cover current plan",
+        )?;
+        require(
+            !state
+                .slots
+                .values()
+                .any(|s| s.phase == Phase::NeedsReconciliation),
+            Kind::Uncertain,
+            "unknown specialist effect cannot be reset",
+        )?;
+        let mut next = state.clone();
+        next.plan.parent_digest = Some(state.plan.digest()?);
+        next.plan.revision = state
+            .plan
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| error(Kind::Invalid, "plan revision overflow"))?;
+        next.plan
+            .validate(&self.store.journal().task(&self.task)?.contract, catalog)?;
+        for slot in next.slots.values_mut() {
+            slot.generation = slot
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| error(Kind::Invalid, "generation overflow"))?;
+            slot.phase = Phase::Pending;
+            slot.lease = None;
+            slot.output = None;
+            slot.native_run_ref = None;
+        }
+        next.active_handoff = None;
+        next.no_progress = 0;
+        if let Some(ledger) = &mut next.adaptive {
+            ledger.source_version = source.into();
+            ledger.current_milestone = None;
+            ledger.completed_milestones.clear();
+            ledger.verified_facts.clear();
+            ledger.accepted_artifacts.clear();
+            ledger.candidate_artifacts.clear();
+            ledger.current_diagnostics.clear();
+            ledger.diagnostics.clear();
+            ledger.last_patch = None;
+            ledger.milestone_checkpoint = None;
+            ledger.pending_proposal = None;
+            ledger.repeated_failures.clear();
+            ledger.next_action =
+                "Re-observe operator-reviewed source; prior work remains historical evidence"
+                    .into();
+            ledger.open_questions.push(format!("Source explicitly reconciled: {review_ref}; previous outputs invalidated, accounting retained"));
+        }
+        self.commit(&state,next,"explicit operator source reconciliation; fresh generations, original history, budget and deadline retained")
+    }
     pub fn observe_source(
         &mut self,
         source: String,
@@ -1046,6 +1121,18 @@ impl Scheduler {
         success: bool,
         content: &str,
     ) -> Result<Option<String>> {
+        self.observe_check_input(lease, tool, source, success, content, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn observe_check_input(
+        &mut self,
+        lease: &Lease,
+        tool: &str,
+        source: &str,
+        success: bool,
+        content: &str,
+        input: Option<&str>,
+    ) -> Result<Option<String>> {
         require(
             identifier(tool) && crate::plan::hash(source) && content.len() <= 4 * 1024 * 1024,
             Kind::Invalid,
@@ -1096,6 +1183,38 @@ impl Scheduler {
         )];
         ledger.last_patch = patch;
         let signature = digest(format!("{tool}:{source}").as_bytes());
+        if let Some(input) = input {
+            require(
+                crate::plan::hash(input),
+                Kind::Invalid,
+                "approach input identity",
+            )?;
+            if !success {
+                let key = digest(format!("{tool}:{source}:{input}").as_bytes());
+                let prior = ledger
+                    .failed_approaches
+                    .get(&key)
+                    .filter(|r| !r.resolved)
+                    .map_or(0, |r| r.count);
+                ledger.failed_approaches.insert(
+                    key,
+                    crate::adaptive::FailedApproach {
+                        tool: tool.into(),
+                        source_digest: source.into(),
+                        input_digest: input.into(),
+                        count: prior.saturating_add(1),
+                        resolved: false,
+                        last_evidence_ref: artifact.clone(),
+                    },
+                );
+            } else {
+                let key = digest(format!("{tool}:{source}:{input}").as_bytes());
+                if let Some(prior) = ledger.failed_approaches.get_mut(&key) {
+                    prior.resolved = true;
+                    prior.last_evidence_ref = artifact.clone();
+                }
+            }
+        }
         if success {
             ledger.diagnostics.remove(tool);
             if tool == "code_tests" {
@@ -1492,11 +1611,10 @@ impl Scheduler {
         } else if budget.budget_exceeded || now()? >= state.deadline_ms {
             "budget_or_deadline_exhausted"
         } else if state.no_progress >= state.plan.max_no_progress
-            || state.adaptive.as_ref().is_some_and(|l| {
-                l.repeated_failures
-                    .values()
-                    .any(|n| *n >= state.plan.max_no_progress)
-            })
+            || state
+                .adaptive
+                .as_ref()
+                .is_some_and(|l| crate::adaptive::repeated_approach(l, state.plan.max_no_progress))
         {
             "no_progress_stop"
         } else if state.slots.values().any(|s| s.phase == Phase::Leased)

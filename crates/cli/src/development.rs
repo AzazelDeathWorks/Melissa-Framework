@@ -126,7 +126,29 @@ impl DevelopmentTools {
         write: bool,
     ) -> Result<Self> {
         let repo = Arc::new(app.source(&app.workspace(store, &t.task_id)?)?);
-        let lang = language(&repo)?;
+        let project_contract = app
+            .execution(store, &t.task_id)?
+            .and_then(|e| e.recipe.project);
+        let debug_project = project_contract.as_ref().and_then(|p| {
+            p.verification
+                .as_ref()
+                .and_then(|v| v.debug.clone())
+                .map(|launch| melissa_build_test::debug::Project {
+                    launch,
+                    image_id: p.environment.image_id.clone(),
+                    executables: p.environment.executables.clone(),
+                    versions: p.environment.versions.clone(),
+                    rust_version: p.environment.versions.get("rust").cloned(),
+                })
+        });
+        let lang = if let Some(p) = &debug_project {
+            p.launch.language
+        } else {
+            language(&repo)?
+        };
+        let entry = debug_project
+            .as_ref()
+            .map_or(entry, |p| p.launch.entry.as_str());
         let c = resources::catalog()?;
         let p = c.profiles.get(profile).ok_or(Error::Store)?;
         let process = p
@@ -175,7 +197,8 @@ impl DevelopmentTools {
                     ops.insert(name.into(), operation);
                 }
             }
-            if write
+            if (write || debug_project.is_some())
+                && (project_contract.is_none() || debug_project.is_some())
                 && tools.contains("code.diagnostics")
                 && p.tool_ids.iter().any(|s| s == "process.exec")
                 && !entry.is_empty()
@@ -210,7 +233,7 @@ impl DevelopmentTools {
             );
         }
         let debug = ops.contains_key("cli_debug_native");
-        let code = if ops.is_empty() {
+        let mut code = if ops.is_empty() {
             None
         } else {
             Some(
@@ -233,6 +256,15 @@ impl DevelopmentTools {
                 .map_err(|_| Error::Denied("SDK kapsamı görev/uzman yetkisiyle uyuşmuyor."))?,
             )
         };
+        if debug
+            && let Some(project) = debug_project.clone()
+            && let Some(c) = code.take()
+        {
+            code = Some(
+                c.with_project_debug(project)
+                    .map_err(|_| Error::Denied("Onaylı proje debug ayarı bağlanamadı."))?,
+            );
+        }
         let git_capture_allowed = app
             .workspace(store, &t.task_id)?
             .explicit_excludes
@@ -356,7 +388,7 @@ impl ToolDispatcher for DevelopmentTools {
             d.push(BoundTool{canonical_id:"git.status".into(),definition:ToolDefinition{name:"code_git".into(),description:"Scoped Git on a captured private copy: status, diff(staged), log(max_entries 1..1000), log_paths(max_entries 1..1000; records ranking evidence), worktree_list, worktree_create(name, exact commit). No commit/push/host changes, hooks or credentials. Worktree creation needs explicit role/write authority; output is a quarantined artifact. Re-captures source and metadata on each call.".into(),parameters:json!({"type":"object","properties":{"operation":{"type":"string","enum":["status","diff","log","log_paths","worktree_list","worktree_create"]},"staged":{"type":"boolean"},"max_entries":{"type":"integer","minimum":1,"maximum":1000},"name":{"type":"string"},"commit":{"type":"string"}},"required":["operation"],"additionalProperties":false}),strict:false}});
         }
         if self.tools.contains("code.references") {
-            d.push(BoundTool{canonical_id:"code.references".into(),definition:ToolDefinition{name:"code_semantic".into(),description:"Real rust-analyzer/TypeScript/Pyright query over the current isolated source. Zero-based UTF-16 line/character. No build scripts; does not claim syntactic matches are semantic references.".into(),parameters:json!({"type":"object","properties":{"method":{"type":"string","enum":["definition","references","symbols","diagnostics","hover"]},"path":{"type":"string"},"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0}},"required":["method","path","line","character"],"additionalProperties":false}),strict:false}});
+            d.push(BoundTool{canonical_id:"code.references".into(),definition:ToolDefinition{name:"code_semantic".into(),description:"Real rust-analyzer/TypeScript/Pyright query over the current isolated source. Zero-based UTF-16 line/character. No build scripts; does not claim syntactic matches are semantic references.".into(),parameters:json!({"type":"object","properties":{"method":{"type":"string","enum":["definition","references","symbols","diagnostics","hover","type_definition","implementation"]},"path":{"type":"string"},"line":{"type":"integer","minimum":0},"character":{"type":"integer","minimum":0}},"required":["method","path","line","character"],"additionalProperties":false}),strict:false}});
         }
         d
     }
@@ -505,6 +537,7 @@ pub struct CheckedEdits {
     pub store: LocalStore,
     pub task: String,
     pub checker: Option<CodeDispatcher>,
+    pub project_verifier: Option<crate::project_verification::tools::Shared>,
     pub language: Language,
     pub context: Option<Arc<Mutex<melissa_skill_context::runtime::ContextRuntime>>>,
 }
@@ -585,7 +618,7 @@ impl ToolDispatcher for CheckedEdits {
                     operation: Operation::Check {},
                     harness: None,
                 };
-                let mut child = ctx;
+                let mut child = ctx.clone();
                 child.invocation_id.push_str(":after-edit");
                 child.attempt_id.push_str(":after-edit");
                 match native
@@ -621,6 +654,51 @@ impl ToolDispatcher for CheckedEdits {
                         check["sdk"] = json!({"status":"unavailable","detail":e.to_string()});
                         check["passed"] = json!(false);
                         check["status"] = json!("BLOCKED");
+                    }
+                }
+            }
+            if check["passed"] == true
+                && let Some(host) = &self.project_verifier
+            {
+                let names = host
+                    .lock()
+                    .map_err(|_| GatewayError::invalid("verification host lock"))?
+                    .contract
+                    .verification
+                    .as_ref()
+                    .map(|v| v.after_edit.clone())
+                    .unwrap_or_default();
+                if !names.is_empty() {
+                    let mut child = ctx.clone();
+                    child.invocation_id.push_str(":project-after-edit");
+                    child.attempt_id.push_str(":project-after-edit");
+                    match crate::project_verification::tools::run_shared(
+                        host.clone(),
+                        crate::project_verification::runner::Request {
+                            names,
+                            baseline: None,
+                        },
+                        false,
+                        child,
+                        cancel.clone(),
+                    )
+                    .await
+                    {
+                        Ok(result) => {
+                            check["project"] =
+                                serde_json::from_str(&result.content).unwrap_or(Value::Null);
+                            check["passed"] =
+                                json!(result.success && !result.requires_reconciliation);
+                            check["status"] = check["project"]["outcome"].clone();
+                            check["level"] = json!("grammar_and_reviewed_project_checks");
+                            out.requires_reconciliation |= result.requires_reconciliation;
+                            out.artifact_refs.extend(result.artifact_refs);
+                        }
+                        Err(e) => {
+                            check["status"] = json!("BLOCKED");
+                            check["passed"] = json!(false);
+                            check["project"] = json!({"reason":e.message});
+                        }
                     }
                 }
             }

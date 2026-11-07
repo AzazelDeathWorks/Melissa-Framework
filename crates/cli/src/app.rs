@@ -54,7 +54,7 @@ pub struct App {
     pub(crate) key: StoreKey,
     _pin: Repository,
 }
-fn task_store_config() -> StoreConfig {
+pub(crate) fn task_store_config() -> StoreConfig {
     StoreConfig {
         max_blob_bytes: 512 * 1024 * 1024,
         max_cas_bytes: 24 * 1024 * 1024 * 1024,
@@ -230,6 +230,48 @@ impl App {
             json!({"command":"init","status":"initialized","home":home,"encryption":"DPAPI_user_key_and_authenticated_local_store","API_calls":0}),
         )
     }
+    pub(crate) fn restored_home(home: &Path, secret: &[u8; 32]) -> Result<StoreKey> {
+        safe_path(home)?;
+        fs::create_dir(home)?;
+        let key =
+            vault::import_key(&home.join("store-key.dpapi"), secret).map_err(|_| Error::Store)?;
+        fs::create_dir(home.join("tasks"))?;
+        let manifest = HomeManifest {
+            schema_version: "melissa.cli-home/v1".into(),
+            installation_id: nonce()?,
+        };
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(home.join("home.json"))?;
+        file.write_all(&bytes(&manifest)?)?;
+        file.sync_all()?;
+        Ok(key)
+    }
+    pub(crate) fn restored(&self, id: &str) -> Result<bool> {
+        validate_id(id)?;
+        let root = self.home.join("tasks").join(id);
+        let path = root.join("restore-boundary.enc");
+        match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(_) => return Err(Error::Store),
+            Ok(_) => {}
+        }
+        let repo = Repository::open(&root, Limits::default(), vec![])?;
+        let raw = repo.read("restore-boundary.enc")?.1;
+        let plain = zeroize::Zeroizing::new(
+            self.key
+                .open(&raw, format!("melissa.restore-boundary/v1:{id}").as_bytes())?,
+        );
+        let value: Value = decode(&plain)?;
+        if value["schema_version"] != "melissa.restore-boundary/v1"
+            || value["task_id"] != id
+            || value["new_task_required"] != true
+        {
+            return Err(Error::Store);
+        }
+        Ok(true)
+    }
     pub fn open(home: &Path) -> Result<Self> {
         let home = absolute(home)?;
         if !home.join("home.json").is_file() {
@@ -363,35 +405,39 @@ impl App {
                 "Frontend tarifi gerçek görsel girdi destekli model gerektirir.",
             ));
         }
-        let negative = Repository::open(
-            &absolute(&recipe.negative_workspace)?,
-            Limits::default(),
-            vec![],
-        )?;
-        if source_root.root_identity() == negative.root_identity()
-            || negative.root_path().starts_with(source_root.root_path())
-            || source_root.root_path().starts_with(negative.root_path())
-        {
-            return Err(Error::Denied(
-                "Negatif kaynak ve asıl proje tamamen ayrı olmalı.",
-            ));
-        }
-        let frozen = FrozenSource::capture(&negative, &AtomicBool::new(false))
-            .map_err(|_| Error::Repository)?;
-        let negative_files = frozen
-            .snapshot()
-            .files
-            .iter()
-            .map(|f| {
-                Ok((
-                    f.path.clone(),
-                    frozen
-                        .bytes(&f.path)
-                        .map_err(|_| Error::Repository)?
-                        .to_vec(),
-                ))
-            })
-            .collect::<Result<_>>()?;
+        let negative_files = if recipe.project.is_none() {
+            let negative = Repository::open(
+                &absolute(&recipe.negative_workspace)?,
+                Limits::default(),
+                vec![],
+            )?;
+            if source_root.root_identity() == negative.root_identity()
+                || negative.root_path().starts_with(source_root.root_path())
+                || source_root.root_path().starts_with(negative.root_path())
+            {
+                return Err(Error::Denied(
+                    "Negatif kaynak ve asıl proje tamamen ayrı olmalı.",
+                ));
+            }
+            let frozen = FrozenSource::capture(&negative, &AtomicBool::new(false))
+                .map_err(|_| Error::Repository)?;
+            frozen
+                .snapshot()
+                .files
+                .iter()
+                .map(|f| {
+                    Ok((
+                        f.path.clone(),
+                        frozen
+                            .bytes(&f.path)
+                            .map_err(|_| Error::Repository)?
+                            .to_vec(),
+                    ))
+                })
+                .collect::<Result<_>>()?
+        } else {
+            BTreeMap::new()
+        };
         let profile = recipe.agents[0].profile.clone();
         let expires_at_ms = now()?
             .checked_add(recipe.wall_time_ms)
@@ -405,6 +451,28 @@ impl App {
         };
         self.create_inner(workspace, goal, &profile, excludes, Some(execution))
     }
+    pub(crate) fn require_separate_workspace(&self, repo: &Repository) -> Result {
+        for p in self.home.ancestors() {
+            if let Ok(r) = Repository::open(p, Limits::default(), vec![])
+                && r.root_identity() == repo.root_identity()
+            {
+                return Err(Error::Denied(
+                    "CLI veri klasörü çalışma projesinin dışında olmalı.",
+                ));
+            }
+        }
+        for p in repo.root_path().ancestors() {
+            if let Ok(r) = Repository::open(p, Limits::default(), vec![])
+                && r.root_identity() == self._pin.root_identity()
+            {
+                return Err(Error::Denied(
+                    "Veri klasörünün içi kaynak projesi olarak kullanılamaz.",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn create_inner(
         &self,
         workspace: &Path,
@@ -428,24 +496,7 @@ impl App {
         let root = absolute(workspace)?;
         let limits = Limits::default();
         let repo = Repository::open(&root, limits.clone(), excludes.clone())?;
-        for p in self.home.ancestors() {
-            if let Ok(r) = Repository::open(p, Limits::default(), vec![])
-                && r.root_identity() == repo.root_identity()
-            {
-                return Err(Error::Denied(
-                    "CLI veri klasörü çalışma projesinin dışında olmalı.",
-                ));
-            }
-        }
-        for p in root.ancestors() {
-            if let Ok(r) = Repository::open(p, Limits::default(), vec![])
-                && r.root_identity() == self._pin.root_identity()
-            {
-                return Err(Error::Denied(
-                    "Veri klasörünün içi kaynak projesi olarak kullanılamaz.",
-                ));
-            }
-        }
+        self.require_separate_workspace(&repo)?;
         let frozen =
             FrozenSource::capture(&repo, &AtomicBool::new(false)).map_err(|_| Error::Repository)?;
         let id = format!("task_{}", nonce()?);
@@ -528,6 +579,13 @@ impl App {
             task.limits.max_wall_time_ms = e.recipe.wall_time_ms;
             task.acceptance_criteria=vec!["Independent source-bound protected suite with rejected negative control; no unknown effects; exact final artifact and recorded candidate".into()];
             task.acceptance_contract_digest = e.recipe.acceptance_digest()?;
+            if let Some(project) = &e.recipe.project {
+                if project.extensions.is_some() {
+                    task.allowed_effects.push("extensions.use_scoped".into());
+                }
+                task.acceptance_criteria=vec!["Host executes the approved project checks on exact final source in the approved environment; native receipts, stopped workers and no unknown effects required. Public project checks are not a private oracle or release acceptance.".into()];
+                task.limits.max_disk_bytes = project.environment.limits.disk_bytes;
+            }
         }
         let dir = self.home.join("tasks").join(&id);
         fs::create_dir(&dir)?;
@@ -600,13 +658,16 @@ impl App {
         let request: Approval = decode(&s.get_artifact(id, APPROVAL)?)?;
         let mut value = json!({"command":"task show","task_id":id,"state":t.record.state,"version":t.record.version,"goal":t.contract.goal,"profile":t.contract.selected_profile_ids,"workspace":w.root,"source_digest":t.contract.input_snapshot_digest,"source_files":w.snapshot.files.len(),"excluded_prefixes":w.snapshot.excluded_prefixes,"approval":{"request_id":request.request_id,"digest":digest(&bytes(&request)?),"meaning":request.meaning,"pending":t.record.state==TaskState::AwaitingApproval},"model_budget":s.journal().model_budget(id)?,"task_accepted":t.record.state==TaskState::Completed,"execution_backend":"not_connected_in_first_CLI_slice"});
         if let Some(e) = self.execution(s, id)? {
-            value["execution_backend"] =
-                json!("Gateway_workflow_scoped_repository_CODE03_protected_QA");
+            value["execution_backend"] = json!(if e.recipe.project.is_some() {
+                "Gateway_workflow_project_environment_checks"
+            } else {
+                "Gateway_workflow_scoped_repository_CODE03_protected_QA"
+            });
             value["execution_plan"] = e.recipe.public_plan();
             value["execution_plan"]["verification"] =
                 crate::verification::Policy::for_recipe(&e.recipe).plan(&e.recipe);
             value["execution_plan"]["timing"] = json!({"task_wall_time_ms":e.recipe.wall_time_ms,
-                "task_deadline_ms":e.expires_at_ms,"default_sdk_tool_wall_time_ms":crate::development::limits().wall_time_ms});
+                "task_deadline_ms":e.expires_at_ms,"default_sdk_tool_wall_time_ms":crate::development::limits().wall_time_ms,"project_tool_wall_time_ms":e.recipe.project.as_ref().map(|p|p.environment.limits.wall_time_ms)});
             value["settings_digest"] = json!(e.settings_digest);
             if let Ok(settings) = self.settings()
                 && settings.digest()? == e.settings_digest
@@ -617,6 +678,12 @@ impl App {
             value["runtime_digest"] = json!(e.runtime_digest);
             if let Ok(control) = self.live(id) {
                 value["phase"] = json!(control.phase);
+            }
+        }
+        if self.conversation(id)?.is_some() {
+            value["conversation"] = self.conversation_view(id)?;
+            if !value["execution_plan"].is_object() {
+                value["execution_backend"] = json!("project_preparation_only");
             }
         }
         Ok(value)

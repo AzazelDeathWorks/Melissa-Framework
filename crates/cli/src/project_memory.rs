@@ -377,6 +377,28 @@ impl ProjectMemory {
 }
 
 impl App {
+    #[cfg(windows)]
+    pub(crate) fn recall_project_memory(
+        &self,
+        workspace: &Path,
+        query: &str,
+        task: &str,
+    ) -> Result<Value> {
+        if query.len() > 16384 {
+            return Err(Error::Usage("Bellek sorgusu çok uzun."));
+        }
+        let repo = Repository::open(workspace, Limits::default(), vec![])?;
+        let ns = namespace(&repo);
+        let memory = ProjectMemory::open(&self.home, self.key.clone(), &repo)?;
+        let time = now()?;
+        let scope = observed(&repo, &ns, &memory.book, time)?.scope(&ns, time);
+        let git = melissa_repository::git_context::observe(&repo);
+        let records =
+            memory
+                .book
+                .search_context(&scope, query, task, &git, time, repo.source_visibility());
+        Ok(json!({"records":records,"only_accepted_fresh_visible_records":true,"model_calls":0}))
+    }
     pub fn memory(
         &self,
         workspace: &Path,
@@ -396,6 +418,20 @@ impl App {
                 .records()
                 .get(id)
                 .ok_or(Error::Usage("Bellek bulunamadı."))?;
+            if action == "accept"
+                && record.metadata.as_ref().is_some_and(|m| {
+                    m.withheld(
+                        &m.task_id,
+                        &melissa_repository::git_context::observe(&repo),
+                        time,
+                    )
+                    .is_some()
+                })
+            {
+                return Err(Error::Conflict(
+                    "Bellek branch/süre bağlamı eski; güncel kaynakla yeni öneri oluştur.",
+                ));
+            }
             let supersedes = project
                 .book
                 .records()
@@ -456,7 +492,7 @@ impl App {
         project.save(&ns)?;
         let review_digest = review_digest(&project.book)?;
         // The listing exposes source identities and digests only.
-        let records=project.book.records().values().map(|r|json!({"id":r.id,"key":r.key,"claim":r.claim,"status":r.status,"sources":r.sources.iter().map(|s|json!({"path":s.id,"digest":s.digest})).collect::<Vec<_>>()})).collect::<Vec<_>>();
+        let records=project.book.records().values().map(|r|json!({"id":r.id,"key":r.key,"claim":r.claim,"status":r.status,"metadata":r.metadata,"legacy_provenance_unknown":r.metadata.is_none(),"context_withheld_reason":r.metadata.as_ref().and_then(|m|m.withheld("operator-list",&melissa_repository::git_context::observe(&repo),now().unwrap_or(u64::MAX))),"conflicts_with":project.book.records().values().filter(|other|other.id!=r.id&&other.key==r.key&&matches!(other.status,melissa_skill_context::state::MemoryStatus::Accepted|melissa_skill_context::state::MemoryStatus::Proposed)).map(|other|&other.id).collect::<Vec<_>>(),"sources":r.sources.iter().map(|s|json!({"path":s.id,"digest":s.digest,"version":s.version,"observed_at_ms":s.observed_at_ms,"valid_until_ms":s.valid_until_ms})).collect::<Vec<_>>()})).collect::<Vec<_>>();
         Ok(
             json!({"command":"memory","action":action,"project":ns.project,"records":records,"review_digest":review_digest,"model_calls":0,"forget_semantics":"excluded from retrieval; encrypted historical audit is retained"}),
         )

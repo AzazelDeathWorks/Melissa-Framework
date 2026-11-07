@@ -1,0 +1,46 @@
+{
+  "mcp": {
+    "reviewed-server": {
+      "connection": {
+        "transport": "http",
+        "endpoint": {
+          "url": "https://mcp.example.invalid/mcp",
+          "auth_env": "MELISSA_MCP_TOKEN",
+          "loopback": false,
+          "timeout_ms": 60000,
+          "max_bytes": 2097152
+        }
+      },
+      "protocol_version": "2026-07-28",
+      "tools": {
+        "lookup": {
+          "description": "Replace with the server's reviewed tool name and exact schema",
+          "input_schema": {
+            "type": "object",
+            "properties": { "query": { "type": "string" } },
+            "required": ["query"],
+            "additionalProperties": false
+          },
+          "writes": false
+        }
+      }
+    }
+  },
+  "docs": {},
+  "hooks": [
+    {
+      "id": "root-python-syntax-example",
+      "event": "after_mutation",
+      "tools": ["fs_patch", "fs_create"],
+      "helper": {
+        "command": {
+          "executable": "python",
+          "argv": ["-I", "-c", "import ast,pathlib; files=list(pathlib.Path('.').glob('*.py')); [ast.parse(p.read_text(encoding='utf-8-sig'),filename=str(p)) for p in files]; print('Root Python files checked:',len(files))"],
+          "cwd": "."
+        },
+        "skill": null
+      }
+    }
+  ],
+  "helpers": {}
+}

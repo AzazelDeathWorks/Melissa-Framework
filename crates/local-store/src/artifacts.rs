@@ -469,3 +469,52 @@ fn artifact_on(
     }
     Ok(metadata)
 }
+
+/// Read-only retention eligibility from the same permanent-reference rules as GC.
+#[derive(Debug, Serialize)]
+pub struct RetentionEntry {
+    pub artifact: ArtifactMetadata,
+    pub reference_count: u64,
+    pub checkpoint_references: u64,
+    pub invocation_references: u64,
+    pub eligible: bool,
+}
+impl LocalStore {
+    pub fn retention_preview(&self, task_id: &str, time: u64) -> StoreResult<Vec<RetentionEntry>> {
+        integer(time)?;
+        let _guard = self.file_guard()?;
+        let task = self.journal.task(task_id)?;
+        self.journal.integrity_check()?;
+        self.list_artifacts(task_id)?
+            .into_iter()
+            .map(|artifact| {
+                let count = |sql: &str| -> StoreResult<u64> {
+                    Ok(self
+                        .journal
+                        .conn
+                        .query_row(sql, [&artifact.artifact_id], |r| r.get(0))?)
+                };
+                let reference_count =
+                    count("SELECT count(*) FROM artifact_refs WHERE artifact_id=?1")?;
+                let checkpoint_references =
+                    count("SELECT count(*) FROM checkpoints WHERE artifact_id=?1")?;
+                let invocation_references =
+                    count("SELECT count(*) FROM invocations WHERE result_artifact_id=?1")?;
+                let eligible = task.record.state.is_terminal()
+                    && !artifact.legal_hold
+                    && artifact.retain_until_ms <= time
+                    && reference_count == 0
+                    && checkpoint_references == 0
+                    && invocation_references == 0
+                    && task.record.final_artifact_digest.as_deref() != Some(&artifact.digest);
+                Ok(RetentionEntry {
+                    artifact,
+                    reference_count,
+                    checkpoint_references,
+                    invocation_references,
+                    eligible,
+                })
+            })
+            .collect()
+    }
+}

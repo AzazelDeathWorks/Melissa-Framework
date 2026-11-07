@@ -65,6 +65,15 @@ impl std::fmt::Debug for ToolExecution {
 pub trait ToolDispatcher: Send {
     fn definitions(&self) -> Vec<BoundTool>;
     fn validate_call(&self, call: &ToolCall) -> Result<()>;
+    /// Host provenance only. Implementations must not derive this from arguments.
+    fn adapter_metadata(&self, _cancelled: &AtomicBool) -> Result<crate::adapter::AdapterMetadata> {
+        Ok(crate::adapter::AdapterMetadata::default())
+    }
+    /// Fresh host-owned guidance or operator steering, sampled only between
+    /// settled tool batches. Content is context, never an authorization grant.
+    fn turn_context(&self, _cancelled: &AtomicBool) -> Result<Option<String>> {
+        Ok(None)
+    }
     fn execute<'a>(
         &'a mut self,
         call: ToolCall,

@@ -84,7 +84,12 @@ impl OutputCapabilityRegistration {
         {
             return Err(GatewayError::invalid("output capability endpoint identity"));
         }
-        if self.json_object && self.protocol != Protocol::OpenAiResponses {
+        if self.json_object
+            && !matches!(
+                self.protocol,
+                Protocol::OpenAiResponses | Protocol::OpenAiChatCompletions
+            )
+        {
             return Err(GatewayError::unsupported(
                 "JSON-object adapter requires Responses",
             ));

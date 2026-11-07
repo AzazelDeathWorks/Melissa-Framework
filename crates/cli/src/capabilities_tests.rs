@@ -491,6 +491,7 @@ async fn html_only_edits_do_not_invent_a_python_check_and_strict_git_rejects_ext
         store: f.store.connect().unwrap(),
         task: f.task.task_id.clone(),
         checker: None,
+        project_verifier: None,
         language: melissa_build_test::full::Language::Python,
     };
     let preview=f.call(&mut d,"code_unified_propose",json!({"patch":"--- a/index.html\n+++ b/index.html\n@@ -1 +1 @@\n-<p>old</p>\n+<p>new</p>\n"}),"html-preview").await;
@@ -560,6 +561,7 @@ async fn post_edit_check_or_receipt_failure_preserves_the_applied_mutation() {
                 f.task.task_id.clone()
             },
             checker: if fail_receipt { None } else { semantic_only },
+            project_verifier: None,
             language: melissa_build_test::full::Language::Python,
         };
         let preview = f.call(&mut d, "code_unified_propose", json!({"patch":"--- a/main.py\n+++ b/main.py\n@@ -1,2 +1,2 @@\n def double(x):\n-    return x * 2\n+    return x + x\n"}), "check-failure-preview").await;
@@ -880,6 +882,7 @@ async fn native_cli_after_edit_reports_invalid_regex_without_replaying_or_undoin
         store: f.store.connect().unwrap(),
         task: f.task.task_id.clone(),
         checker: f.development().code,
+        project_verifier: None,
         language: melissa_build_test::full::Language::JavaScript,
     };
     let preview=f.call(&mut d,"code_unified_propose",json!({"patch":"--- a/main.js\n+++ b/main.js\n@@ -1 +1 @@\n-const pattern = /ok/;\n+const pattern = /(/;\n"}),"regex-preview").await;
@@ -967,6 +970,7 @@ async fn native_cli_git_is_fresh_read_only_and_worktree_is_private() {
         store: f.store.connect().unwrap(),
         task: f.task.task_id.clone(),
         checker: None,
+        project_verifier: None,
         language: melissa_build_test::full::Language::Python,
         context: Some(host),
     };

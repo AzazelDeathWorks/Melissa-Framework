@@ -150,6 +150,9 @@ pub fn state_message(state: &TurnState) -> Result<Message> {
 pub fn opaque_continuation(response: &crate::ModelResponse) -> bool {
     response.continuation.iter().any(|item| {
         let allowed: &[&str] = match (response.protocol, item["type"].as_str()) {
+            (crate::Protocol::OpenAiChatCompletions, None) => {
+                &["role", "content", "tool_calls", "refusal"]
+            }
             (crate::Protocol::OpenAiResponses, Some("function_call")) => {
                 &["type", "id", "call_id", "name", "arguments", "status"]
             }

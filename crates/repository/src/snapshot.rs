@@ -9,6 +9,7 @@ use std::{
     io::{Read, Seek, SeekFrom},
     path::Path,
     sync::atomic::AtomicBool,
+    sync::{Arc, Mutex},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,9 +25,9 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_files: 10_000,
+            max_files: 50_000,
             max_file_bytes: 8 * 1024 * 1024,
-            max_total_bytes: 128 * 1024 * 1024,
+            max_total_bytes: 256 * 1024 * 1024,
             max_patch_files: 128,
             max_edits: 4096,
             max_search_hits: 1000,
@@ -109,6 +110,21 @@ pub struct SearchResult {
 pub struct WorkerInput {
     pub source_snapshot_digest: String,
     pub snapshot: melissa_container_executor::Snapshot,
+    pub materialization: Materialization,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Materialization {
+    pub source_bytes_read: u64,
+    pub source_bytes_reused: u64,
+    pub transfer_bytes: u64,
+    pub files: usize,
+}
+#[derive(Default)]
+struct SourceCache {
+    versions: BTreeMap<String, IndexedFileVersion>,
+    bodies: BTreeMap<String, Vec<u8>>,
+    last_read: u64,
 }
 
 pub struct Repository {
@@ -116,6 +132,7 @@ pub struct Repository {
     pub(crate) limits: Limits,
     visibility: crate::SourceVisibilityPolicy,
     package_capture: bool,
+    cache: Arc<Mutex<SourceCache>>,
 }
 impl Repository {
     /// Host-selected workspace. Does not run Git, build scripts, hooks or tools.
@@ -131,12 +148,33 @@ impl Repository {
         Ok(Self {
             root: paths::pin_root(root)?,
             limits,
-            visibility: crate::SourceVisibilityPolicy::new(excluded)?,
+            visibility: crate::SourceVisibilityPolicy::source(excluded, vec![])?,
             package_capture: false,
+            cache: Arc::default(),
         })
     }
     pub fn root_path(&self) -> &Path {
         &self.root.canonical
+    }
+    /// Host-selected source policy; exceptions must be reviewed with the task.
+    pub fn open_with_source_policy(
+        root: &Path,
+        limits: Limits,
+        policy: crate::SourceVisibilityPolicy,
+    ) -> Result<Self> {
+        limits.validate()?;
+        if !policy.protects_sensitive_paths() {
+            return Err(Error::Invalid(
+                "source policy must enable sensitive defaults",
+            ));
+        }
+        Ok(Self {
+            root: paths::pin_root(root)?,
+            limits,
+            visibility: policy,
+            package_capture: false,
+            cache: Arc::default(),
+        })
     }
     /// Independent handle with the exact same source visibility and envelope.
     /// A domain worker must not accidentally re-include operator exclusions.
@@ -150,6 +188,7 @@ impl Repository {
             limits: self.limits.clone(),
             visibility: self.visibility.clone(),
             package_capture: self.package_capture,
+            cache: self.cache.clone(),
         })
     }
     /// Exact bounded worktree capture for Git: no generated/ignored exclusions.
@@ -162,10 +201,12 @@ impl Repository {
             limits,
             visibility: crate::SourceVisibilityPolicy::new(vec![".git".into()])?,
             package_capture: false,
+            cache: Arc::default(),
         })
     }
     /// Complete package file capture: generated/runtime directories are part
-    /// of the artifact. Git metadata is rejected instead of silently omitted.
+    /// of the artifact. Git metadata and sensitive paths are rejected instead
+    /// of silently omitting files and misrepresenting package integrity.
     /// Existing source/Git capture policies retain their original behavior.
     pub fn open_for_package(root: &Path, limits: Limits) -> Result<Self> {
         limits.validate()?;
@@ -174,6 +215,7 @@ impl Repository {
             limits,
             visibility: crate::SourceVisibilityPolicy::new(vec![])?,
             package_capture: true,
+            cache: Arc::default(),
         })
     }
     pub fn root_identity(&self) -> &str {
@@ -183,7 +225,8 @@ impl Repository {
         &self.limits
     }
     pub(crate) fn check_path(&self, path: &str) -> Result {
-        self.visibility.check(path)
+        self.visibility.check(path)?;
+        crate::source_ignore::check(self, path)
     }
     pub fn source_visibility(&self) -> &crate::SourceVisibilityPolicy {
         &self.visibility
@@ -191,9 +234,10 @@ impl Repository {
     /// Binds historical model-visible results to the same root and policy.
     pub fn source_visibility_digest(&self) -> Result<String> {
         Ok(digest(&serde_json::to_vec(&(
-            "melissa.source-visibility/v1",
+            "melissa.source-visibility/v2",
             self.root_identity(),
-            self.visibility.excluded_prefixes(),
+            self.visibility.policy_digest_material(),
+            crate::source_ignore::policy_digest(self)?,
         ))?))
     }
     pub(crate) fn lock(&self, path: &str, write: bool) -> Result<Pinned> {
@@ -288,10 +332,16 @@ impl Repository {
             .map(Some)
     }
     pub fn snapshot(&self, cancel: &AtomicBool) -> Result<RepositorySnapshot> {
-        self.capture(cancel, |path, pin| {
-            self.read_locked_with_cancel(pin, path, Some(cancel))
-                .map(|(version, _)| version)
-        })
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| Error::Denied("source cache lock"))?;
+        let scan = self.scan_index(&cache.versions, cancel)?;
+        cache.bodies.retain(|p, _| scan.files.contains_key(p));
+        cache.bodies.extend(scan.changed_bytes);
+        cache.versions = scan.files;
+        cache.last_read = scan.bytes_read;
+        Ok(scan.snapshot)
     }
 
     /// Recheck the visible tree using the same pinned path admission as a
@@ -409,6 +459,7 @@ impl Repository {
         self.visit(
             &self.root,
             "",
+            &crate::source_ignore::Rules::default(),
             &mut seen,
             &mut entries,
             cancel,
@@ -425,11 +476,22 @@ impl Repository {
             },
         )?;
         files.sort_by(|a, b| a.path.cmp(&b.path));
-        let seal = digest(&serde_json::to_vec(&(
-            self.root_identity(),
-            &files,
-            self.visibility.excluded_prefixes(),
-        ))?);
+        // Preserve legacy snapshot seals when there are no active ignore
+        // inputs. Changed source visibility still requires fresh review.
+        let seal = if let Some(ignore) = crate::source_ignore::policy_digest(self)? {
+            digest(&serde_json::to_vec(&(
+                self.root_identity(),
+                &files,
+                self.visibility.excluded_prefixes(),
+                ignore,
+            ))?)
+        } else {
+            digest(&serde_json::to_vec(&(
+                self.root_identity(),
+                &files,
+                self.visibility.excluded_prefixes(),
+            ))?)
+        };
         Ok(RepositorySnapshot {
             schema_version: "melissa.repository-snapshot/v1".into(),
             root_identity: self.root.identity.clone(),
@@ -440,22 +502,21 @@ impl Repository {
             excluded_prefixes: self.visibility.excluded_prefixes().to_vec(),
         })
     }
+    #[allow(clippy::too_many_arguments)] // One pinned recursive traversal and its inherited ignore state.
     fn visit(
         &self,
         parent: &Pinned,
         relative: &str,
+        inherited: &crate::source_ignore::Rules,
         seen: &mut BTreeSet<String>,
         entries: &mut usize,
         cancel: &AtomicBool,
         file: &mut impl FnMut(&str, &mut Pinned) -> Result,
     ) -> Result {
         check_cancel(cancel)?;
+        let rules = inherited.enter(self, relative)?;
         for entry in fs::read_dir(&parent.canonical)? {
             check_cancel(cancel)?;
-            *entries += 1;
-            if *entries > self.limits.max_files {
-                return Err(Error::Quota("directory and file entry count"));
-            }
             let entry = entry?;
             let name = entry
                 .file_name()
@@ -467,22 +528,34 @@ impl Repository {
                 format!("{relative}/{name}")
             };
             paths::relative(&child)?;
+            if self.package_capture && crate::SourceVisibilityPolicy::sensitive_path(&child) {
+                return Err(Error::Denied("package contains a sensitive path"));
+            }
             if child.split('/').any(|s| s.eq_ignore_ascii_case(".git")) {
                 if self.package_capture {
                     return Err(Error::Denied("package contains Git metadata"));
                 }
                 continue;
             }
-            if !self.visibility.allows(&child) {
+            let kind = entry.file_type()?;
+            if !self.visibility.allows(&child)
+                && !(kind.is_dir() && self.visibility.permits_traversal(&child))
+            {
                 continue;
+            }
+            if rules.excludes(self, &child, kind.is_dir()) {
+                continue;
+            }
+            *entries += 1;
+            if *entries > self.limits.max_files {
+                return Err(Error::Quota("visible directory and file entry count"));
             }
             if !seen.insert(paths::key(&child)) {
                 return Err(Error::Denied("case-colliding paths"));
             }
-            let kind = entry.file_type()?;
             paths::with_read_child(parent, &name, kind.is_dir(), |pin| {
                 if kind.is_dir() {
-                    self.visit(pin, &child, seen, entries, cancel, file)
+                    self.visit(pin, &child, &rules, seen, entries, cancel, file)
                 } else {
                     file(&child, pin)
                 }
@@ -519,13 +592,37 @@ impl Repository {
             source.files.iter().map(|f| (f.path.as_str(), f.bytes)), bytes_limit,
         ).map_err(|_| Error::Quota("worker transfer preflight: file count, bytes, reserved path or ustar path capacity"))?;
         let mut files = std::collections::BTreeMap::new();
-        for f in &source.files {
-            let (current, bytes) = self.read_cancellable(&f.path, cancel)?;
-            if current != *f {
-                return Err(Error::Stale("worker snapshot source changed"));
-            }
-            files.insert(f.path.clone(), bytes);
+        // Revalidate journal/identity receipts before using cached bodies. A
+        // timestamp alone is never sufficient. Other filesystems re-read.
+        let current_source = self.snapshot(cancel)?;
+        if current_source != *source {
+            return Err(Error::Stale("worker snapshot source changed"));
         }
+        let cache = self
+            .cache
+            .lock()
+            .map_err(|_| Error::Denied("source cache lock"))?;
+        let mut materialization = Materialization {
+            source_bytes_read: cache.last_read,
+            files: source.files.len(),
+            transfer_bytes: source.total_bytes,
+            ..Default::default()
+        };
+        for f in &source.files {
+            check_cancel(cancel)?;
+            let bytes = cache
+                .bodies
+                .get(&f.path)
+                .ok_or(Error::Stale("source cache body missing"))?;
+            if digest(bytes) != f.digest {
+                return Err(Error::Stale("source cache digest"));
+            }
+            files.insert(f.path.clone(), bytes.clone());
+        }
+        materialization.source_bytes_reused = source
+            .total_bytes
+            .saturating_sub(materialization.source_bytes_read);
+        drop(cache);
         let snapshot = melissa_container_executor::Snapshot { files };
         snapshot
             .validate(bytes_limit)
@@ -534,6 +631,7 @@ impl Repository {
         Ok(WorkerInput {
             source_snapshot_digest: source.digest.clone(),
             snapshot,
+            materialization,
         })
     }
     /// Byte-literal search; matches carry the exact file and snapshot digest.

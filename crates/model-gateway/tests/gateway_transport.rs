@@ -233,13 +233,29 @@ async fn both_actual_http_protocols_preserve_fragmented_unicode_and_authenticati
         plan.chunked = true;
         let fixture = fixture(plan).await;
         let endpoint = endpoint(protocol, &fixture.url);
-        let result = generate(
-            &endpoint,
-            3000,
-            DecoderLimits::default(),
-            Arc::new(AtomicBool::new(false)),
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let copy = observed.clone();
+        let observer: melissa_model_gateway::visible_stream::Observer =
+            Arc::new(move |d| copy.lock().unwrap().push(d));
+        let result = melissa_model_gateway::visible_stream::observe(
+            observer,
+            generate(
+                &endpoint,
+                3000,
+                DecoderLimits::default(),
+                Arc::new(AtomicBool::new(false)),
+            ),
         )
         .await;
+        assert_eq!(
+            observed
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|d| d.text.as_str())
+                .collect::<String>(),
+            "ş😀"
+        );
         assert!(
             result.error.is_none(),
             "sanitized result: {:?}",
@@ -259,7 +275,7 @@ async fn both_actual_http_protocols_preserve_fragmented_unicode_and_authenticati
                 assert!(lower.contains("anthropic-version: 2023-06-01"));
                 assert!(!lower.contains("authorization:"));
             }
-            Protocol::OpenAiResponses => {
+            Protocol::OpenAiResponses | Protocol::OpenAiChatCompletions => {
                 assert!(lower.contains("authorization: bearer local_fixture_credential"));
                 assert!(!lower.contains("x-api-key:"));
             }

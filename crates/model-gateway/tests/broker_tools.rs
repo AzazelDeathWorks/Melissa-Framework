@@ -69,6 +69,7 @@ fn fixture(script: &str, store_config: StoreConfig, rust: bool) -> Fixture {
         }
     });
     let request = ContainerRequest {
+        backend: Default::default(),
         schema_version: "melissa.container-exec/v1".into(),
         image_id: IMAGE.into(),
         executable: "/bin/sh".into(),
