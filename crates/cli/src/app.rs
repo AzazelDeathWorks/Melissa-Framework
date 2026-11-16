@@ -109,9 +109,25 @@ pub fn default_home() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("MELISSA_HOME") {
         return absolute(Path::new(&path));
     }
-    let base = std::env::var_os("LOCALAPPDATA")
-        .ok_or(Error::Usage("--home PATH veya MELISSA_HOME gerekli."))?;
-    absolute(&PathBuf::from(base).join("Melissa/cli-v1"))
+    let missing = Error::Usage("--home PATH veya MELISSA_HOME gerekli.");
+    let var = |name| {
+        std::env::var_os(name)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    let base = if cfg!(windows) {
+        var("LOCALAPPDATA").ok_or(missing)?
+    } else if cfg!(target_os = "macos") {
+        var("HOME")
+            .ok_or(missing)?
+            .join("Library/Application Support")
+    } else {
+        var("XDG_DATA_HOME")
+            .filter(|p| p.is_absolute())
+            .or_else(|| var("HOME").map(|h| h.join(".local/share")))
+            .ok_or(missing)?
+    };
+    absolute(&base.join("Melissa/cli-v1"))
 }
 pub fn absolute(path: &Path) -> Result<PathBuf> {
     if path
@@ -246,7 +262,7 @@ impl App {
         file.write_all(&bytes(&m)?)?;
         file.sync_all()?;
         Ok(
-            json!({"command":"init","status":"initialized","home":home,"encryption":"DPAPI_user_key_and_authenticated_local_store","API_calls":0}),
+            json!({"command":"init","status":"initialized","home":home,"encryption":if cfg!(windows) {"DPAPI_user_key_and_authenticated_local_store"} else {"owner_only_key_file_and_authenticated_local_store"},"API_calls":0}),
         )
     }
     pub(crate) fn restored_home(home: &Path, secret: &[u8; 32]) -> Result<StoreKey> {
