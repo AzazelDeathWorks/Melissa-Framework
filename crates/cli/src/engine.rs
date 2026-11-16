@@ -2817,6 +2817,10 @@ fn mirror_qa(root: &mut LocalStore, parent: &str, qa: &ProtectedQa) -> Result {
 mod tests {
     /// macOS temp dirs sit under the /var symlink, which the stores reject.
     fn canonical_tempdir() -> tempfile::TempDir {
+        if cfg!(windows) {
+            // canonicalize yields a \\?\ verbatim path that the stores refuse.
+            return tempfile::tempdir().unwrap();
+        }
         tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap()
     }
     use super::*;
