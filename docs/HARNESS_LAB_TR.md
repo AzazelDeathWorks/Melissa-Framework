@@ -112,3 +112,35 @@ ve I/O aktarım sayaçlarını kapsar. Diskin fiziksel okuma ve yazma değerleri
 worker veya uzak model RAM’i bu sayaçlardan türetilmez. Pilot sonuçları kendi
 vaka kapsamıyla yorumlanır. Değişiklik kabulü için tekrarlanabilir sonuçlar,
 güvenlik ve kurtarma regresyonları ve insan incelemesi gerekir.
+
+## Düzenleme yüzeyi canlı karşılaştırması
+
+`crates/repository/tests/live_provider.rs` içindeki `live_edit_tool_ab`
+aynı model, aynı 8 küçük vaka ve aynı görev metniyle üç düzenleme yüzeyini
+karşılaştırır. Değişen tek şey modele sunulan araçlardır:
+
+| Kol | Araçlar |
+|---|---|
+| `fs_replace` | `fs_read`, `fs_replace` (düz metin bul-değiştir) |
+| `fs_patch` | `fs_read`, `fs_snapshot`, `fs_patch` (bayt ofsetli yerel öneri) |
+| `unified` | `fs_read`, `code_unified_propose`, taşınabilir `fs_patch` (CLI tarifi yolu) |
+
+Her deneme taze çalışma alanı ve depo kullanır. Dağıtıcı CLI motoruyla aynı
+kurtarma gözlemlerini açar. Korumalı dosya değişirse test durur. Kol sırası
+vaka ve tekrar başına döner. Testler varsayılan olarak kapalıdır ve gerçek
+token harcar:
+
+```bash
+MELISSA_LIVE_ENDPOINT=https://host/v1/chat/completions \
+MELISSA_LIVE_PROTOCOL=open_ai_chat_completions \
+MELISSA_LIVE_MODEL=model-id MELISSA_LIVE_API_KEY=... \
+MELISSA_LIVE_OUT=edit_ab.jsonl MELISSA_LIVE_REPS=5 \
+cargo test -p melissa-repository --test live_provider live_edit_tool_ab -- --ignored
+python3 tools/edit_ab_stats.py edit_ab.jsonl --baseline fs_patch --treatment fs_replace
+```
+
+`MELISSA_LIVE_CASES` ve `MELISSA_LIVE_ARMS` virgülle ayrılmış kimliklerle
+alt küme seçer. İstatistik betiği kol başına Wilson %95 aralığı, eşleşmiş
+başarı için kesin McNemar testi ve token, istek ve süre farkları için eşleşmiş
+bootstrap %95 aralığı verir. Küçük sentetik vakalar gerçek depo görevlerinin
+yerine geçmez.

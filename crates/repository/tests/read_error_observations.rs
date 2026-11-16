@@ -428,3 +428,55 @@ async fn read_feedback_mode_keeps_denials_and_post_write_evidence_failure_fail_c
     );
     assert!(dispatcher.definitions().is_empty());
 }
+
+#[tokio::test]
+async fn text_replacement_miss_is_feedback_but_protected_target_stays_denied() {
+    let (_temp, repo, store, policy) = support::fixture(&["f.txt"]);
+    let root = repo.root_path().to_owned();
+    fs::write(root.join("f.txt"), b"old\r\n").unwrap();
+    fs::write(root.join("other.txt"), b"keep\n").unwrap();
+    let mut dispatcher = RepositoryDispatcher::new(
+        repo,
+        store,
+        RepositoryToolPolicy {
+            files: policy,
+            read_repository: true,
+            enabled_tools: ["fs_replace"].map(String::from).into(),
+        },
+    )
+    .unwrap()
+    .with_read_error_observations()
+    .unwrap();
+    let miss = call(
+        &mut dispatcher,
+        "fs_replace",
+        json!({"path":"f.txt","old_text":"old\\r","new_text":"new\\r"}),
+        "miss",
+    )
+    .await
+    .unwrap();
+    assert!(!miss.success && !miss.requires_reconciliation);
+    let v: Value = serde_json::from_str(&miss.content).unwrap();
+    assert_eq!(v["status"], "replace_input_rejected");
+    assert_eq!(v["workspace_write_dispatched"], false);
+    assert_eq!(fs::read(root.join("f.txt")).unwrap(), b"old\r\n");
+    let denied = call(
+        &mut dispatcher,
+        "fs_replace",
+        json!({"path":"other.txt","old_text":"keep","new_text":"x"}),
+        "outside-scope",
+    )
+    .await;
+    assert!(denied.is_err(), "write scope denial must stay fail-closed");
+    assert_eq!(fs::read(root.join("other.txt")).unwrap(), b"keep\n");
+    let fixed = call(
+        &mut dispatcher,
+        "fs_replace",
+        json!({"path":"f.txt","old_text":"old","new_text":"new"}),
+        "fixed",
+    )
+    .await
+    .unwrap();
+    assert!(fixed.success, "{}", fixed.content);
+    assert_eq!(fs::read(root.join("f.txt")).unwrap(), b"new\r\n");
+}
