@@ -40,6 +40,7 @@ worker'lar arasında delta aktarımı veya kalıcı konteyner cache'i uygulanmaz
 | `code_structural_search` | Rust/Python/JavaScript/TypeScript/TSX içinde ast-grep 0.51.1 yapısal eşleşmeleri; seçili dosyaların tam sürümleri. |
 | `code_structural_propose` | `pattern` ve `rewrite` ile tam preimage bağlı çok dosyalı öneri. Kendi başına yazmaz. |
 | `fs_patch` | Mevcut görev/profil/dosya izni, kesin kaynak sürümü ve byte doğrulamasıyla öneriyi uygular. |
+| `fs_replace` | `path`, `old_text`, `new_text` ile metin değiştirir. Eşleşme tek olmalı (veya `replace_all`); host düzenlemeyi dosyanın güncel sürümüne bağlayıp `fs_patch` yolundan uygular. LF metin CRLF dosyada da eşleşir. |
 | `fs_artifact_page` | Büyük araç sonucunu özet işaretçisinden son baytına kadar okur. Kaynak hash'i olan kanıtta CURRENT/STALE, diğerinde UNKNOWN güncelliği döner. |
 
 TypeScript'te yakalanan tsconfig, extends, project references ve paths alias
