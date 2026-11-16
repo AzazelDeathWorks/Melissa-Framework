@@ -277,13 +277,25 @@ pub(super) fn delete(source: Pinned) -> Result {
     getrandom::fill(&mut nonce).map_err(|_| Error::Denied("host entropy unavailable"))?;
     let aside: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
     let aside = OsString::from(format!(".melissa-delete-{aside}"));
-    rename_no_replace(parent, name, parent, &aside, &held)?;
+    match rename_no_replace(parent, name, parent, &aside, &held) {
+        // Directory without no-replace rename: rmdir by the confirmed name.
+        Err(Error::Unsupported(_)) if flags == AtFlags::REMOVEDIR => {
+            rfs::unlinkat(parent, name, flags).map_err(errno)?;
+            drop(source);
+            return Ok(());
+        }
+        r => r?,
+    }
     let moved = rfs::statat(parent, &aside, AtFlags::SYMLINK_NOFOLLOW).map_err(errno)?;
     if !same(&held, &moved) {
         let _ = rename_no_replace(parent, &aside, parent, name, &moved);
         return Err(Error::Stale("deleted object identity changed"));
     }
-    rfs::unlinkat(parent, &aside, flags).map_err(errno)?;
+    if let Err(e) = rfs::unlinkat(parent, &aside, flags) {
+        // E.g. a directory that gained an entry: restore the original name.
+        let _ = rename_no_replace(parent, &aside, parent, name, &moved);
+        return Err(errno(e));
+    }
     drop(source);
     Ok(())
 }
