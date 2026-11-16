@@ -84,7 +84,9 @@ impl Client {
         if let Ok(meta) = std::fs::symlink_metadata(&client.path) {
             use std::os::unix::fs::FileTypeExt;
             if !meta.file_type().is_socket() || meta.uid() != uid() {
-                return Err(Error::Denied("Yerel arayüz soket yolu beklenmeyen bir dosya."));
+                return Err(Error::Denied(
+                    "Yerel arayüz soket yolu beklenmeyen bir dosya.",
+                ));
             }
             std::fs::remove_file(&client.path)?;
         }

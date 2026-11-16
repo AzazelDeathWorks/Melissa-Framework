@@ -109,8 +109,13 @@ pub(crate) fn pin_client_mode(
         .split_last()
         .ok_or_else(|| fail("Docker client path"))?;
     for part in parents {
-        let next = openat(ancestors.last().expect("root").as_fd(), part, dir, Mode::empty())
-            .map_err(|_| fail("Docker client path has a linked or non-directory ancestor"))?;
+        let next = openat(
+            ancestors.last().expect("root").as_fd(),
+            part,
+            dir,
+            Mode::empty(),
+        )
+        .map_err(|_| fail("Docker client path has a linked or non-directory ancestor"))?;
         ancestors.push(File::from(next));
     }
     let mut file = File::from(

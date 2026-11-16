@@ -132,7 +132,9 @@ pub fn open_key(path: &Path) -> Result<StoreKey> {
     use std::{io::Read, os::unix::fs::MetadataExt};
     let link = fs::symlink_metadata(path).map_err(|_| Error::Denied("vault key read"))?;
     let mut file = fs::File::open(path).map_err(|_| Error::Denied("vault key read"))?;
-    let meta = file.metadata().map_err(|_| Error::Denied("vault key read"))?;
+    let meta = file
+        .metadata()
+        .map_err(|_| Error::Denied("vault key read"))?;
     if !link.file_type().is_file()
         || link.dev() != meta.dev()
         || link.ino() != meta.ino()
@@ -140,7 +142,9 @@ pub fn open_key(path: &Path) -> Result<StoreKey> {
         || meta.uid() != rustix::process::geteuid().as_raw()
         || meta.mode() & 0o077 != 0
     {
-        return Err(Error::Denied("vault key must be an owner-only (0600) regular file"));
+        return Err(Error::Denied(
+            "vault key must be an owner-only (0600) regular file",
+        ));
     }
     if meta.len() != 32 {
         return Err(Error::Invalid("vault key length"));

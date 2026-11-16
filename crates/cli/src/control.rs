@@ -101,9 +101,16 @@ fn identity(pid: u32) -> Result<ProcessIdentity> {
         created: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
     })
 }
-#[cfg(not(any(windows, target_os = "linux", target_os = "android", target_os = "macos")))]
+#[cfg(not(any(
+    windows,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos"
+)))]
 fn identity(_: u32) -> Result<ProcessIdentity> {
-    Err(Error::Unavailable("Bu platformda süreç kimliği desteklenmiyor."))
+    Err(Error::Unavailable(
+        "Bu platformda süreç kimliği desteklenmiyor.",
+    ))
 }
 impl ProcessIdentity {
     pub fn current() -> Result<Self> {

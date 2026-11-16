@@ -143,8 +143,17 @@ pub(super) fn pin_mode(path: &Path, dir: bool, write: bool, host_root: bool) -> 
         path.to_path_buf()
     };
     let leaf = name(&path)?;
-    let mut guards = walk(path.parent().ok_or(Error::Invalid("root is not a workspace"))?)?;
-    let file = open_at(guards.last().expect("parent").as_fd(), leaf, dir, write, false)?;
+    let mut guards = walk(
+        path.parent()
+            .ok_or(Error::Invalid("root is not a workspace"))?,
+    )?;
+    let file = open_at(
+        guards.last().expect("parent").as_fd(),
+        leaf,
+        dir,
+        write,
+        false,
+    )?;
     let (file, identity, canonical) = inspect(file, path.clone(), dir)?;
     guards.shrink_to_fit();
     Ok(Pinned {
@@ -182,8 +191,17 @@ pub(super) fn create_directory(parent: &Pinned, name: &str) -> Result<Pinned> {
 pub(super) fn create_new(path: &Path) -> Result<Pinned> {
     absolute(path)?;
     let leaf = name(path)?;
-    let guards = walk(path.parent().ok_or(Error::Invalid("root is not a workspace"))?)?;
-    let file = open_at(guards.last().expect("parent").as_fd(), leaf, false, true, true)?;
+    let guards = walk(
+        path.parent()
+            .ok_or(Error::Invalid("root is not a workspace"))?,
+    )?;
+    let file = open_at(
+        guards.last().expect("parent").as_fd(),
+        leaf,
+        false,
+        true,
+        true,
+    )?;
     let (file, identity, canonical) = inspect(file, path.to_path_buf(), false)?;
     Ok(Pinned {
         file,

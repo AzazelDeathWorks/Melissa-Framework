@@ -320,10 +320,7 @@ fn docker_probe(arguments: &[&str]) -> Option<String> {
 fn readiness(supported_host: bool, engine: Option<&str>, image: bool) -> Value {
     let linux_engine = engine == Some("linux/amd64");
     let (status, next_step) = if !supported_host {
-        (
-            "BLOCKED",
-            "Use a supported Windows, Linux or macOS host.",
-        )
+        ("BLOCKED", "Use a supported Windows, Linux or macOS host.")
     } else if !linux_engine {
         (
             "BLOCKED",

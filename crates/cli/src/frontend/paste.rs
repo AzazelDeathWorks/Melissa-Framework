@@ -107,9 +107,15 @@ pub(crate) fn clipboard() -> crate::Result<String> {
     let candidates: &[&[&str]] = if cfg!(target_vendor = "apple") {
         &[&["pbpaste"]]
     } else if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        &[&["wl-paste", "--no-newline"], &["xclip", "-selection", "clipboard", "-o"]]
+        &[
+            &["wl-paste", "--no-newline"],
+            &["xclip", "-selection", "clipboard", "-o"],
+        ]
     } else {
-        &[&["xclip", "-selection", "clipboard", "-o"], &["xsel", "--clipboard", "--output"]]
+        &[
+            &["xclip", "-selection", "clipboard", "-o"],
+            &["xsel", "--clipboard", "--output"],
+        ]
     };
     for argv in candidates {
         let Ok(out) = Command::new(argv[0])

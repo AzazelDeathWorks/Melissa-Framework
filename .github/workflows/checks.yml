@@ -84,6 +84,32 @@ jobs:
         run: cargo +1.98.0 test --locked -p melissa-build-test --lib
       - name: Web development protocol tests
         run: cargo +1.98.0 test --locked -p melissa-web-development --lib --test protocol
+  unix-hosts:
+    # Linux and macOS run the same CLI and repository filesystem contracts
+    # that previously required the Windows handle-pinned backend.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal
+      - name: Compile
+        run: cargo +1.98.0 check --locked --workspace --all-targets
+      - name: Local CLI contracts
+        run: cargo +1.98.0 test --locked -p melissa-cli
+      - name: Repository filesystem contracts
+        run: cargo +1.98.0 test --locked -p melissa-repository --lib --test closeout_contracts --test read_error_observations --test incremental_parse --test property_contracts --test sensitive_visibility --test syntax --test text_eol_contract --test repository_agent_loop --test archive_ancestors --test graph_facts
+      - name: Store and vault
+        run: cargo +1.98.0 test --locked -p melissa-core-contracts -p melissa-local-store -p melissa-code-quality --lib
   secrets:
     runs-on: ubuntu-latest
     steps:

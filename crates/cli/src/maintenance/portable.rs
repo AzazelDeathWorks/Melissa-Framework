@@ -358,7 +358,12 @@ fn publish(source: &Path, out: &Path) -> Result {
         }
         Ok(())
     }
-    #[cfg(not(any(windows, target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    #[cfg(not(any(
+        windows,
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple"
+    )))]
     {
         let _ = (source, out);
         Err(Error::Unavailable(

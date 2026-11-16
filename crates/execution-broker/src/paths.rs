@@ -319,13 +319,18 @@ fn validate_absolute(path: &Path) -> BrokerResult<()> {
 }
 
 #[cfg(unix)]
-fn walk_unix(path: &Path, leaf_directory: bool, guards: &mut Vec<File>) -> BrokerResult<(PathBuf, File)> {
+fn walk_unix(
+    path: &Path,
+    leaf_directory: bool,
+    guards: &mut Vec<File>,
+) -> BrokerResult<(PathBuf, File)> {
     use rustix::fs::{Mode, OFlags, openat};
     validate_absolute(path)?;
     let canonical = fs::canonicalize(path)?;
     validate_absolute(&canonical)?;
     let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let mut current = File::from(rustix::fs::open("/", dir_flags, Mode::empty()).map_err(std::io::Error::from)?);
+    let mut current =
+        File::from(rustix::fs::open("/", dir_flags, Mode::empty()).map_err(std::io::Error::from)?);
     let parts: Vec<_> = canonical.components().skip(1).collect();
     for (i, component) in parts.iter().enumerate() {
         let last = i + 1 == parts.len();

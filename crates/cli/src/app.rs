@@ -231,9 +231,7 @@ impl App {
         safe_path(&home)?;
         let _pin = Repository::open(&home, Limits::default(), vec![])?;
         let key = vault::create_key(&home.join("store-key.dpapi")).map_err(|_| {
-            Error::Denied(
-                "Kullanıcı anahtarı oluşturulamadı; mevcut anahtar değiştirilmedi.",
-            )
+            Error::Denied("Kullanıcı anahtarı oluşturulamadı; mevcut anahtar değiştirilmedi.")
         })?;
         drop(key);
         fs::create_dir(home.join("tasks"))?;
