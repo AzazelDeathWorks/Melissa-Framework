@@ -233,7 +233,8 @@ struct ReplaceArg {
     #[serde(default)]
     replace_all: bool,
 }
-fn occurrences(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
+/// Match starts; `step` 1 also finds overlapping matches.
+fn occurrences(haystack: &[u8], needle: &[u8], step: usize) -> Vec<usize> {
     let mut hits = vec![];
     let mut at = 0;
     while let Some(i) = haystack[at..]
@@ -241,7 +242,7 @@ fn occurrences(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
         .position(|w| w == needle)
     {
         hits.push(at + i);
-        at += i + needle.len();
+        at += i + step;
     }
     hits
 }
@@ -256,11 +257,14 @@ fn replacement_patch(
     let crlf = |s: &str| s.replace("\r\n", "\n").replace('\n', "\r\n");
     let mut old = r.old_text.as_bytes().to_vec();
     let mut new = r.new_text.as_bytes().to_vec();
-    let mut hits = occurrences(bytes, &old);
+    if old.is_empty() {
+        return Err(Error::Invalid("old_text must not be empty"));
+    }
+    let mut hits = occurrences(bytes, &old, 1);
     if hits.is_empty() && r.old_text.contains('\n') && bytes.windows(2).any(|w| w == b"\r\n") {
         old = crlf(&r.old_text).into_bytes();
         new = crlf(&r.new_text).into_bytes();
-        hits = occurrences(bytes, &old);
+        hits = occurrences(bytes, &old, 1);
     }
     if hits.is_empty() {
         return Err(Error::Invalid(
@@ -272,15 +276,24 @@ fn replacement_patch(
             "old_text matches more than once; include more surrounding lines or set replace_all",
         ));
     }
-    let edits = hits
-        .into_iter()
-        .map(|start| crate::patch::ByteEdit {
-            start: start as u64,
-            end: (start + old.len()) as u64,
-            expected: old.clone(),
-            replacement: new.clone(),
-        })
-        .collect();
+    let mut edits: Vec<crate::patch::ByteEdit> = vec![];
+    for start in occurrences(bytes, &old, old.len()) {
+        let start = start as u64;
+        match edits.last_mut() {
+            // Patch edits must not touch, so adjacent matches become one edit.
+            Some(e) if e.end == start => {
+                e.end += old.len() as u64;
+                e.expected.extend_from_slice(&old);
+                e.replacement.extend_from_slice(&new);
+            }
+            _ => edits.push(crate::patch::ByteEdit {
+                start,
+                end: start + old.len() as u64,
+                expected: old.clone(),
+                replacement: new.clone(),
+            }),
+        }
+    }
     Ok(PatchProposal {
         schema_version: "melissa.repository-patch/v1".into(),
         root_identity: root_identity.into(),
@@ -715,7 +728,7 @@ impl Host {
         })
     }
 }
-fn page(bytes: &[u8], offset: u64, max: u32, mut context: Value) -> crate::Result<Value> {
+fn page(bytes: &[u8], offset: u64, max: u32, context: Value) -> crate::Result<Value> {
     if max == 0 || max > 64 * 1024 || offset > bytes.len() as u64 {
         return Err(Error::Invalid("page bounds"));
     }
@@ -1117,3 +1130,33 @@ impl ToolDispatcher for ToolRouter {
 #[cfg(test)]
 #[path = "tool_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod replacement_tests {
+    use super::*;
+
+    fn patch(bytes: &[u8], old: &str, new: &str, all: bool) -> crate::Result<PatchProposal> {
+        let version: FileVersion = serde_json::from_value(json!({
+            "path":"f.txt","bytes":bytes.len(),"digest":"blake3:00","identity":"0:0"
+        }))
+        .unwrap();
+        let r = ReplaceArg {
+            path: "f.txt".into(),
+            old_text: old.into(),
+            new_text: new.into(),
+            replace_all: all,
+        };
+        replacement_patch("root", version, bytes, &r)
+    }
+
+    #[test]
+    fn overlapping_matches_are_ambiguous_and_adjacent_matches_merge() {
+        assert!(patch(b"banana", "ana", "x", false).is_err());
+        let p = patch(b"foofoo bar foo", "foo", "q", true).unwrap();
+        let edits = &p.files[0].edits;
+        assert_eq!(edits.len(), 2);
+        assert_eq!((edits[0].start, edits[0].end), (0, 6));
+        assert_eq!(edits[0].replacement, b"qq");
+        assert_eq!((edits[1].start, edits[1].end), (11, 14));
+    }
+}
