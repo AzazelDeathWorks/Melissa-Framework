@@ -7,6 +7,7 @@ difference in total tokens, requests and latency (treatment - baseline).
 """
 import argparse
 import json
+import sys
 import math
 import random
 import statistics
@@ -56,7 +57,10 @@ def main():
     for r in runs:
         r["tokens"] = r["input_tokens"] + r["output_tokens"]
         by_arm[r["arm"]].append(r)
-        pairs[(r["model"], r["case"], r["rep"])][r["arm"]] = r
+        key = (r["model"], r.get("session", ""), r["case"], r["rep"])
+        if r["arm"] in pairs[key]:
+            sys.exit(f"duplicate trial {key} {r['arm']}; add a session field per invocation")
+        pairs[key][r["arm"]] = r
 
     out = {"runs": len(runs), "arms": {}}
     for arm, rs in sorted(by_arm.items()):

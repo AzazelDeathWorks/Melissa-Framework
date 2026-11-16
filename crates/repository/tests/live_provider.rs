@@ -395,6 +395,12 @@ async fn live_edit_tool_ab() {
         .open(env("MELISSA_LIVE_OUT"))
         .unwrap();
     let model = env("MELISSA_LIVE_MODEL");
+    // Output appends across invocations; pairs are keyed by (session, case, rep).
+    let session = format!(
+        "{}-{}",
+        melissa_execution_broker::unix_ms().unwrap(),
+        std::process::id()
+    );
     let only = std::env::var("MELISSA_LIVE_CASES").ok();
     let arm_ids = std::env::var("MELISSA_LIVE_ARMS").ok();
     for rep in 0..reps {
@@ -424,7 +430,7 @@ async fn live_edit_tool_ab() {
                 );
                 assert!(!o.task_accepted);
                 let line = serde_json::json!({
-                    "model": model, "case": case.id, "rep": rep, "arm": arm.id,
+                    "model": model, "session": session, "case": case.id, "rep": rep, "arm": arm.id,
                     "success": o.success, "status": format!("{:?}", o.status),
                     "requests": o.requests, "tool_calls": o.tool_calls,
                     "input_tokens": o.input_tokens, "output_tokens": o.output_tokens,
