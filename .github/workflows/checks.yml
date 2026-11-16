@@ -100,6 +100,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - name: Use a symlink-free temp dir
+        run: echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Rust toolchain
         run: rustup toolchain install 1.98.0 --profile minimal
       - name: Compile
