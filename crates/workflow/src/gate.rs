@@ -170,6 +170,11 @@ impl NodeDispatcher {
                         );
                     }
                 }
+                "fs_replace" => paths.push(
+                    args["path"]
+                        .as_str()
+                        .ok_or_else(|| error(Kind::Invalid, "replacement target missing"))?,
+                ),
                 "fs_create" | "fs_delete" | "fs_move" | "fs_mkdir" | "fs_rmdir" | "fs_movedir" => {
                     for key in ["before", "destination"] {
                         if let Some(p) = args["mutation"][key]["path"].as_str() {

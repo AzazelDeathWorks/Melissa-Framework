@@ -547,3 +547,57 @@ async fn router_keeps_exact_bindings_and_rejects_duplicate_function_names() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn text_replacement_binds_current_version_matches_crlf_and_rejects_ambiguity() {
+    let (temp, mut d, _peer) = fixture();
+    let applied = invoke(
+        &mut d,
+        "fs_replace",
+        json!({"path":"lib.rs","old_text":"pub fn original() {}\n","new_text":"pub fn renamed() {}\npub fn extra() {}\n"}),
+        "replace",
+    )
+    .await;
+    assert!(applied.success, "{}", applied.content);
+    assert_eq!(
+        fs::read(temp.path().join("repo/lib.rs")).unwrap(),
+        b"pub fn renamed() {}\r\npub fn extra() {}\r\n"
+    );
+    for (args, tag) in [
+        (
+            json!({"path":"lib.rs","old_text":"pub fn","new_text":"fn"}),
+            "ambiguous",
+        ),
+        (
+            json!({"path":"lib.rs","old_text":"missing","new_text":"x"}),
+            "missing",
+        ),
+        (
+            json!({"path":"dirty.txt","old_text":"dirty","new_text":"x"}),
+            "protected",
+        ),
+    ] {
+        let c = call("fs_replace", args);
+        d.validate_call(&c).unwrap();
+        let r = d
+            .execute(c, context(tag), Arc::new(AtomicBool::new(false)))
+            .await;
+        assert!(r.map(|e| !e.success).unwrap_or(true), "{tag}");
+    }
+    assert_eq!(
+        fs::read(temp.path().join("repo/dirty.txt")).unwrap(),
+        b"preserve dirty\0\xff"
+    );
+    let all = invoke(
+        &mut d,
+        "fs_replace",
+        json!({"path":"lib.rs","old_text":"pub fn","new_text":"pub(crate) fn","replace_all":true}),
+        "replace-all",
+    )
+    .await;
+    assert!(all.success, "{}", all.content);
+    assert_eq!(
+        fs::read(temp.path().join("repo/lib.rs")).unwrap(),
+        b"pub(crate) fn renamed() {}\r\npub(crate) fn extra() {}\r\n"
+    );
+}

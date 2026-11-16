@@ -2305,7 +2305,7 @@ impl App {
                     | "sandbox_format_check" => {
                         Some((d.definition.name, melissa_recovery::FailureKind::BuildError))
                     }
-                    "fs_patch" => {
+                    "fs_patch" | "fs_replace" => {
                         Some((d.definition.name, melissa_recovery::FailureKind::StalePatch))
                     }
                     _ => None,
@@ -2732,6 +2732,7 @@ fn repo_wires(tools: &BTreeSet<String>) -> BTreeSet<String> {
         ("code_unified_propose", "code.patch_propose"),
         ("fs_absent", "fs.read"),
         ("fs_patch", "fs.patch"),
+        ("fs_replace", "fs.patch"),
         ("fs_create", "fs.patch"),
         ("fs_delete", "fs.patch"),
         ("fs_move", "fs.patch"),

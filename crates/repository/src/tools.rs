@@ -1,8 +1,8 @@
 //! Opt-in Gateway ToolDispatcher implementation. The host chooses the root,
 //! task, profile, grants and routes. Wire arguments contain observations only.
 use crate::{
-    Error, MutationProposal, PatchBroker, PatchPolicy, PatchProposal, Repository, check_cancel,
-    digest, symbols::SyntaxIndex,
+    Error, FileVersion, MutationProposal, PatchBroker, PatchPolicy, PatchProposal, Repository,
+    check_cancel, digest, symbols::SyntaxIndex,
 };
 use melissa_core_contracts::TaskState;
 use melissa_local_store::{ArtifactRequest, LocalStore};
@@ -127,7 +127,7 @@ const ROUTES: &[(&str, &str, &str)] = &[
     (
         "fs_read",
         "fs.read",
-        "Read exact bytes and file identity. Byte arrays preserve binary content and CRLF.",
+        "Read a file and its identity. UTF-8 files return exact text (CRLF preserved); other files return a byte array.",
     ),
     (
         "fs_hash",
@@ -168,6 +168,11 @@ const ROUTES: &[(&str, &str, &str)] = &[
         "fs_patch",
         "fs.patch",
         "Apply an exact existing-file typed byte patch after host/task admission. Unknown outcomes require reconciliation.",
+    ),
+    (
+        "fs_replace",
+        "fs.patch",
+        "Replace exact text in one existing file. old_text must match exactly once (copy it verbatim from a fresh read, with enough surrounding lines to be unique) unless replace_all is true. The host binds the edit to the file's current identity and applies it like fs_patch.",
     ),
     (
         "fs_create",
@@ -221,6 +226,72 @@ struct NameArg {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ReplaceArg {
+    path: String,
+    old_text: String,
+    new_text: String,
+    #[serde(default)]
+    replace_all: bool,
+}
+fn occurrences(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
+    let mut hits = vec![];
+    let mut at = 0;
+    while let Some(i) = haystack[at..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+    {
+        hits.push(at + i);
+        at += i + needle.len();
+    }
+    hits
+}
+/// Turns an exact text replacement into a byte patch bound to the current
+/// file version. LF-only text also matches a CRLF file.
+fn replacement_patch(
+    root_identity: &str,
+    version: FileVersion,
+    bytes: &[u8],
+    r: &ReplaceArg,
+) -> crate::Result<PatchProposal> {
+    let crlf = |s: &str| s.replace("\r\n", "\n").replace('\n', "\r\n");
+    let mut old = r.old_text.as_bytes().to_vec();
+    let mut new = r.new_text.as_bytes().to_vec();
+    let mut hits = occurrences(bytes, &old);
+    if hits.is_empty() && r.old_text.contains('\n') && bytes.windows(2).any(|w| w == b"\r\n") {
+        old = crlf(&r.old_text).into_bytes();
+        new = crlf(&r.new_text).into_bytes();
+        hits = occurrences(bytes, &old);
+    }
+    if hits.is_empty() {
+        return Err(Error::Invalid(
+            "old_text not found; re-read the file and copy the exact current text",
+        ));
+    }
+    if hits.len() > 1 && !r.replace_all {
+        return Err(Error::Invalid(
+            "old_text matches more than once; include more surrounding lines or set replace_all",
+        ));
+    }
+    let edits = hits
+        .into_iter()
+        .map(|start| crate::patch::ByteEdit {
+            start: start as u64,
+            end: (start + old.len()) as u64,
+            expected: old.clone(),
+            replacement: new.clone(),
+        })
+        .collect();
+    Ok(PatchProposal {
+        schema_version: "melissa.repository-patch/v1".into(),
+        root_identity: root_identity.into(),
+        files: vec![crate::patch::FilePatch {
+            before: version,
+            edits,
+        }],
+    })
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReadPageArg {
     before: crate::FileVersion,
     offset: u64,
@@ -264,6 +335,7 @@ enum Parsed {
     References(String),
     Preview(PatchProposal),
     Patch(PatchProposal),
+    Replace(ReplaceArg),
     Mutation(MutationProposal),
 }
 fn decode<T: serde::de::DeserializeOwned>(v: Value) -> melissa_model_gateway::Result<T> {
@@ -325,6 +397,16 @@ fn parse(call: &ToolCall) -> melissa_model_gateway::Result<Parsed> {
                 return Err(GatewayError::invalid("identifier bounds"));
             }
             Parsed::References(p.name)
+        }
+        "fs_replace" => {
+            let r: ReplaceArg = decode(v)?;
+            if r.old_text.is_empty() || r.old_text == r.new_text {
+                return Err(GatewayError::invalid(
+                    "old_text must be non-empty and differ from new_text",
+                ));
+            }
+            crate::paths::relative(&r.path).map_err(err)?;
+            Parsed::Replace(r)
         }
         "fs_patch" => Parsed::Patch(PatchProposal::parse(call.arguments.as_bytes()).map_err(err)?),
         "fs_diff" | "code_patch_propose" => {
@@ -517,6 +599,17 @@ impl Host {
                 artifacts.extend(r.files.iter().map(|f| f.preimage_artifact_id.clone()));
                 serde_json::to_value(r)?
             }
+            Parsed::Replace(r) => {
+                let (version, bytes) = self.repo.read(&r.path)?;
+                let p = replacement_patch(self.repo.root_identity(), version, &bytes, &r)?;
+                let mut b =
+                    PatchBroker::new(&self.repo, &mut self.store, self.policy.files.clone())?;
+                let permit = b.authorize(&c.invocation_id, &c.attempt_id, p)?;
+                let r = b.execute(permit, cancel)?;
+                artifacts.push(format!("{}:receipt", c.invocation_id));
+                artifacts.extend(r.files.iter().map(|f| f.preimage_artifact_id.clone()));
+                serde_json::to_value(r)?
+            }
             Parsed::Mutation(p) => {
                 let mut b =
                     PatchBroker::new(&self.repo, &mut self.store, self.policy.files.clone())?;
@@ -547,7 +640,7 @@ impl Host {
             }
             Parsed::Read(p) => {
                 let (version, bytes) = self.repo.read(&p)?;
-                json!({"version":version,"bytes":bytes,"encoding":"byte_array"})
+                content(json!({"version":version}), &bytes)
             }
             Parsed::Hash(p) => {
                 let (version, _) = self.repo.read(&p)?;
@@ -628,7 +721,7 @@ fn page(bytes: &[u8], offset: u64, max: u32, mut context: Value) -> crate::Resul
     }
     let start = offset as usize;
     let end = start.saturating_add(max as usize).min(bytes.len());
-    context["bytes"] = json!(&bytes[start..end]);
+    let mut context = content(context, &bytes[start..end]);
     context["offset"] = json!(offset);
     context["total_bytes"] = json!(bytes.len());
     context["next_offset"] = if end < bytes.len() {
@@ -637,8 +730,22 @@ fn page(bytes: &[u8], offset: u64, max: u32, mut context: Value) -> crate::Resul
         Value::Null
     };
     context["complete"] = json!(end == bytes.len());
-    context["encoding"] = json!("byte_array");
     Ok(context)
+}
+/// Text is roughly an order of magnitude cheaper for models than a JSON
+/// byte array, so arrays are kept only for content that is not UTF-8.
+fn content(mut context: Value, bytes: &[u8]) -> Value {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => {
+            context["text"] = json!(text);
+            context["encoding"] = json!("utf8");
+        }
+        Err(_) => {
+            context["bytes"] = json!(bytes);
+            context["encoding"] = json!("byte_array");
+        }
+    }
+    context
 }
 impl RepositoryDispatcher {
     /// Host-side withdrawal for subsequent calls and outstanding capabilities.
@@ -928,6 +1035,10 @@ fn schema(id: &str) -> Value {
                 &["schema_version", "root_identity", "files"],
             )
         }
+        "fs_replace" => object(
+            json!({"path":{"type":"string","minLength":1,"maxLength":4096},"old_text":{"type":"string","minLength":1},"new_text":{"type":"string"},"replace_all":{"type":"boolean"}}),
+            &["path", "old_text", "new_text"],
+        ),
         "fs_create" | "fs_delete" | "fs_move" => {
             let mutation = match id {
                 "fs_create" => object(
@@ -1003,6 +1114,6 @@ impl ToolDispatcher for ToolRouter {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 #[path = "tool_tests.rs"]
 mod tests;
