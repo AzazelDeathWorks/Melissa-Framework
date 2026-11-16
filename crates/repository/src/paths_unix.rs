@@ -1,7 +1,7 @@
 //! Unix backend: every component is opened relative to its held parent with
 //! O_NOFOLLOW, so symlinked ancestors or targets are denied without pathname
 //! prechecks. Unix cannot share-lock names; deletes and moves re-confirm the
-//! held device/inode at the name immediately before the syscall.
+//! held device/inode at the name and verify it again after renaming.
 use super::{Pinned, relative};
 use crate::{Error, Result};
 use rustix::{
@@ -9,7 +9,7 @@ use rustix::{
     io::Errno,
 };
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs::File,
     os::fd::{AsFd, BorrowedFd, OwnedFd},
     path::{Component, Path, PathBuf},
@@ -224,6 +224,8 @@ pub(super) fn move_no_replace(source: &Pinned, destination: &Path) -> Result {
     rename_no_replace(src_parent, src_name, dst_parent, dst_name, &held)?;
     let moved = rfs::statat(dst_parent, dst_name, AtFlags::SYMLINK_NOFOLLOW).map_err(errno)?;
     if !same(&held, &moved) {
+        // A concurrent writer swapped the source name; put the stranger back.
+        let _ = rename_no_replace(dst_parent, dst_name, src_parent, src_name, &moved);
         return Err(Error::Stale("moved object identity changed"));
     }
     Ok(())
@@ -269,7 +271,19 @@ pub(super) fn delete(source: Pinned) -> Result {
     } else {
         AtFlags::empty()
     };
-    rfs::unlinkat(parent, name, flags).map_err(errno)?;
+    // Unix has no handle-based unlink. Move the name aside under an
+    // unguessable name and verify it is still the pinned object before removal.
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce).map_err(|_| Error::Denied("host entropy unavailable"))?;
+    let aside: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+    let aside = OsString::from(format!(".melissa-delete-{aside}"));
+    rename_no_replace(parent, name, parent, &aside, &held)?;
+    let moved = rfs::statat(parent, &aside, AtFlags::SYMLINK_NOFOLLOW).map_err(errno)?;
+    if !same(&held, &moved) {
+        let _ = rename_no_replace(parent, &aside, parent, name, &moved);
+        return Err(Error::Stale("deleted object identity changed"));
+    }
+    rfs::unlinkat(parent, &aside, flags).map_err(errno)?;
     drop(source);
     Ok(())
 }
