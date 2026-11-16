@@ -270,22 +270,25 @@ pub(crate) fn image_present(expected: &str) -> bool {
         .is_some_and(|actual| actual == expected)
 }
 
-#[cfg(windows)]
 fn docker_probe(arguments: &[&str]) -> Option<String> {
-    use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
 
     let config = tempfile::tempdir().ok()?;
-    let mut command = Command::new(r"C:\Program Files\Docker\Docker\resources\bin\docker.exe");
+    let (client, endpoint) = melissa_container_executor::docker_host().ok()?;
+    let mut command = Command::new(client);
     command.env_clear();
     if let Some(root) = std::env::var_os("SystemRoot") {
         command.env("SystemRoot", root);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
     let mut child = command
-        .creation_flags(0x08000000)
         .arg("--config")
         .arg(config.path())
-        .args(["--host", "npipe:////./pipe/dockerDesktopLinuxEngine"])
+        .args(["--host", endpoint.as_str()])
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -314,22 +317,17 @@ fn docker_probe(arguments: &[&str]) -> Option<String> {
     }
 }
 
-#[cfg(not(windows))]
-fn docker_probe(_: &[&str]) -> Option<String> {
-    None
-}
-
-fn readiness(windows_x64: bool, engine: Option<&str>, image: bool) -> Value {
+fn readiness(supported_host: bool, engine: Option<&str>, image: bool) -> Value {
     let linux_engine = engine == Some("linux/amd64");
-    let (status, next_step) = if !windows_x64 {
+    let (status, next_step) = if !supported_host {
         (
             "BLOCKED",
-            "Use the Windows x64 preview on a supported Windows host.",
+            "Use a supported Windows, Linux or macOS host.",
         )
     } else if !linux_engine {
         (
             "BLOCKED",
-            "Install or start Docker Desktop with its Linux container engine and re-run doctor.",
+            "Install or start Docker (Desktop, Engine, Colima, OrbStack or Podman socket) with a linux/amd64 engine and re-run doctor.",
         )
     } else if !image {
         (
@@ -344,7 +342,7 @@ fn readiness(windows_x64: bool, engine: Option<&str>, image: bool) -> Value {
     };
     json!({
         "status":status,
-        "supported_preview_host":windows_x64,
+        "supported_preview_host":supported_host,
         "docker_engine_platform":engine,
         "docker_linux_amd64_ready":linux_engine,
         "pinned_sdk_worker_ready":image,
@@ -366,7 +364,7 @@ pub fn doctor() -> Result<Value> {
         "isolated_SDK_image_present":image,"isolated_SDK_image_id":melissa_code_quality::protected::SDK_IMAGE,
         "isolated_web_API_DB_image_present":web_image,"model_probe":"NOT_RUN","credential_read":false,
         "desktop_companion_present":executable.with_file_name("melissa-desktop.exe").is_file(),
-        "release_readiness":readiness(cfg!(all(windows, target_arch = "x86_64")), engine.as_deref(), image)
+        "release_readiness":readiness(cfg!(any(windows, target_os = "linux", target_os = "macos")), engine.as_deref(), image)
     }))
 }
 

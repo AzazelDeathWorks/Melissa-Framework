@@ -1,4 +1,3 @@
-#![cfg(windows)]
 use melissa_cli::{Error, app::App};
 use melissa_code_quality::vault;
 use melissa_core_contracts::TaskState;

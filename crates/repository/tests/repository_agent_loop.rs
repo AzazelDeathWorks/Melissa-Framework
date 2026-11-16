@@ -1,6 +1,5 @@
 //! Real Gateway HTTP/SSE -> repository broker -> filesystem -> continuation.
 //! Deterministic owned loopback data, not live model or product acceptance.
-#![cfg(windows)]
 use melissa_core_contracts::{TaskState, catalog::Catalog, wire::TaskContractV1};
 use melissa_local_store::{LocalStore, StoreConfig, StoreKey};
 use melissa_model_gateway::{

@@ -123,8 +123,29 @@ pub fn absolute(path: &Path) -> Result<PathBuf> {
         ));
     }
     let path = std::path::absolute(path)?.components().collect::<PathBuf>();
+    #[cfg(unix)]
+    let path = resolve_host_links(path);
     safe_path(&path)?;
     Ok(path)
+}
+/// macOS spells system locations through root-owned top-level links
+/// (`/var`, `/tmp` -> `/private/...`). Only such a first component is
+/// resolved; every link below it is still denied by `safe_path`.
+#[cfg(unix)]
+fn resolve_host_links(path: PathBuf) -> PathBuf {
+    use std::os::unix::fs::MetadataExt;
+    let mut parts = path.components();
+    let (Some(std::path::Component::RootDir), Some(first)) = (parts.next(), parts.next()) else {
+        return path;
+    };
+    let top = Path::new("/").join(first);
+    match fs::symlink_metadata(&top) {
+        Ok(m) if m.file_type().is_symlink() && m.uid() == 0 => match fs::canonicalize(&top) {
+            Ok(real) => real.join(parts.as_path()),
+            Err(_) => path,
+        },
+        _ => path,
+    }
 }
 pub(crate) fn safe_path(path: &Path) -> Result {
     use std::path::{Component, Prefix};
@@ -211,7 +232,7 @@ impl App {
         let _pin = Repository::open(&home, Limits::default(), vec![])?;
         let key = vault::create_key(&home.join("store-key.dpapi")).map_err(|_| {
             Error::Denied(
-                "Windows kullanıcı anahtarı oluşturulamadı; mevcut anahtar değiştirilmedi.",
+                "Kullanıcı anahtarı oluşturulamadı; mevcut anahtar değiştirilmedi.",
             )
         })?;
         drop(key);

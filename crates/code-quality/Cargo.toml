@@ -26,5 +26,8 @@ spdx = "=0.13.6"
 time = { version = "=0.3.55", features = ["parsing"] }
 windows-sys = { workspace = true, features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
 
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true

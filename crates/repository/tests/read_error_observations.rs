@@ -1,4 +1,3 @@
-#![cfg(windows)]
 mod support;
 use melissa_core_contracts::InvocationState;
 use melissa_local_store::ArtifactRequest;

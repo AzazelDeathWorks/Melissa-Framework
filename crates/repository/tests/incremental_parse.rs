@@ -1,4 +1,3 @@
-#![cfg(windows)]
 use melissa_repository::{
     Limits, Repository,
     polyglot::{ParseCache, PolyglotIndex},

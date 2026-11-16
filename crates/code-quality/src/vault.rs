@@ -1,4 +1,4 @@
-//! Windows user-bound DPAPI wrapping; neither API keys nor plaintext store keys
+//! Windows user-bound DPAPI wrapping (owner-only key file on Unix); neither API keys nor plaintext store keys
 //! are written to reports. Existing vault files are always preserved.
 use crate::{Error, Result};
 use melissa_local_store::StoreKey;
@@ -107,18 +107,46 @@ pub fn open_key(path: &Path) -> Result<StoreKey> {
     }
     key.ok_or(Error::Invalid("vault key length"))
 }
-#[cfg(not(windows))]
-pub fn create_key(_: &Path) -> Result<StoreKey> {
-    Err(Error::Denied(
-        "DPAPI vault requires Windows; supply host-managed StoreKey",
-    ))
+/// Unix: a 0600 owner-only key file; the user account boundary replaces DPAPI.
+#[cfg(unix)]
+pub fn create_key(path: &Path) -> Result<StoreKey> {
+    let mut bytes = Zeroizing::new([0u8; 32]);
+    getrandom::fill(&mut *bytes).map_err(|_| Error::Denied("vault entropy"))?;
+    import_key(path, &bytes)
 }
-#[cfg(not(windows))]
-pub fn open_key(_: &Path) -> Result<StoreKey> {
-    Err(Error::Denied("DPAPI vault requires Windows"))
+#[cfg(unix)]
+pub fn import_key(path: &Path, secret: &[u8; 32]) -> Result<StoreKey> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|_| Error::Denied("preserve existing vault key"))?;
+    std::io::Write::write_all(&mut file, secret).map_err(|_| Error::Denied("vault key write"))?;
+    file.sync_all().map_err(|_| Error::Denied("vault flush"))?;
+    Ok(StoreKey::from_bytes(*secret))
 }
-
-#[cfg(not(windows))]
-pub fn import_key(_: &Path, _: &[u8; 32]) -> Result<StoreKey> {
-    Err(Error::Denied("DPAPI vault requires Windows"))
+#[cfg(unix)]
+pub fn open_key(path: &Path) -> Result<StoreKey> {
+    use std::{io::Read, os::unix::fs::MetadataExt};
+    let link = fs::symlink_metadata(path).map_err(|_| Error::Denied("vault key read"))?;
+    let mut file = fs::File::open(path).map_err(|_| Error::Denied("vault key read"))?;
+    let meta = file.metadata().map_err(|_| Error::Denied("vault key read"))?;
+    if !link.file_type().is_file()
+        || link.dev() != meta.dev()
+        || link.ino() != meta.ino()
+        || meta.nlink() != 1
+        || meta.uid() != rustix::process::geteuid().as_raw()
+        || meta.mode() & 0o077 != 0
+    {
+        return Err(Error::Denied("vault key must be an owner-only (0600) regular file"));
+    }
+    if meta.len() != 32 {
+        return Err(Error::Invalid("vault key length"));
+    }
+    let mut key = Zeroizing::new([0u8; 32]);
+    file.read_exact(&mut *key)
+        .map_err(|_| Error::Denied("vault key read"))?;
+    Ok(StoreKey::from_bytes(*key))
 }

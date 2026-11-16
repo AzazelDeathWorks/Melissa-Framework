@@ -8,7 +8,6 @@ use serde_json::{Value, json};
 use std::io::{self, IsTerminal};
 
 pub async fn run(options: &args::Options) -> Result<Value> {
-    #[cfg(windows)]
     if let Command::UiRequest { workspace, request } = &options.command {
         let home = options.home.clone().map(Ok).unwrap_or_else(default_home)?;
         let client = crate::frontend::pipe::Client::for_project(&home, workspace)?;
@@ -51,15 +50,8 @@ pub async fn run(options: &args::Options) -> Result<Value> {
                 "Ayar ekranını etkileşimli terminalde melissa config ile aç. Otomasyon için config show veya config import PATH kullan.",
             ));
         }
-        #[cfg(windows)]
-        {
-            crate::console::settings_dialog(&home).await?;
-            return Ok(Value::Null);
-        }
-        #[cfg(not(windows))]
-        return Err(crate::Error::Unavailable(
-            "Etkileşimli ayar ekranı Windows sürümünde kullanılabilir.",
-        ));
+        crate::console::settings_dialog(&home).await?;
+        return Ok(Value::Null);
     }
     if let Command::Session { workspace } = &options.command {
         let workspace = workspace

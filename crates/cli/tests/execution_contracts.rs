@@ -1,4 +1,3 @@
-#![cfg(windows)]
 use melissa_cli::{app::App, recipe::Recipe, settings::Settings};
 use serde_json::{Value, json};
 use std::{
@@ -81,7 +80,15 @@ fn tokenizer_import_authenticates_before_publication_without_resolving_keys() {
     fs::write(&path, b"{}").unwrap();
     assert!(f.app().configure(&f.config).is_err());
     assert_eq!(fs::read(f.home.join("settings.enc")).unwrap(), stored);
-    settings["local_tokenizer"]["path"] = json!(r"\\unreachable.invalid\share\tokenizer.json");
+    #[cfg(windows)]
+    let denied = std::path::PathBuf::from(r"\\unreachable.invalid\share\tokenizer.json");
+    #[cfg(unix)]
+    let denied = {
+        let link = f.temp.path().join("linked-tokenizer.json");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        link
+    };
+    settings["local_tokenizer"]["path"] = json!(denied);
     fs::write(&f.config, serde_json::to_vec(&settings).unwrap()).unwrap();
     assert!(matches!(
         f.app().configure(&f.config),

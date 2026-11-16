@@ -57,7 +57,7 @@ pub fn observe(repo: &Repository) -> GitContext {
                 return Err(Error::Unsupported("symbolic Git provenance"));
             }
             branch = Some(reference.to_owned());
-            match read(&root.join(reference.replace('/', "\\")), 4096) {
+            match read(&root.join(&*crate::paths::native(reference)), 4096) {
                 Ok(raw) => {
                     let h = std::str::from_utf8(&raw)
                         .map_err(|_| Error::Invalid("Git ref encoding"))?

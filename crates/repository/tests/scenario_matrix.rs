@@ -1,4 +1,3 @@
-#![cfg(windows)]
 mod support;
 use melissa_execution_broker::{InvocationIdentity, policy::PermitRequest, unix_ms};
 use melissa_repository::{

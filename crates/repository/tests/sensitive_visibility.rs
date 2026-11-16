@@ -1,4 +1,3 @@
-#![cfg(windows)]
 use melissa_repository::{
     Error, Limits, Repository, SourceVisibilityPolicy, discovery::DiscoveryOptions,
 };

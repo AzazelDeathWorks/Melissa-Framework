@@ -9,12 +9,14 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 
-#[cfg(windows)]
 pub(crate) mod paste;
 #[cfg(windows)]
+#[path = "frontend/pipe_windows.rs"]
+pub mod pipe;
+#[cfg(unix)]
+#[path = "frontend/pipe_unix.rs"]
 pub mod pipe;
 mod presentation;
-#[cfg(windows)]
 pub mod terminal;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
