@@ -377,7 +377,6 @@ impl ProjectMemory {
 }
 
 impl App {
-    #[cfg(windows)]
     pub(crate) fn recall_project_memory(
         &self,
         workspace: &Path,

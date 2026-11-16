@@ -1,4 +1,3 @@
-#![cfg(windows)]
 mod support;
 use melissa_repository::{Limits, PatchBroker, Repository, structural::Query};
 use std::{fs, sync::atomic::AtomicBool};

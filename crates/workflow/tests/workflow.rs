@@ -998,7 +998,7 @@ async fn shared_root_continuation_survives_store_close_and_other_node_charges_wi
         .get_artifact(TASK, &read_ref)
         .unwrap();
     let read: Value = serde_json::from_slice(&before).unwrap();
-    assert_eq!(read["result"]["bytes"], json!(b"original payload"));
+    assert_eq!(read["result"]["text"], "original payload");
     let fresh = Freshness {
         workspace_digest: owner.lock().unwrap().state().unwrap().plan.workspace_digest,
         policy_digest: melissa_workflow::digest(b"current-policy"),

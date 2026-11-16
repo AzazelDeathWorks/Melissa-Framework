@@ -243,7 +243,7 @@ impl Repository {
     pub(crate) fn lock(&self, path: &str, write: bool) -> Result<Pinned> {
         self.check_path(path)?;
         paths::pin(
-            &self.root.canonical.join(path.replace('/', "\\")),
+            &self.root.canonical.join(&*paths::native(path)),
             false,
             write,
         )
@@ -324,7 +324,7 @@ impl Repository {
             }
             Err(error) => return Err(error),
         };
-        let expected = self.root.canonical.join(path.replace('/', "\\"));
+        let expected = self.root.canonical.join(&*paths::native(path));
         if pin.canonical.as_os_str() != expected.as_os_str() {
             return Ok(None);
         }

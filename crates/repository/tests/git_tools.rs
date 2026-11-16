@@ -1,5 +1,5 @@
-//! Actual reviewed agent Git bindings through the existing isolated broker.
 #![cfg(windows)]
+//! Actual reviewed agent Git bindings through the existing isolated broker.
 use melissa_container_executor::ContainerLimits;
 use melissa_core_contracts::{TaskState, catalog::Catalog, wire::TaskContractV1};
 use melissa_execution_broker::{

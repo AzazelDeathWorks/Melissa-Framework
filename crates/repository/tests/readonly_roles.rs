@@ -1,4 +1,3 @@
-#![cfg(windows)]
 mod support;
 use melissa_core_contracts::{InvocationState, TaskState, catalog::Catalog, wire::TaskContractV1};
 use melissa_local_store::{

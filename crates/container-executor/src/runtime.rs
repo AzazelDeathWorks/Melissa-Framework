@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(windows)]
 const ENGINE: &str = "npipe:////./pipe/dockerDesktopLinuxEngine";
 include!("runtime_recovery.rs");
 include!("runtime_compose.rs");
@@ -241,8 +242,13 @@ struct Docker {
     _ancestors: Vec<File>,
     client_identity: String,
     executable: PathBuf,
+    endpoint: String,
 }
-#[cfg(windows)]
+#[cfg(unix)]
+#[path = "runtime_unix.rs"]
+mod unix_host;
+#[cfg(unix)]
+use unix_host::pin_client_mode;
 fn pin_client(executable: &std::path::Path) -> ExecutorResult<(File, Vec<File>, String)> {
     pin_client_mode(executable, true)
 }
@@ -336,28 +342,33 @@ fn pin_client_mode(
     );
     Ok((file, ancestors, identity))
 }
+/// Host-selected Docker client and local engine endpoint for diagnostics.
+pub fn docker_host() -> ExecutorResult<(PathBuf, String)> {
+    #[cfg(windows)]
+    return Ok((
+        PathBuf::from(r"C:\Program Files\Docker\Docker\resources\bin\docker.exe"),
+        ENGINE.to_owned(),
+    ));
+    #[cfg(unix)]
+    return Ok((unix_host::client()?, unix_host::endpoint()?));
+}
 impl Docker {
     fn new() -> ExecutorResult<Self> {
-        if !cfg!(windows) {
-            return Err(ExecutorError::Unsupported(
-                "this backend currently pins the Windows Docker Desktop Linux engine".into(),
-            ));
-        }
-        let executable = PathBuf::from(r"C:\Program Files\Docker\Docker\resources\bin\docker.exe");
         #[cfg(windows)]
-        let (pin, ancestors, client_identity) = pin_client(&executable)?;
-        #[cfg(not(windows))]
-        let (pin, ancestors, client_identity) = (
-            OpenOptions::new().read(true).open(&executable)?,
-            Vec::new(),
-            String::new(),
+        let (executable, endpoint) = (
+            PathBuf::from(r"C:\Program Files\Docker\Docker\resources\bin\docker.exe"),
+            ENGINE.to_owned(),
         );
+        #[cfg(unix)]
+        let (executable, endpoint) = (unix_host::client()?, unix_host::endpoint()?);
+        let (pin, ancestors, client_identity) = pin_client(&executable)?;
         Ok(Self {
             _config: tempfile::tempdir()?,
             _pin: pin,
             _ancestors: ancestors,
             client_identity,
             executable,
+            endpoint,
         })
     }
     fn command(&self, args: &[String]) -> Command {
@@ -371,7 +382,7 @@ impl Docker {
             .arg("--config")
             .arg(self._config.path())
             .arg("--host")
-            .arg(ENGINE)
+            .arg(&self.endpoint)
             .args(args);
         #[cfg(windows)]
         {

@@ -341,11 +341,33 @@ fn publish(source: &Path, out: &Path) -> Result {
         }
         Ok(())
     }
-    #[cfg(not(windows))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    {
+        rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            source,
+            rustix::fs::CWD,
+            out,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(|_| {
+            Error::Conflict("Geri yükleme hedefi değişti veya yayınlanamadı; mevcut hedef korunur.")
+        })?;
+        if let Some(parent) = out.parent() {
+            let _ = fs::File::open(parent).and_then(|d| d.sync_all());
+        }
+        Ok(())
+    }
+    #[cfg(not(any(
+        windows,
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple"
+    )))]
     {
         let _ = (source, out);
         Err(Error::Unavailable(
-            "Taşınabilir home geri yükleme Windows gerektirir.",
+            "Bu platformda atomik geri yükleme desteklenmiyor.",
         ))
     }
 }

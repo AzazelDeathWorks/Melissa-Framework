@@ -558,7 +558,7 @@ impl ToolDispatcher for CheckedEdits {
         Box::pin(async move {
             let edit = matches!(
                 c.name.as_str(),
-                "fs_patch" | "fs_create" | "fs_delete" | "fs_move"
+                "fs_patch" | "fs_replace" | "fs_create" | "fs_delete" | "fs_move"
             );
             let id = c.id.clone();
             let name = c.name.clone();

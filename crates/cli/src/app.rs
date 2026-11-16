@@ -109,9 +109,25 @@ pub fn default_home() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("MELISSA_HOME") {
         return absolute(Path::new(&path));
     }
-    let base = std::env::var_os("LOCALAPPDATA")
-        .ok_or(Error::Usage("--home PATH veya MELISSA_HOME gerekli."))?;
-    absolute(&PathBuf::from(base).join("Melissa/cli-v1"))
+    let missing = Error::Usage("--home PATH veya MELISSA_HOME gerekli.");
+    let var = |name| {
+        std::env::var_os(name)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    let base = if cfg!(windows) {
+        var("LOCALAPPDATA").ok_or(missing)?
+    } else if cfg!(target_os = "macos") {
+        var("HOME")
+            .ok_or(missing)?
+            .join("Library/Application Support")
+    } else {
+        var("XDG_DATA_HOME")
+            .filter(|p| p.is_absolute())
+            .or_else(|| var("HOME").map(|h| h.join(".local/share")))
+            .ok_or(missing)?
+    };
+    absolute(&base.join("Melissa/cli-v1"))
 }
 pub fn absolute(path: &Path) -> Result<PathBuf> {
     if path
@@ -123,8 +139,29 @@ pub fn absolute(path: &Path) -> Result<PathBuf> {
         ));
     }
     let path = std::path::absolute(path)?.components().collect::<PathBuf>();
+    #[cfg(unix)]
+    let path = resolve_host_links(path);
     safe_path(&path)?;
     Ok(path)
+}
+/// macOS spells system locations through root-owned top-level links
+/// (`/var`, `/tmp` -> `/private/...`). Only such a first component is
+/// resolved; every link below it is still denied by `safe_path`.
+#[cfg(unix)]
+fn resolve_host_links(path: PathBuf) -> PathBuf {
+    use std::os::unix::fs::MetadataExt;
+    let mut parts = path.components();
+    let (Some(std::path::Component::RootDir), Some(first)) = (parts.next(), parts.next()) else {
+        return path;
+    };
+    let top = Path::new("/").join(first);
+    match fs::symlink_metadata(&top) {
+        Ok(m) if m.file_type().is_symlink() && m.uid() == 0 => match fs::canonicalize(&top) {
+            Ok(real) => real.join(parts.as_path()),
+            Err(_) => path,
+        },
+        _ => path,
+    }
 }
 pub(crate) fn safe_path(path: &Path) -> Result {
     use std::path::{Component, Prefix};
@@ -210,9 +247,7 @@ impl App {
         safe_path(&home)?;
         let _pin = Repository::open(&home, Limits::default(), vec![])?;
         let key = vault::create_key(&home.join("store-key.dpapi")).map_err(|_| {
-            Error::Denied(
-                "Windows kullanıcı anahtarı oluşturulamadı; mevcut anahtar değiştirilmedi.",
-            )
+            Error::Denied("Kullanıcı anahtarı oluşturulamadı; mevcut anahtar değiştirilmedi.")
         })?;
         drop(key);
         fs::create_dir(home.join("tasks"))?;
@@ -227,7 +262,7 @@ impl App {
         file.write_all(&bytes(&m)?)?;
         file.sync_all()?;
         Ok(
-            json!({"command":"init","status":"initialized","home":home,"encryption":"DPAPI_user_key_and_authenticated_local_store","API_calls":0}),
+            json!({"command":"init","status":"initialized","home":home,"encryption":if cfg!(windows) {"DPAPI_user_key_and_authenticated_local_store"} else {"owner_only_key_file_and_authenticated_local_store"},"API_calls":0}),
         )
     }
     pub(crate) fn restored_home(home: &Path, secret: &[u8; 32]) -> Result<StoreKey> {

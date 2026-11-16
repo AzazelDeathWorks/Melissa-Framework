@@ -1,4 +1,3 @@
-#![cfg(windows)]
 use melissa_repository::{Error, Limits, Repository, symbols::SyntaxIndex};
 use std::{fs, sync::atomic::AtomicBool, time::Duration};
 #[test]
