@@ -126,6 +126,7 @@ pub struct Gateway {
     live_tool_projection: bool,
     transient_retries: bool,
     output_limit_retries: u8,
+    rate_limit_retries: bool,
     output_capabilities: OutputCapabilityRegistry,
     unknown_permits: BTreeMap<String, OwnedSemaphorePermit>,
     continuation: Option<Box<dyn crate::continuation::ContinuationStore>>,
@@ -289,6 +290,7 @@ impl Gateway {
             live_tool_projection: false,
             transient_retries: false,
             output_limit_retries: 0,
+            rate_limit_retries: false,
             output_capabilities: OutputCapabilityRegistry::default(),
             unknown_permits: BTreeMap::new(),
             continuation: None,
@@ -315,6 +317,13 @@ impl Gateway {
     /// steps, at most `retries` times per run. Default 0 stops as InvalidOutput.
     pub fn with_output_limit_retries(mut self, retries: u8) -> Self {
         self.output_limit_retries = retries;
+        self
+    }
+    /// Opt-in operator assertion that the provider never bills an HTTP 429
+    /// rejection (RFC 6585: not processed). Such attempts settle as known zero
+    /// usage and are retried under `with_transient_retries`. Default: unknown.
+    pub fn with_rate_limit_retries(mut self) -> Self {
+        self.rate_limit_retries = true;
         self
     }
     /// Opt-in host configuration; the legacy constructor keeps its 30-minute bound.
@@ -1213,8 +1222,15 @@ impl Gateway {
                         .as_ref()
                         .map(|r| r.usage)
                         .unwrap_or_default();
-                    let not_sent =
-                        outcome.response.is_none() && outcome.delivery == Delivery::NotSent;
+                    let not_sent = outcome.response.is_none()
+                        && (outcome.delivery == Delivery::NotSent
+                            || self.rate_limit_retries
+                                && outcome.delivery == Delivery::ResponseReceived
+                                && outcome.http_status == Some(429)
+                                && outcome
+                                    .error
+                                    .as_ref()
+                                    .is_some_and(|e| e.kind == ErrorKind::RateLimited));
                     let accounted = if not_sent {
                         ModelUsage {
                             input_tokens: Some(0),

@@ -494,7 +494,7 @@ async fn run(host: Arc<Mutex<Host>>) -> std::result::Result<Value, String> {
                 + wall_ms
                 + 60_000,
             allow_fallback: false,
-            max_backoff_ms: 5_000,
+            max_backoff_ms: 30_000,
             decoder_limits: DecoderLimits::default(),
         },
         false,
@@ -502,6 +502,8 @@ async fn run(host: Arc<Mutex<Host>>) -> std::result::Result<Value, String> {
     .map_err(gw)?
     .with_host_run_limit(HostRunLimit::new(wall_ms).map_err(gw)?)
     .with_output_limit_retries(4)
+    .with_transient_retries()
+    .with_rate_limit_retries()
     .with_request_limits(RequestLimits {
         max_history_bytes: 32 * 1024 * 1024,
     })

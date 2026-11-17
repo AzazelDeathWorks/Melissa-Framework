@@ -518,6 +518,44 @@ async fn opted_in_transient_retry_only_retries_proven_not_sent_and_keeps_zero_us
     );
 }
 
+#[tokio::test]
+async fn opted_in_retry_treats_http_429_as_known_zero_usage_rejection() {
+    let dir = tempfile::tempdir().unwrap();
+    let http = http_fixture(vec![
+        HttpPlan {
+            status: 429,
+            body: b"{}".to_vec(),
+            delay: Duration::ZERO,
+        },
+        HttpPlan::sse(text_response("done", false, true)),
+    ])
+    .await;
+    let mut policy = policy();
+    policy.max_backoff_ms = 100;
+    let mut g = gateway(store(&dir.path().join("store"), 10_000), &http, policy)
+        .with_transient_retries()
+        .with_rate_limit_retries();
+    let r = g
+        .run(
+            &spec("ratelimited"),
+            &mut FakeTools::default(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status, RunStatus::FinalCandidate);
+    assert_eq!(http.requests.load(Ordering::SeqCst), 2);
+    assert!(!r.requires_reconciliation);
+    assert_eq!(
+        g.store()
+            .journal()
+            .model_budget(TASK)
+            .unwrap()
+            .unknown_requests,
+        0
+    );
+}
+
 #[derive(Default)]
 struct FakeTools {
     context_updates: Vec<String>,
