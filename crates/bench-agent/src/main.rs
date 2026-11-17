@@ -6,7 +6,7 @@
 //!
 //! MELISSA_BENCH_ENDPOINT, MELISSA_BENCH_PROTOCOL, MELISSA_BENCH_MODEL and
 //! MELISSA_BENCH_API_KEY select the provider; MELISSA_BENCH_MAX_TURNS and
-//! MELISSA_BENCH_WALL_MS bound the run. The instruction path is argv[1].
+//! MELISSA_BENCH_WALL_MS (at most the gateway bound of 30 min) bound the run. The instruction path is argv[1].
 use melissa_core_contracts::{TaskState, catalog::Catalog, wire::TaskContractV1};
 use melissa_local_store::{LocalStore, StoreConfig, StoreKey};
 use melissa_model_gateway::{
@@ -431,7 +431,7 @@ async fn run(host: Arc<Mutex<Host>>) -> std::result::Result<Value, String> {
     let instruction =
         std::fs::read_to_string(std::env::args().nth(1).ok_or("instruction path required")?)
             .map_err(|e| e.to_string())?;
-    let wall_ms = env_or("MELISSA_BENCH_WALL_MS", 1_800_000);
+    let wall_ms = env_or("MELISSA_BENCH_WALL_MS", 1_800_000).clamp(1, 1_800_000);
     let max_turns = env_or("MELISSA_BENCH_MAX_TURNS", 200).clamp(1, 4096) as u32;
     let protocol: Protocol = serde_json::from_value(Value::String(env("MELISSA_BENCH_PROTOCOL")))
         .map_err(|e| e.to_string())?;
