@@ -1099,6 +1099,55 @@ async fn refusal_and_provider_output_limits_do_not_execute_or_fake_a_final_resul
 }
 
 #[tokio::test]
+async fn opted_in_output_limit_retry_discards_the_cut_reply_and_asks_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let limited = || {
+        wire(vec![
+            created(),
+            json!({"type":"response.incomplete","response":{"id":"resp_fixture","model":"fixture-snapshot","status":"incomplete","output":[],"usage":{"input_tokens":12,"output_tokens":4,"total_tokens":16},"error":null,"incomplete_details":{"reason":"max_output_tokens"}}}),
+        ])
+    };
+    let http = http_fixture(vec![
+        HttpPlan::sse(limited()),
+        HttpPlan::sse(text_response("done", false, true)),
+    ])
+    .await;
+    let mut g = gateway(store(&dir.path().join("store"), 10_000), &http, policy())
+        .with_output_limit_retries(1);
+    let mut tools = FakeTools::default();
+    let r = g
+        .run(
+            &spec("limitretry"),
+            &mut tools,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status, RunStatus::FinalCandidate);
+    assert_eq!(r.answer.as_deref(), Some("done"));
+    assert_eq!(tools.executed.load(Ordering::SeqCst), 0);
+    assert_eq!(http.requests.load(Ordering::SeqCst), 2);
+    let second = http.bodies.lock().unwrap()[1].to_string();
+    assert!(second.contains("output token limit"));
+    assert!(!r.task_accepted);
+
+    let dir = tempfile::tempdir().unwrap();
+    let http = http_fixture(vec![HttpPlan::sse(limited()), HttpPlan::sse(limited())]).await;
+    let mut g = gateway(store(&dir.path().join("store"), 10_000), &http, policy())
+        .with_output_limit_retries(1);
+    let r = g
+        .run(
+            &spec("limitretry2"),
+            &mut tools,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status, RunStatus::InvalidOutput);
+    assert_eq!(http.requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn stream_ending_after_tool_arguments_without_terminal_snapshot_executes_zero_and_reserves_unknown()
  {
     let dir = tempfile::tempdir().unwrap();

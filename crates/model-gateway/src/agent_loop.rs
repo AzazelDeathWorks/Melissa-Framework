@@ -125,6 +125,7 @@ pub struct Gateway {
     json_object_output: bool,
     live_tool_projection: bool,
     transient_retries: bool,
+    output_limit_retries: u8,
     output_capabilities: OutputCapabilityRegistry,
     unknown_permits: BTreeMap<String, OwnedSemaphorePermit>,
     continuation: Option<Box<dyn crate::continuation::ContinuationStore>>,
@@ -169,6 +170,7 @@ fn pending_tool_batch(messages: &[Message], seen: &BTreeSet<String>) -> Result<V
 }
 
 const TOOL_CHECKPOINT_GROUP: usize = 8;
+const OUTPUT_LIMIT_FEEDBACK: &str = "Host notice: your previous reply hit the output token limit and was discarded unexecuted. Continue with shorter reasoning and smaller steps; write large files in several parts.";
 
 fn now() -> Result<u64> {
     melissa_execution_broker::unix_ms()
@@ -286,6 +288,7 @@ impl Gateway {
             json_object_output: false,
             live_tool_projection: false,
             transient_retries: false,
+            output_limit_retries: 0,
             output_capabilities: OutputCapabilityRegistry::default(),
             unknown_permits: BTreeMap::new(),
             continuation: None,
@@ -305,6 +308,13 @@ impl Gateway {
     /// This never enables provider/model fallback or retries unknown usage.
     pub fn with_transient_retries(mut self) -> Self {
         self.transient_retries = true;
+        self
+    }
+    /// Opt-in: a response cut off by the provider output limit is discarded
+    /// (never replayed or executed) and the model is asked to retry in smaller
+    /// steps, at most `retries` times per run. Default 0 stops as InvalidOutput.
+    pub fn with_output_limit_retries(mut self, retries: u8) -> Self {
+        self.output_limit_retries = retries;
         self
     }
     /// Opt-in host configuration; the legacy constructor keeps its 30-minute bound.
@@ -675,6 +685,7 @@ impl Gateway {
         }
         let mut seen_calls = BTreeSet::new();
         let mut successful = BTreeSet::new();
+        let mut output_limit_retries = 0u8;
         let mut selected = None;
         let mut next_turn = 0;
         let mut binding = if self.continuation.is_some() {
@@ -1463,6 +1474,13 @@ impl Gateway {
                         return self.complete(result);
                     }
                     StopReason::ToolCalls => {}
+                    StopReason::MaxTokens if output_limit_retries < self.output_limit_retries => {
+                        output_limit_retries += 1;
+                        messages.push(Message::User {
+                            text: OUTPUT_LIMIT_FEEDBACK.into(),
+                        });
+                        continue;
+                    }
                     _ => {
                         result.status = RunStatus::InvalidOutput;
                         return self.complete(result);
