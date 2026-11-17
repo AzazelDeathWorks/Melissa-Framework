@@ -533,7 +533,26 @@ async fn run(host: Arc<Mutex<Host>>) -> std::result::Result<Value, String> {
         .journal()
         .model_budget(TASK)
         .map_err(|e| format!("{e:?}"))?;
+    let records = g
+        .store()
+        .journal()
+        .model_requests(TASK)
+        .map_err(|e| format!("{e:?}"))?;
+    let (mut usage_in, mut usage_out, mut cached) = (0u64, 0u64, 0u64);
+    let mut failures = vec![];
+    for rec in &records {
+        if let Some(s) = &rec.settlement {
+            usage_in += s.usage.input_tokens.unwrap_or(0);
+            usage_out += s.usage.output_tokens.unwrap_or(0);
+            cached += s.usage.cached_input_tokens.unwrap_or(0);
+            if let Some(reason) = &s.reason {
+                failures.push(format!("{:?}: {reason}", rec.state));
+            }
+        }
+    }
     let mut out = json!({
+        "reported_input_tokens": usage_in, "reported_output_tokens": usage_out,
+        "cached_input_tokens": cached, "request_failures": failures,
         "requests": 0, "tool_calls": 0,
         "input_tokens": budget.charged_input_tokens, "output_tokens": budget.charged_output_tokens,
         "elapsed_ms": started.elapsed().as_millis() as u64,
