@@ -7,14 +7,13 @@ exercise all production repository/broker authorization checks. A final model
 answer is not a pass. No low-memory, safety, or competitive-score claim follows
 from this adapter alone.
 
-File transfers require a POSIX host with `O_NOFOLLOW` and Linux task utilities
-(`stat`, `mktemp`, `cat`, `mv -T`). Copied links are never followed on the
-host, and symlink write destinations are rejected; use the bash
-tool to inspect and explicitly select the intended container path. Reads are
-limited to 16 MiB per transfer; larger files can be inspected with bounded bash
-commands. Write payloads use private host transfer directories, not command-line
-arguments or environment overrides; uploaded files are copied to agent-owned
-staging before replacement. Live logs and child stores stay in private scratch.
+File tools use GNU/Linux task utilities (`stat`, `mktemp`, `head`, `base64`,
+`cat`, `mv -T`). Reads run inside the container as the configured task user and
+are limited to 16 MiB; larger files can be inspected with bounded bash commands.
+Writes reject symlink destinations. Payloads use the pinned Harbor 0.26 Docker
+stdin transport, not argv, environment overrides or privileged uploads; staging
+and replacement run as the task user. Other environment backends do not support
+the write helper. Live logs and child stores stay in private host scratch.
 
 ## Reproduce
 

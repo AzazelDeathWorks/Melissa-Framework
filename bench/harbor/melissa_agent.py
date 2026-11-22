@@ -16,12 +16,12 @@ import math
 import os
 import posixpath
 import shlex
-import stat
 import tempfile
 import time
 from pathlib import Path
 
 from harbor.agents.base import BaseAgent
+from harbor.constants import MAIN_SERVICE_NAME
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 from harbor.models.job.plugin import BaseJobPlugin
@@ -78,17 +78,14 @@ class MelissaAgent(BaseAgent):
         path = self._abs(req["path"])
         if op == "read":
             try:
-                with tempfile.TemporaryDirectory(dir=scratch) as transfer:
-                    local = Path(transfer) / "payload"
-                    await env.download_file(path, local)
-                    fd = os.open(local, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-                    with os.fdopen(fd, "rb") as source:
-                        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
-                            raise ValueError("not a regular file")
-                        data = source.read(16 * 1024 * 1024 + 1)
-                        if len(data) > 16 * 1024 * 1024:
-                            raise ValueError("file exceeds read limit; use bash")
-                    return {"content_b64": base64.b64encode(data).decode()}
+                q = shlex.quote(path)
+                result = await env.exec(f"set -o pipefail; test -f {q} && head -c 16777217 -- {q} | base64 -w0")
+                if result.return_code != 0:
+                    return {"error": f"cannot read {path}"}
+                encoded = result.stdout or ""
+                if len(base64.b64decode(encoded, validate=True)) > 16 * 1024 * 1024:
+                    return {"error": "file exceeds read limit; use bash"}
+                return {"content_b64": encoded}
             except Exception as e:
                 return {"error": f"cannot read {path}: {type(e).__name__}"}
         if op == "write":
@@ -105,14 +102,17 @@ class MelissaAgent(BaseAgent):
                 mode = (old.stdout or "").strip()
                 if not mode or any(c not in "01234567" for c in mode):
                     mode = "644"
-                with tempfile.TemporaryDirectory(dir=scratch) as transfer:
-                    local = Path(transfer) / "payload"
-                    local.write_bytes(data)
-                    local.chmod(0o644)
-                    await env.upload_file(local, stage + "/payload")
-                payload = shlex.quote(stage + "/payload")
                 ready = shlex.quote(stage + "/ready")
-                result = await env.exec(f"cat -- {payload} > {ready} && chmod {mode} -- {ready} && test ! -L {q} && mv -T -- {ready} {q}")
+                # Pinned Harbor Docker stdin preserves the task UID without exposing data in argv.
+                command = ["exec", "-T"]
+                user = env._resolve_user(None)
+                if user is not None:
+                    command.extend(["-u", str(user)])
+                command.extend([MAIN_SERVICE_NAME, "sh", "-c", f"cat > {ready}"])
+                result = await env._run_docker_compose_command(command, stdin_data=data, check=False)
+                if result.return_code != 0:
+                    return {"error": f"cannot stage file contents: {path}"}
+                result = await env.exec(f"chmod {mode} -- {ready} && test ! -L {q} && mv -T -- {ready} {q}")
                 if result.return_code != 0:
                     return {"error": f"cannot replace file: {path}"}
                 return {}

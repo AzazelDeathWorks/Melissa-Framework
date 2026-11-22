@@ -5,7 +5,6 @@ import importlib.util
 import json
 import logging
 import os
-import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -110,25 +109,19 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
     def result(self):
         return json.loads((self.agent.logs_dir / "melissa-result.json").read_text())
 
-    async def test_downloaded_links_and_directories_are_not_read_on_host(self):
+    async def test_reads_do_not_use_privileged_host_downloads(self):
         sentinel = self.root / "host-only"
         sentinel.write_text("host sentinel")
-        async def linked(_, local):
-            local.symlink_to(sentinel)
-        async def directory(_, local):
-            local.mkdir()
-        async def regular(_, local):
-            local.write_bytes(b"task data")
-            local.chmod(0o444)
-        for download in (linked, directory):
-            env = SimpleNamespace(download_file=download)
-            result = await self.agent._serve(env, {"op": "read", "path": "/task"}, self.root)
-            self.assertIn("error", result)
-            self.assertNotIn("host sentinel", str(result))
-        env = SimpleNamespace(download_file=regular)
+        env = SimpleNamespace(
+            download_file=AsyncMock(side_effect=AssertionError("no privileged downloads")),
+            exec=AsyncMock(return_value=SimpleNamespace(return_code=0, stdout=base64.b64encode(b"task data").decode())),
+        )
         for _ in range(2):
             result = await self.agent._serve(env, {"op": "read", "path": "/task"}, self.root)
             self.assertEqual(base64.b64decode(result["content_b64"]), b"task data")
+        env.download_file.assert_not_awaited()
+        env.exec.return_value.return_code = 1
+        self.assertIn("error", await self.agent._serve(env, {"op": "read", "path": "/task"}, self.root))
         self.assertEqual(sentinel.read_text(), "host sentinel")
 
     async def test_final_usage_and_model_name_are_preserved(self):
@@ -147,17 +140,21 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             async def exec(self, command, env=None, **_):
                 if env is not None or "MELISSA_WRITE_CHUNK" in command or base64.b64encode(b"new content").decode() in command:
                     raise AssertionError("file data must not enter process arguments")
-                proc = await asyncio.create_subprocess_shell(command, env={**os.environ, **(env or {})}, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                proc = await asyncio.create_subprocess_exec("bash", "-c", command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
                 out, err = await proc.communicate()
                 return SimpleNamespace(return_code=proc.returncode, stdout=out.decode(), stderr=err.decode())
             async def upload_file(self, source, dest):
-                if source.parent.stat().st_mode & 0o777 != 0o700:
-                    raise AssertionError("host transfer files require a private directory")
-                if source.stat().st_mode & 0o444 != 0o444:
-                    raise PermissionError("root-owned uploads must be readable by the agent")
-                shutil.copy2(source, dest)
+                raise AssertionError("no privileged uploads")
             async def download_file(self, source, dest):
-                shutil.copy2(source, dest, follow_symlinks=False)
+                raise AssertionError("no privileged downloads")
+            def _resolve_user(self, _):
+                return None
+            async def _run_docker_compose_command(self, command, stdin_data, **_):
+                if any("new content" in arg for arg in command):
+                    raise AssertionError("file data must not enter process arguments")
+                proc = await asyncio.create_subprocess_exec("sh", "-c", command[-1], stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                out, err = await proc.communicate(stdin_data)
+                return SimpleNamespace(return_code=proc.returncode, stdout=out.decode(), stderr=err.decode())
         env = LocalContainer()
         directory = self.root / "directory"
         directory.mkdir()
@@ -200,9 +197,8 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((self.agent.logs_dir / "melissa-trace.jsonl").is_symlink())
 
     @unittest.skipUnless(os.environ.get("MELISSA_HARBOR_DOCKER_IMAGE"), "opt-in local Docker image")
-    async def test_real_harbor_upload_handles_nonroot_tmpfs_without_content_in_argv(self):
+    async def test_real_docker_stdin_handles_nonroot_tmpfs_without_privileged_transfers(self):
         from harbor.constants import MAIN_SERVICE_NAME
-        from harbor.environments.docker.docker_unix import UnixOps
 
         project = "melissa-transfer-" + os.urandom(6).hex()
         config = self.root / "compose.yaml"
@@ -217,8 +213,13 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
 
         class Container:
             logger = logging.getLogger(__name__)
+            redirect_stage = False
 
             async def _run_docker_compose_command(self, command, check=True, stdin_data=None, **_):
+                if self.redirect_stage and stdin_data is not None:
+                    self.redirect_stage = False
+                    stage = command[-1].removeprefix("cat > ").rsplit("/", 1)[0]
+                    await self.exec(f"rm -rf -- {stage} && ln -s /tmp/protected {stage}")
                 args = ["docker", "compose", "-p", project, "-f", str(config), *command]
                 argv.append(args)
                 proc = await asyncio.to_thread(subprocess.run, args, input=stdin_data, capture_output=True, timeout=30)
@@ -228,11 +229,14 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
 
             async def exec(self, command, **_):
                 return await self._run_docker_compose_command(
-                    ["exec", "-T", "-u", "10001:10001", MAIN_SERVICE_NAME, "sh", "-c", command], check=False
+                    ["exec", "-T", "-u", "10001:10001", MAIN_SERVICE_NAME, "bash", "-c", command], check=False
                 )
 
             async def upload_file(self, source, dest):
-                await UnixOps(self).upload_file(source, dest)
+                raise AssertionError("no privileged uploads")
+
+            def _resolve_user(self, _):
+                return "10001:10001"
 
         env = Container()
         marker = b"private-transfer-content-not-for-argv"
@@ -244,6 +248,19 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await self.agent._serve(env, request, self.root), {})
                 self.assertEqual((await env.exec("cat /tmp/data")).stdout.encode(), data)
                 self.assertEqual((await env.exec("stat -c %u:%a /tmp/data")).stdout.strip(), "10001:640")
+                read = await self.agent._serve(env, {"op": "read", "path": "/tmp/data"}, self.root)
+                self.assertEqual(base64.b64decode(read["content_b64"]), data)
+            await env._run_docker_compose_command(["exec", "-T", "-u", "root", MAIN_SERVICE_NAME, "sh", "-c", "touch /tmp/root-only; chmod 600 /tmp/root-only"])
+            self.assertIn("error", await self.agent._serve(env, {"op": "read", "path": "/tmp/root-only"}, self.root))
+            request["path"] = "/tmp/root-only"
+            self.assertIn("error", await self.agent._serve(env, request, self.root))
+            self.assertEqual((await env.exec("stat -c %u:%s /tmp/root-only")).stdout.strip(), "0:0")
+            await env._run_docker_compose_command(["exec", "-T", "-u", "root", MAIN_SERVICE_NAME, "sh", "-c", "mkdir -m 700 /tmp/protected"])
+            env.redirect_stage = True
+            request["path"] = "/tmp/data"
+            self.assertIn("error", await self.agent._serve(env, request, self.root))
+            protected = await env._run_docker_compose_command(["exec", "-T", "-u", "root", MAIN_SERVICE_NAME, "find", "/tmp/protected", "-mindepth", "1", "-print"])
+            self.assertFalse(protected.stdout)
             await env.exec("ln -s /tmp/data /tmp/link")
             request["path"] = "/tmp/link"
             self.assertIn("error", await self.agent._serve(env, request, self.root))
