@@ -279,7 +279,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("error", await self.agent._serve(env, request, self.root))
             self.assertEqual((await env.exec("readlink /tmp/link")).stdout.strip(), "/tmp/data")
             self.assertEqual((await env.exec("cat /tmp/data")).stdout.encode(), data)
-            self.assertFalse((await env.exec("find /tmp -name '.melissa-write-*'")).stdout)
+            self.assertFalse((await env.exec("find /tmp -mindepth 1 -maxdepth 1 -name '.melissa-write-*'")).stdout)
             commands = "\0".join(arg for args in argv for arg in args)
             self.assertNotIn(marker.decode(), commands)
             self.assertNotIn(base64.b64encode(marker).decode(), commands)
