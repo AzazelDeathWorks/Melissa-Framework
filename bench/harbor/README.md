@@ -36,8 +36,9 @@ and the matching Harbor timeout explicitly; otherwise the adapter refuses to
 silently invent the task deadline. An unlimited Harbor timeout retains a bounded
 30-minute host run. This does not extend any benchmark limit.
 
-Each request receives the live remaining time; earlier countdown messages do
-not accumulate. `MELISSA_BENCH_REQUEST_MS` optionally lowers the per-request
+Each request receives the live remaining time as a trailing, request-local
+notice. The stable system/history prefix is preserved for cache reuse; earlier
+countdown messages do not accumulate. `MELISSA_BENCH_REQUEST_MS` optionally lowers the per-request
 timeout (default five minutes). Cutting an already-sent request retains unknown
 usage and stops for reconciliation, **not** an automatic replay. This is not a
 provider-independent reasoning-effort control.

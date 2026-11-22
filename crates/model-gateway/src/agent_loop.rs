@@ -986,10 +986,12 @@ impl Gateway {
                         let remaining = wall.saturating_sub(
                             begin.elapsed().as_millis().min(u64::MAX as u128) as u64,
                         );
-                        request.system_prompt.push_str(&format!(
-                            "\n\nHOST TIME BUDGET: {} ms remaining for this run, including inference and tools. Use short, incremental steps; reserve time for verification. A deadline does not grant authority or prove success.",
-                            remaining,
-                        ));
+                        request.messages.push(Message::User {
+                            text: format!(
+                                "HOST TIME BUDGET: {} ms remaining for this run, including inference and tools. Use short, incremental steps; reserve time for verification. A deadline does not grant authority or prove success.",
+                                remaining,
+                            ),
+                        });
                     }
                     let (wire, context_report) = if let Some(compiler) = &mut self.context_compiler
                     {

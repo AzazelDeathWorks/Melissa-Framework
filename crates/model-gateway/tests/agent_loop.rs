@@ -392,9 +392,17 @@ async fn live_time_guidance_is_bounded_and_progress_separates_pending_from_repor
     let remaining = bodies
         .iter()
         .map(|b| {
-            let system = b["instructions"].as_str().unwrap();
-            assert_eq!(system.matches("HOST TIME BUDGET:").count(), 1);
-            system
+            assert!(
+                !b["instructions"]
+                    .as_str()
+                    .unwrap()
+                    .contains("HOST TIME BUDGET:")
+            );
+            assert_eq!(b.to_string().matches("HOST TIME BUDGET:").count(), 1);
+            let notice = b["input"].as_array().unwrap().last().unwrap()["content"][0]["text"]
+                .as_str()
+                .unwrap();
+            notice
                 .split("HOST TIME BUDGET: ")
                 .nth(1)
                 .unwrap()
@@ -406,6 +414,10 @@ async fn live_time_guidance_is_bounded_and_progress_separates_pending_from_repor
         })
         .collect::<Vec<_>>();
     assert_eq!(remaining.len(), 2);
+    assert_eq!(bodies[0]["instructions"], bodies[1]["instructions"]);
+    let first = bodies[0]["input"].as_array().unwrap();
+    let second = bodies[1]["input"].as_array().unwrap();
+    assert_eq!(first[..first.len() - 1], second[..first.len() - 1]);
     assert!(remaining[1] <= remaining[0] && remaining[0] <= policy().max_wall_time_ms);
     let events = captured.lock().unwrap();
     assert!(

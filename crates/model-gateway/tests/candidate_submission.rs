@@ -136,6 +136,7 @@ async fn intelligent_native_loop_rebuilds_each_turn_and_sends_output_schema_once
         submission_policy(),
     )
     .with_native_context_compiler(compiler)
+    .with_time_awareness()
     .with_candidate_submission_tool("submit_result")
     .unwrap();
     let mut sink = ExactSink(Sink::new());
@@ -151,6 +152,7 @@ async fn intelligent_native_loop_rebuilds_each_turn_and_sends_output_schema_once
     let bodies = http.bodies.lock().unwrap();
     assert_eq!(bodies.len(), 2);
     for (turn, body) in bodies.iter().enumerate() {
+        assert_eq!(body.to_string().matches("HOST TIME BUDGET:").count(), 1);
         assert!(body.get("text").is_none());
         assert_eq!(
             body["tools"]
