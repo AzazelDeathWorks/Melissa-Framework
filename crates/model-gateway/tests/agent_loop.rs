@@ -1354,6 +1354,62 @@ async fn opted_in_output_limit_retry_discards_the_cut_reply_and_asks_again() {
 }
 
 #[tokio::test]
+async fn output_limit_retry_honors_a_safe_pause_before_another_paid_request() {
+    use melissa_model_gateway::continuation::{ContinuationStore, Phase, TurnCheckpoint};
+    struct PauseRetry;
+    impl ContinuationStore for PauseRetry {
+        fn begin(
+            &mut self,
+            _: &mut LocalStore,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> melissa_model_gateway::Result<Option<TurnCheckpoint>> {
+            Ok(None)
+        }
+        fn publish(
+            &mut self,
+            _: &mut LocalStore,
+            state: &TurnCheckpoint,
+        ) -> melissa_model_gateway::Result<()> {
+            if state.phase == Phase::Safe && state.next_turn == 1 {
+                assert_eq!(state.result.request_ids.len(), 1);
+                assert!(state.messages.last().is_some_and(|m| matches!(m, melissa_model_gateway::Message::User {text} if text.contains("output token limit"))));
+                return Err(GatewayError::new(
+                    ErrorKind::Cancelled,
+                    "fixture safe pause",
+                ));
+            }
+            Ok(())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let limited = wire(vec![
+        created(),
+        json!({"type":"response.incomplete","response":{"id":"resp_fixture","model":"fixture-snapshot","status":"incomplete","output":[],"usage":{"input_tokens":12,"output_tokens":4,"total_tokens":16},"error":null,"incomplete_details":{"reason":"max_output_tokens"}}}),
+    ]);
+    let http = http_fixture(vec![
+        HttpPlan::sse(limited),
+        HttpPlan::sse(text_response("not requested", false, true)),
+    ])
+    .await;
+    let mut g = gateway(store(&dir.path().join("store"), 10_000), &http, policy())
+        .with_output_limit_retries(1)
+        .with_continuation(Box::new(PauseRetry));
+    let mut tools = FakeTools::default();
+    let result = g
+        .run(
+            &spec("pause-limit-retry"),
+            &mut tools,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+    assert_eq!(result.unwrap_err().kind, ErrorKind::Cancelled);
+    assert_eq!(http.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(tools.executed.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn stream_ending_after_tool_arguments_without_terminal_snapshot_executes_zero_and_reserves_unknown()
  {
     let dir = tempfile::tempdir().unwrap();

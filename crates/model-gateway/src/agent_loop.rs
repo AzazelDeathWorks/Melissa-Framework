@@ -1568,6 +1568,19 @@ impl Gateway {
                         messages.push(Message::User {
                             text: OUTPUT_LIMIT_FEEDBACK.into(),
                         });
+                        if self.continuation.is_some() {
+                            self.publish_turn(&crate::continuation::TurnCheckpointView {
+                                schema_version: "melissa.gateway-turn-checkpoint/v1",
+                                binding_digest: &binding,
+                                phase: crate::continuation::Phase::Safe,
+                                next_turn: turn + 1,
+                                messages: &messages,
+                                seen_calls: &seen_calls,
+                                successful: &successful,
+                                selected_model: selected,
+                                result: &result,
+                            })?;
+                        }
                         continue;
                     }
                     _ => {
