@@ -7,6 +7,14 @@ exercise all production repository/broker authorization checks. A final model
 answer is not a pass. No low-memory, safety, or competitive-score claim follows
 from this adapter alone.
 
+File transfers require a POSIX host with `O_NOFOLLOW` and Linux task utilities
+(`stat`, `mktemp`, `base64`, `mv -T`). Symlink reads/writes are rejected rather
+than following host links or silently replacing a container link; use the bash
+tool to inspect and explicitly select the intended container path. Reads are
+limited to 16 MiB per transfer; larger files can be inspected with bounded bash
+commands. Writes use agent-owned staging and bounded chunks, not privileged
+Docker uploads. Live logs and child stores stay in private host scratch.
+
 ## Reproduce
 
 Tested with Harbor **0.26.0**, Python >=3.12 and `terminal-bench@2.0`. These are

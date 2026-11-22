@@ -126,7 +126,8 @@ jobs:
       - name: Compile
         run: cargo +1.98.0 check --locked --workspace --all-targets
       - name: Local CLI contracts
-        run: cargo +1.98.0 test --locked -p melissa-cli
+        # Process fixtures must not overlap repeated exclusive-store reopens.
+        run: cargo +1.98.0 test --locked -p melissa-cli -- --test-threads=1
       - name: Repository filesystem contracts
         run: cargo +1.98.0 test --locked -p melissa-repository --lib --test closeout_contracts --test read_error_observations --test incremental_parse --test property_contracts --test sensitive_visibility --test syntax --test text_eol_contract --test repository_agent_loop --test archive_ancestors --test graph_facts
       - name: Store and vault
