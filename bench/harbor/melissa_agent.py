@@ -76,7 +76,6 @@ class MelissaAgent(BaseAgent):
                 return {"exit_code": -1, "stdout": "", "stderr": f"{type(e).__name__}: {e}"}
             return {"exit_code": r.return_code, "stdout": r.stdout or "", "stderr": r.stderr or ""}
         path = self._abs(req["path"])
-        local = scratch / "io"
         if op == "read":
             try:
                 with tempfile.TemporaryDirectory(dir=scratch) as transfer:
@@ -93,16 +92,36 @@ class MelissaAgent(BaseAgent):
             except Exception as e:
                 return {"error": f"cannot read {path}: {type(e).__name__}"}
         if op == "write":
-            local.write_bytes(base64.b64decode(req["content_b64"]))
             q = shlex.quote(path)
-            pre = await env.exec(f"mkdir -p {shlex.quote(posixpath.dirname(path))} && stat -c %a {q} 2>/dev/null || true")
+            stage = None
             try:
-                await env.upload_file(local, path)
+                with tempfile.TemporaryDirectory(dir=scratch) as transfer:
+                    local = Path(transfer) / "payload"
+                    local.write_bytes(base64.b64decode(req["content_b64"], validate=True))
+                    parent = posixpath.dirname(path)
+                    pre = await env.exec(f"test ! -d {q} && mkdir -p {shlex.quote(parent)} && mktemp {shlex.quote(parent + '/.melissa-write-XXXXXXXX')}")
+                    if pre.return_code != 0 or not (pre.stdout or "").strip():
+                        return {"error": f"cannot stage file write: {path}"}
+                    stage = (pre.stdout or "").strip()
+                    old = await env.exec(f"stat -c %a -- {q} 2>/dev/null || true")
+                    mode = (old.stdout or "").strip()
+                    if not mode or any(c not in "01234567" for c in mode):
+                        mode = "644"
+                    await env.upload_file(local, stage)
+                    staged = shlex.quote(stage)
+                    result = await env.exec(f"chmod {mode} -- {staged} && mv -T -- {staged} {q}")
+                    if result.return_code != 0:
+                        return {"error": f"cannot replace file: {path}"}
+                    return {}
             except Exception as e:
                 return {"error": f"cannot write {path}: {type(e).__name__}"}
-            mode = (pre.stdout or "").strip()
-            await env.exec(f"chmod {mode} {q}" if mode.isdigit() else f"chmod 644 {q}")
-            return {}
+            finally:
+                if stage:
+                    try:
+                        async with asyncio.timeout(1):
+                            await env.exec(f"rm -f -- {shlex.quote(stage)}", timeout_sec=1)
+                    except Exception:
+                        pass
         return {"error": "unknown op"}
 
     async def run(self, instruction: str, environment: BaseEnvironment, context: AgentContext) -> None:

@@ -4,6 +4,7 @@ import base64
 import importlib.util
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -139,6 +140,37 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.agent.run(code, None, self.context)
         self.assertEqual(self.result()["status"], "FinalCandidate")
         self.assertEqual(self.context.n_input_tokens, 12)
+
+    async def test_directory_write_is_rejected_and_read_only_reads_do_not_poison_writes(self):
+        class LocalContainer:
+            async def exec(self, command, **_):
+                proc = await asyncio.create_subprocess_shell(command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                out, err = await proc.communicate()
+                return SimpleNamespace(return_code=proc.returncode, stdout=out.decode(), stderr=err.decode())
+            async def upload_file(self, source, dest):
+                destination = Path(dest)
+                shutil.copy2(source, destination / source.name if destination.is_dir() else destination)
+            async def download_file(self, source, dest):
+                shutil.copy2(source, dest, follow_symlinks=False)
+        env = LocalContainer()
+        directory = self.root / "directory"
+        directory.mkdir()
+        mode = directory.stat().st_mode
+        content = base64.b64encode(b"new content").decode()
+        request = {"op": "write", "path": str(directory), "content_b64": content}
+        result = await self.agent._serve(env, request, self.root)
+        self.assertIn("error", result)
+        self.assertEqual(list(directory.iterdir()), [])
+        self.assertEqual(directory.stat().st_mode, mode)
+        file = self.root / "read-only"
+        file.write_text("old")
+        file.chmod(0o444)
+        read = await self.agent._serve(env, {"op": "read", "path": str(file)}, self.root)
+        self.assertEqual(base64.b64decode(read["content_b64"]), b"old")
+        request["path"] = str(file)
+        self.assertEqual(await self.agent._serve(env, request, self.root), {})
+        self.assertEqual(file.read_text(), "new content")
+        self.assertEqual(file.stat().st_mode & 0o777, 0o444)
 
     async def test_task_writable_log_links_cannot_truncate_host_files(self):
         self.agent.logs_dir.mkdir()
