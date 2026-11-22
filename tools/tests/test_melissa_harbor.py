@@ -140,6 +140,16 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.result()["status"], "FinalCandidate")
         self.assertEqual(self.context.n_input_tokens, 12)
 
+    async def test_task_writable_log_links_cannot_truncate_host_files(self):
+        self.agent.logs_dir.mkdir()
+        sentinel = self.root / "host-file"
+        sentinel.write_text("unchanged")
+        for name in ("melissa-trace.jsonl", "melissa-stderr.log", "melissa-result.json"):
+            (self.agent.logs_dir / name).symlink_to(sentinel)
+        await self.agent.run(self.fixture + "print('{\"op\":\"done\"}')\n", None, self.context)
+        self.assertEqual(sentinel.read_text(), "unchanged")
+        self.assertFalse((self.agent.logs_dir / "melissa-trace.jsonl").is_symlink())
+
     async def test_timeout_saves_last_snapshot_without_faking_complete_usage(self):
         self.agent.wall_time_sec = 0.3
         await self.agent.run(self.fixture + "time.sleep(30)\n", None, self.context)

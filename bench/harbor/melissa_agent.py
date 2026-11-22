@@ -29,7 +29,7 @@ from harbor.models.task.config import TaskConfig
 from harbor.tasks.client import TaskClient
 from harbor.trial.hooks import TrialEvent
 
-from melissa_runtime import atomic_json, remaining_wall_ms, update_context
+from melissa_runtime import atomic_bytes, atomic_json, remaining_wall_ms, update_context
 
 ROOT = Path(__file__).resolve().parents[2]
 BIN = Path(os.environ.get("MELISSA_BENCH_BIN", ROOT / "target/release/melissa-bench"))
@@ -109,9 +109,9 @@ class MelissaAgent(BaseAgent):
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         started = time.monotonic()
         with tempfile.TemporaryDirectory() as tmp, \
-                (self.logs_dir / "melissa-trace.jsonl").open("w", encoding="utf-8") as trace, \
-                (self.logs_dir / "melissa-stderr.log").open("wb") as stderr:
-            scratch = Path(tmp)
+                (Path(tmp) / "trace.jsonl").open("w", encoding="utf-8") as trace, \
+                (Path(tmp) / "stderr.log").open("wb") as stderr:
+            scratch = Path(tmp).resolve()
             (scratch / "instruction.md").write_text(instruction, encoding="utf-8")
             progress_path = self.logs_dir.parent / "melissa-progress.json"
             progress_path.unlink(missing_ok=True)
@@ -166,6 +166,10 @@ class MelissaAgent(BaseAgent):
                     if not final_received or done.get("status") == "GatewayError":
                         done["telemetry_complete"] = False
                     done["wall_ms"] = int((time.monotonic() - started) * 1000)
+                    trace.flush()
+                    stderr.flush()
+                    atomic_bytes(self.logs_dir / "melissa-trace.jsonl", (scratch / "trace.jsonl").read_bytes())
+                    atomic_bytes(self.logs_dir / "melissa-stderr.log", (scratch / "stderr.log").read_bytes())
                     atomic_json(self.logs_dir / "melissa-result.json", done)
                     update_context(context, done)
 

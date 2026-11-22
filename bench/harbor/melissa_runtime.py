@@ -7,10 +7,14 @@ from pathlib import Path
 
 
 def atomic_json(path: Path, value: dict) -> None:
+    atomic_bytes(path, json.dumps(value, indent=2).encode("utf-8"))
+
+
+def atomic_bytes(path: Path, value: bytes) -> None:
     fd, name = tempfile.mkstemp(prefix=f".{path.name}-", dir=path.parent)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(value, f, indent=2)
+        with os.fdopen(fd, "wb") as f:
+            f.write(value)
             f.flush()
             os.fsync(f.fileno())
         os.replace(name, path)
