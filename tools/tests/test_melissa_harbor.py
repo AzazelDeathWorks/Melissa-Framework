@@ -143,13 +143,12 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_directory_write_is_rejected_and_read_only_reads_do_not_poison_writes(self):
         class LocalContainer:
-            async def exec(self, command, **_):
-                proc = await asyncio.create_subprocess_shell(command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            async def exec(self, command, env=None, **_):
+                proc = await asyncio.create_subprocess_shell(command, env={**os.environ, **(env or {})}, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
                 out, err = await proc.communicate()
                 return SimpleNamespace(return_code=proc.returncode, stdout=out.decode(), stderr=err.decode())
             async def upload_file(self, source, dest):
-                destination = Path(dest)
-                shutil.copy2(source, destination / source.name if destination.is_dir() else destination)
+                raise AssertionError("writes must not use root-owned Docker uploads")
             async def download_file(self, source, dest):
                 shutil.copy2(source, dest, follow_symlinks=False)
         env = LocalContainer()
@@ -171,6 +170,10 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.agent._serve(env, request, self.root), {})
         self.assertEqual(file.read_text(), "new content")
         self.assertEqual(file.stat().st_mode & 0o777, 0o444)
+        for payload in (b"", b"a" * 140000, "ğ".encode() * 40000):
+            request["content_b64"] = base64.b64encode(payload).decode()
+            self.assertEqual(await self.agent._serve(env, request, self.root), {})
+            self.assertEqual(file.read_bytes(), payload)
 
     async def test_task_writable_log_links_cannot_truncate_host_files(self):
         self.agent.logs_dir.mkdir()

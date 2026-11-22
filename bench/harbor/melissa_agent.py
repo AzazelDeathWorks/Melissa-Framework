@@ -95,31 +95,34 @@ class MelissaAgent(BaseAgent):
             q = shlex.quote(path)
             stage = None
             try:
-                with tempfile.TemporaryDirectory(dir=scratch) as transfer:
-                    local = Path(transfer) / "payload"
-                    local.write_bytes(base64.b64decode(req["content_b64"], validate=True))
-                    parent = posixpath.dirname(path)
-                    pre = await env.exec(f"test ! -d {q} && mkdir -p {shlex.quote(parent)} && mktemp {shlex.quote(parent + '/.melissa-write-XXXXXXXX')}")
-                    if pre.return_code != 0 or not (pre.stdout or "").strip():
-                        return {"error": f"cannot stage file write: {path}"}
-                    stage = (pre.stdout or "").strip()
-                    old = await env.exec(f"stat -c %a -- {q} 2>/dev/null || true")
-                    mode = (old.stdout or "").strip()
-                    if not mode or any(c not in "01234567" for c in mode):
-                        mode = "644"
-                    await env.upload_file(local, stage)
-                    staged = shlex.quote(stage)
-                    result = await env.exec(f"chmod {mode} -- {staged} && mv -T -- {staged} {q}")
+                data = base64.b64decode(req["content_b64"], validate=True)
+                parent = posixpath.dirname(path)
+                pre = await env.exec(f"test ! -d {q} && mkdir -p {shlex.quote(parent)} && mktemp -d {shlex.quote(parent + '/.melissa-write-XXXXXXXX')}")
+                if pre.return_code != 0 or not (pre.stdout or "").strip():
+                    return {"error": f"cannot stage file write: {path}"}
+                stage = (pre.stdout or "").strip()
+                old = await env.exec(f"stat -c %a -- {q} 2>/dev/null || true")
+                mode = (old.stdout or "").strip()
+                if not mode or any(c not in "01234567" for c in mode):
+                    mode = "644"
+                ready = shlex.quote(stage + "/ready")
+                for offset in range(0, max(1, len(data)), 65536):
+                    chunk = base64.b64encode(data[offset:offset + 65536]).decode()
+                    redirect = ">" if offset == 0 else ">>"
+                    result = await env.exec(f'printf %s "$MELISSA_WRITE_CHUNK" | base64 -d {redirect} {ready}', env={"MELISSA_WRITE_CHUNK": chunk})
                     if result.return_code != 0:
-                        return {"error": f"cannot replace file: {path}"}
-                    return {}
+                        return {"error": f"cannot stage file contents: {path}"}
+                result = await env.exec(f"chmod {mode} -- {ready} && mv -T -- {ready} {q}")
+                if result.return_code != 0:
+                    return {"error": f"cannot replace file: {path}"}
+                return {}
             except Exception as e:
                 return {"error": f"cannot write {path}: {type(e).__name__}"}
             finally:
                 if stage:
                     try:
                         async with asyncio.timeout(1):
-                            await env.exec(f"rm -f -- {shlex.quote(stage)}", timeout_sec=1)
+                            await env.exec(f"rm -rf -- {shlex.quote(stage)}", timeout_sec=1)
                     except Exception:
                         pass
         return {"error": "unknown op"}
