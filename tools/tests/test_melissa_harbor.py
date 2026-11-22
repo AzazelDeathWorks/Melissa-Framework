@@ -1,5 +1,6 @@
 """Offline bridge tests. Harbor-specific cases run when Harbor 0.26 is installed."""
 import asyncio
+import base64
 import importlib.util
 import json
 import os
@@ -106,6 +107,27 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
 
     def result(self):
         return json.loads((self.agent.logs_dir / "melissa-result.json").read_text())
+
+    async def test_downloaded_links_and_directories_are_not_read_on_host(self):
+        sentinel = self.root / "host-only"
+        sentinel.write_text("host sentinel")
+        async def linked(_, local):
+            local.symlink_to(sentinel)
+        async def directory(_, local):
+            local.mkdir()
+        async def regular(_, local):
+            local.write_bytes(b"task data")
+            local.chmod(0o444)
+        for download in (linked, directory):
+            env = SimpleNamespace(download_file=download)
+            result = await self.agent._serve(env, {"op": "read", "path": "/task"}, self.root)
+            self.assertIn("error", result)
+            self.assertNotIn("host sentinel", str(result))
+        env = SimpleNamespace(download_file=regular)
+        for _ in range(2):
+            result = await self.agent._serve(env, {"op": "read", "path": "/task"}, self.root)
+            self.assertEqual(base64.b64decode(result["content_b64"]), b"task data")
+        self.assertEqual(sentinel.read_text(), "host sentinel")
 
     async def test_final_usage_and_model_name_are_preserved(self):
         code = self.fixture + (

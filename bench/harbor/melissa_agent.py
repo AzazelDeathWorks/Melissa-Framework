@@ -16,6 +16,7 @@ import math
 import os
 import posixpath
 import shlex
+import stat
 import tempfile
 import time
 from pathlib import Path
@@ -77,10 +78,18 @@ class MelissaAgent(BaseAgent):
         path = self._abs(req["path"])
         local = scratch / "io"
         if op == "read":
-            local.unlink(missing_ok=True)
             try:
-                await env.download_file(path, local)
-                return {"content_b64": base64.b64encode(local.read_bytes()).decode()}
+                with tempfile.TemporaryDirectory(dir=scratch) as transfer:
+                    local = Path(transfer) / "payload"
+                    await env.download_file(path, local)
+                    fd = os.open(local, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                    with os.fdopen(fd, "rb") as source:
+                        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                            raise ValueError("not a regular file")
+                        data = source.read(16 * 1024 * 1024 + 1)
+                        if len(data) > 16 * 1024 * 1024:
+                            raise ValueError("file exceeds read limit; use bash")
+                    return {"content_b64": base64.b64encode(data).decode()}
             except Exception as e:
                 return {"error": f"cannot read {path}: {type(e).__name__}"}
         if op == "write":
