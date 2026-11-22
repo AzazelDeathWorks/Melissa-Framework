@@ -152,13 +152,22 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_timeout_saves_last_snapshot_without_faking_complete_usage(self):
         self.agent.wall_time_sec = 0.3
-        await self.agent.run(self.fixture + "time.sleep(30)\n", None, self.context)
+        record = self.root / "scratch-path"
+        code = self.fixture + (
+            f"open({str(record)!r}, 'w').write(os.environ['TMPDIR'])\n"
+            "import tempfile\n"
+            "store = tempfile.mkdtemp()\n"
+            "open(store + '/orphan-store', 'w').write('data')\n"
+            "time.sleep(30)\n"
+        )
+        await self.agent.run(code, None, self.context)
         result = self.result()
         self.assertEqual(result["status"], "Deadline")
         self.assertFalse(result["telemetry_complete"])
         self.assertEqual(result["reported_input_tokens"], 12)
         self.assertEqual(result["pending_requests"], 1)
         self.assertIsNone(self.context.n_input_tokens)
+        self.assertFalse(Path(record.read_text()).exists())
 
     async def test_cancellation_reraises_after_persisting_partial_telemetry(self):
         task = asyncio.create_task(self.agent.run(self.fixture + "time.sleep(30)\n", None, self.context))

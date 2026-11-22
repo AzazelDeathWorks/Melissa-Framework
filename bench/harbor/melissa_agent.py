@@ -121,6 +121,7 @@ class MelissaAgent(BaseAgent):
                 MELISSA_BENCH_PROTOCOL=self.protocol,
                 MELISSA_BENCH_MAX_TURNS=self.max_turns,
                 MELISSA_BENCH_PROGRESS_PATH=str(progress_path),
+                TMPDIR=str(scratch), TMP=str(scratch), TEMP=str(scratch),
             )
             if self.endpoint:
                 child_env["MELISSA_BENCH_ENDPOINT"] = self.endpoint
