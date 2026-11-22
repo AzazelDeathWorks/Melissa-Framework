@@ -112,16 +112,27 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_reads_do_not_use_privileged_host_downloads(self):
         sentinel = self.root / "host-only"
         sentinel.write_text("host sentinel")
+        task = self.root / "task"
+        task.write_bytes(b"task data")
+        startup = self.root / "bash_env"
+        startup.write_text("printf 'startup diagnostic\\n'; printf 'startup warning\\n' >&2\n")
+        async def noisy_exec(command):
+            proc = await asyncio.create_subprocess_exec("bash", "-c", command, env={**os.environ, "BASH_ENV": str(startup)}, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            out, err = await proc.communicate()
+            return SimpleNamespace(return_code=proc.returncode, stdout=(out + err).decode())
         env = SimpleNamespace(
             download_file=AsyncMock(side_effect=AssertionError("no privileged downloads")),
-            exec=AsyncMock(return_value=SimpleNamespace(return_code=0, stdout=base64.b64encode(b"task data").decode())),
+            exec=noisy_exec,
         )
         for _ in range(2):
-            result = await self.agent._serve(env, {"op": "read", "path": "/task"}, self.root)
+            result = await self.agent._serve(env, {"op": "read", "path": str(task)}, self.root)
             self.assertEqual(base64.b64decode(result["content_b64"]), b"task data")
         env.download_file.assert_not_awaited()
-        env.exec.return_value.return_code = 1
-        self.assertIn("error", await self.agent._serve(env, {"op": "read", "path": "/task"}, self.root))
+        self.assertIn("error", await self.agent._serve(env, {"op": "read", "path": str(self.root)}, self.root))
+        task.write_bytes(b"x" * (16 * 1024 * 1024 + 1))
+        self.assertIn("error", await self.agent._serve(env, {"op": "read", "path": str(task)}, self.root))
+        env.exec = AsyncMock(return_value=SimpleNamespace(return_code=0, stdout="unframed output"))
+        self.assertIn("error", await self.agent._serve(env, {"op": "read", "path": str(task)}, self.root))
         self.assertEqual(sentinel.read_text(), "host sentinel")
 
     async def test_final_usage_and_model_name_are_preserved(self):
@@ -136,13 +147,15 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.context.n_input_tokens, 12)
 
     async def test_directory_write_is_rejected_and_read_only_reads_do_not_poison_writes(self):
+        startup = self.root / "bash_env"
+        startup.write_text("printf 'startup diagnostic\\n'; printf 'startup warning\\n' >&2\n")
         class LocalContainer:
             async def exec(self, command, env=None, **_):
                 if env is not None or "MELISSA_WRITE_CHUNK" in command or base64.b64encode(b"new content").decode() in command:
                     raise AssertionError("file data must not enter process arguments")
-                proc = await asyncio.create_subprocess_exec("bash", "-c", command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                proc = await asyncio.create_subprocess_exec("bash", "-c", command, env={**os.environ, "BASH_ENV": str(startup)}, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
                 out, err = await proc.communicate()
-                return SimpleNamespace(return_code=proc.returncode, stdout=out.decode(), stderr=err.decode())
+                return SimpleNamespace(return_code=proc.returncode, stdout=(out + err).decode(), stderr="")
             async def upload_file(self, source, dest):
                 raise AssertionError("no privileged uploads")
             async def download_file(self, source, dest):
@@ -225,7 +238,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
                 proc = await asyncio.to_thread(subprocess.run, args, input=stdin_data, capture_output=True, timeout=30)
                 if check and proc.returncode:
                     raise RuntimeError(proc.stderr.decode())
-                return SimpleNamespace(return_code=proc.returncode, stdout=proc.stdout.decode(), stderr=proc.stderr.decode())
+                return SimpleNamespace(return_code=proc.returncode, stdout=(proc.stdout + proc.stderr).decode(), stderr="")
 
             async def exec(self, command, **_):
                 return await self._run_docker_compose_command(

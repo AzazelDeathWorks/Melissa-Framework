@@ -66,6 +66,20 @@ class MelissaAgent(BaseAgent):
     def _abs(self, path: str) -> str:
         return posixpath.normpath(posixpath.join(self.workdir, path))
 
+    async def _file_output(self, env: BaseEnvironment, command: str) -> str:
+        marker = "melissa_" + os.urandom(16).hex()
+        result = await env.exec(
+            f"printf '\\n{marker}:start\\n'; {{ {command}; }} 2>/dev/null; "
+            f"status=$?; printf '\\n{marker}:end\\n'; exit $status"
+        )
+        if result.return_code != 0:
+            raise OSError("file command failed")
+        _, start, body = (result.stdout or "").partition(f"\n{marker}:start\n")
+        payload, end, _ = body.partition(f"\n{marker}:end\n")
+        if not start or not end:
+            raise ValueError("missing file output frame")
+        return payload
+
     async def _serve(self, env: BaseEnvironment, req: dict, scratch: Path) -> dict:
         op = req.get("op")
         if op == "exec":
@@ -79,10 +93,7 @@ class MelissaAgent(BaseAgent):
         if op == "read":
             try:
                 q = shlex.quote(path)
-                result = await env.exec(f"set -o pipefail; test -f {q} && head -c 16777217 -- {q} | base64 -w0")
-                if result.return_code != 0:
-                    return {"error": f"cannot read {path}"}
-                encoded = result.stdout or ""
+                encoded = await self._file_output(env, f"set -o pipefail; test -f {q} && head -c 16777217 -- {q} | base64 -w0")
                 if len(base64.b64decode(encoded, validate=True)) > 16 * 1024 * 1024:
                     return {"error": "file exceeds read limit; use bash"}
                 return {"content_b64": encoded}
@@ -94,13 +105,13 @@ class MelissaAgent(BaseAgent):
             try:
                 data = base64.b64decode(req["content_b64"], validate=True)
                 parent = posixpath.dirname(path)
-                pre = await env.exec(f"test ! -d {q} && test ! -L {q} && mkdir -p {shlex.quote(parent)} && mktemp -d {shlex.quote(parent + '/.melissa-write-XXXXXXXX')}")
-                if pre.return_code != 0 or not (pre.stdout or "").strip():
+                stage = (await self._file_output(env, f"test ! -d {q} && test ! -L {q} && mkdir -p {shlex.quote(parent)} && mktemp -d {shlex.quote(parent + '/.melissa-write-XXXXXXXX')}")).strip()
+                if not stage:
                     return {"error": f"cannot stage file write: {path}"}
-                stage = (pre.stdout or "").strip()
-                old = await env.exec(f"stat -c %a -- {q} 2>/dev/null || true")
-                mode = (old.stdout or "").strip()
-                if not mode or any(c not in "01234567" for c in mode):
+                mode = (await self._file_output(env, f"stat -c %a -- {q} 2>/dev/null || true")).strip()
+                if any(c not in "01234567" for c in mode):
+                    raise ValueError("invalid file mode")
+                if not mode:
                     mode = "644"
                 ready = shlex.quote(stage + "/ready")
                 # Pinned Harbor Docker stdin preserves the task UID without exposing data in argv.
