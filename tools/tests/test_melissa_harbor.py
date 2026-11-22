@@ -170,6 +170,13 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.agent._serve(env, request, self.root), {})
         self.assertEqual(file.read_text(), "new content")
         self.assertEqual(file.stat().st_mode & 0o777, 0o444)
+        link = self.root / "link"
+        link.symlink_to(file)
+        request["path"] = str(link)
+        self.assertIn("error", await self.agent._serve(env, request, self.root))
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(file.read_text(), "new content")
+        request["path"] = str(file)
         for payload in (b"", b"a" * 140000, "ğ".encode() * 40000):
             request["content_b64"] = base64.b64encode(payload).decode()
             self.assertEqual(await self.agent._serve(env, request, self.root), {})

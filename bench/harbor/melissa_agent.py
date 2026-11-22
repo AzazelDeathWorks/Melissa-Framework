@@ -97,7 +97,7 @@ class MelissaAgent(BaseAgent):
             try:
                 data = base64.b64decode(req["content_b64"], validate=True)
                 parent = posixpath.dirname(path)
-                pre = await env.exec(f"test ! -d {q} && mkdir -p {shlex.quote(parent)} && mktemp -d {shlex.quote(parent + '/.melissa-write-XXXXXXXX')}")
+                pre = await env.exec(f"test ! -d {q} && test ! -L {q} && mkdir -p {shlex.quote(parent)} && mktemp -d {shlex.quote(parent + '/.melissa-write-XXXXXXXX')}")
                 if pre.return_code != 0 or not (pre.stdout or "").strip():
                     return {"error": f"cannot stage file write: {path}"}
                 stage = (pre.stdout or "").strip()
@@ -112,7 +112,7 @@ class MelissaAgent(BaseAgent):
                     result = await env.exec(f'printf %s "$MELISSA_WRITE_CHUNK" | base64 -d {redirect} {ready}', env={"MELISSA_WRITE_CHUNK": chunk})
                     if result.return_code != 0:
                         return {"error": f"cannot stage file contents: {path}"}
-                result = await env.exec(f"chmod {mode} -- {ready} && mv -T -- {ready} {q}")
+                result = await env.exec(f"chmod {mode} -- {ready} && test ! -L {q} && mv -T -- {ready} {q}")
                 if result.return_code != 0:
                     return {"error": f"cannot replace file: {path}"}
                 return {}
