@@ -3,6 +3,7 @@ import asyncio
 import base64
 import importlib.util
 import json
+import logging
 import os
 import shutil
 from pathlib import Path
@@ -144,11 +145,17 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_directory_write_is_rejected_and_read_only_reads_do_not_poison_writes(self):
         class LocalContainer:
             async def exec(self, command, env=None, **_):
+                if env is not None or "MELISSA_WRITE_CHUNK" in command or base64.b64encode(b"new content").decode() in command:
+                    raise AssertionError("file data must not enter process arguments")
                 proc = await asyncio.create_subprocess_shell(command, env={**os.environ, **(env or {})}, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
                 out, err = await proc.communicate()
                 return SimpleNamespace(return_code=proc.returncode, stdout=out.decode(), stderr=err.decode())
             async def upload_file(self, source, dest):
-                raise AssertionError("writes must not use root-owned Docker uploads")
+                if source.parent.stat().st_mode & 0o777 != 0o700:
+                    raise AssertionError("host transfer files require a private directory")
+                if source.stat().st_mode & 0o444 != 0o444:
+                    raise PermissionError("root-owned uploads must be readable by the agent")
+                shutil.copy2(source, dest)
             async def download_file(self, source, dest):
                 shutil.copy2(source, dest, follow_symlinks=False)
         env = LocalContainer()
@@ -191,6 +198,63 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.agent.run(self.fixture + "print('{\"op\":\"done\"}')\n", None, self.context)
         self.assertEqual(sentinel.read_text(), "unchanged")
         self.assertFalse((self.agent.logs_dir / "melissa-trace.jsonl").is_symlink())
+
+    @unittest.skipUnless(os.environ.get("MELISSA_HARBOR_DOCKER_IMAGE"), "opt-in local Docker image")
+    async def test_real_harbor_upload_handles_nonroot_tmpfs_without_content_in_argv(self):
+        from harbor.constants import MAIN_SERVICE_NAME
+        from harbor.environments.docker.docker_unix import UnixOps
+
+        project = "melissa-transfer-" + os.urandom(6).hex()
+        config = self.root / "compose.yaml"
+        config.write_text(
+            f"services:\n  {MAIN_SERVICE_NAME}:\n"
+            f"    image: {json.dumps(os.environ['MELISSA_HARBOR_DOCKER_IMAGE'])}\n"
+            '    user: "10001:10001"\n    network_mode: none\n'
+            '    read_only: true\n    tmpfs: ["/tmp:rw,nosuid,nodev"]\n'
+            '    entrypoint: ["/bin/sh", "-c", "tail -f /dev/null"]\n'
+        )
+        argv = []
+
+        class Container:
+            logger = logging.getLogger(__name__)
+
+            async def _run_docker_compose_command(self, command, check=True, stdin_data=None, **_):
+                args = ["docker", "compose", "-p", project, "-f", str(config), *command]
+                argv.append(args)
+                proc = await asyncio.to_thread(subprocess.run, args, input=stdin_data, capture_output=True, timeout=30)
+                if check and proc.returncode:
+                    raise RuntimeError(proc.stderr.decode())
+                return SimpleNamespace(return_code=proc.returncode, stdout=proc.stdout.decode(), stderr=proc.stderr.decode())
+
+            async def exec(self, command, **_):
+                return await self._run_docker_compose_command(
+                    ["exec", "-T", "-u", "10001:10001", MAIN_SERVICE_NAME, "sh", "-c", command], check=False
+                )
+
+            async def upload_file(self, source, dest):
+                await UnixOps(self).upload_file(source, dest)
+
+        env = Container()
+        marker = b"private-transfer-content-not-for-argv"
+        try:
+            await env._run_docker_compose_command(["up", "-d", "--pull", "never"])
+            await env.exec("printf old > /tmp/data; chmod 640 /tmp/data")
+            for data in (marker, b"", marker + "ğ".encode() * 70000):
+                request = {"op": "write", "path": "/tmp/data", "content_b64": base64.b64encode(data).decode()}
+                self.assertEqual(await self.agent._serve(env, request, self.root), {})
+                self.assertEqual((await env.exec("cat /tmp/data")).stdout.encode(), data)
+                self.assertEqual((await env.exec("stat -c %u:%a /tmp/data")).stdout.strip(), "10001:640")
+            await env.exec("ln -s /tmp/data /tmp/link")
+            request["path"] = "/tmp/link"
+            self.assertIn("error", await self.agent._serve(env, request, self.root))
+            self.assertEqual((await env.exec("readlink /tmp/link")).stdout.strip(), "/tmp/data")
+            self.assertEqual((await env.exec("cat /tmp/data")).stdout.encode(), data)
+            self.assertFalse((await env.exec("find /tmp -name '.melissa-write-*'")).stdout)
+            commands = "\0".join(arg for args in argv for arg in args)
+            self.assertNotIn(marker.decode(), commands)
+            self.assertNotIn(base64.b64encode(marker).decode(), commands)
+        finally:
+            await env._run_docker_compose_command(["down", "--timeout", "1"], check=False)
 
     async def test_timeout_saves_last_snapshot_without_faking_complete_usage(self):
         self.agent.wall_time_sec = 0.3

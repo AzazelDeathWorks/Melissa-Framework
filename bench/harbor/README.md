@@ -8,12 +8,13 @@ answer is not a pass. No low-memory, safety, or competitive-score claim follows
 from this adapter alone.
 
 File transfers require a POSIX host with `O_NOFOLLOW` and Linux task utilities
-(`stat`, `mktemp`, `base64`, `mv -T`). Copied links are never followed on the
+(`stat`, `mktemp`, `cat`, `mv -T`). Copied links are never followed on the
 host, and symlink write destinations are rejected; use the bash
 tool to inspect and explicitly select the intended container path. Reads are
 limited to 16 MiB per transfer; larger files can be inspected with bounded bash
-commands. Writes use agent-owned staging and bounded chunks, not privileged
-Docker uploads. Live logs and child stores stay in private host scratch.
+commands. Write payloads use private host transfer directories, not command-line
+arguments or environment overrides; uploaded files are copied to agent-owned
+staging before replacement. Live logs and child stores stay in private scratch.
 
 ## Reproduce
 
@@ -80,6 +81,9 @@ python3 bench/harbor/summarize.py /path/to/job
 python3 -m unittest discover -s tools/tests -p test_melissa_harbor.py
 # Run the same command inside an environment with Harbor==0.26.0 to include
 # subprocess cancellation/deadline-plugin tests (otherwise those are skipped).
+# Optional real non-root Docker transfer test; uses an already-local Linux
+# image with GNU tools, never pulls images or calls a model:
+# MELISSA_HARBOR_DOCKER_IMAGE=your-local-image python3 -m unittest discover -s tools/tests -p test_melissa_harbor.py
 cargo test --locked -p melissa-model-gateway --test agent_loop --test host_run_limit -- --test-threads=1
 cargo test --locked -p melissa-bench-agent
 ```

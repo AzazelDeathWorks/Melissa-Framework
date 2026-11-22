@@ -105,14 +105,14 @@ class MelissaAgent(BaseAgent):
                 mode = (old.stdout or "").strip()
                 if not mode or any(c not in "01234567" for c in mode):
                     mode = "644"
+                with tempfile.TemporaryDirectory(dir=scratch) as transfer:
+                    local = Path(transfer) / "payload"
+                    local.write_bytes(data)
+                    local.chmod(0o644)
+                    await env.upload_file(local, stage + "/payload")
+                payload = shlex.quote(stage + "/payload")
                 ready = shlex.quote(stage + "/ready")
-                for offset in range(0, max(1, len(data)), 65536):
-                    chunk = base64.b64encode(data[offset:offset + 65536]).decode()
-                    redirect = ">" if offset == 0 else ">>"
-                    result = await env.exec(f'printf %s "$MELISSA_WRITE_CHUNK" | base64 -d {redirect} {ready}', env={"MELISSA_WRITE_CHUNK": chunk})
-                    if result.return_code != 0:
-                        return {"error": f"cannot stage file contents: {path}"}
-                result = await env.exec(f"chmod {mode} -- {ready} && test ! -L {q} && mv -T -- {ready} {q}")
+                result = await env.exec(f"cat -- {payload} > {ready} && chmod {mode} -- {ready} && test ! -L {q} && mv -T -- {ready} {q}")
                 if result.return_code != 0:
                     return {"error": f"cannot replace file: {path}"}
                 return {}
