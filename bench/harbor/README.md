@@ -8,8 +8,8 @@ answer is not a pass. No low-memory, safety, or competitive-score claim follows
 from this adapter alone.
 
 File transfers require a POSIX host with `O_NOFOLLOW` and Linux task utilities
-(`stat`, `mktemp`, `base64`, `mv -T`). Symlink reads/writes are rejected rather
-than following host links or silently replacing a container link; use the bash
+(`stat`, `mktemp`, `base64`, `mv -T`). Copied links are never followed on the
+host, and symlink write destinations are rejected; use the bash
 tool to inspect and explicitly select the intended container path. Reads are
 limited to 16 MiB per transfer; larger files can be inspected with bounded bash
 commands. Writes use agent-owned staging and bounded chunks, not privileged
