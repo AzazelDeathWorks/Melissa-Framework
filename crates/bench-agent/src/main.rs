@@ -216,6 +216,7 @@ struct ReadArg {
     path: String,
     start_line: Option<usize>,
     max_lines: Option<usize>,
+    start_byte: Option<usize>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -242,7 +243,7 @@ const TOOLS: [(&str, &str, &str); 4] = [
     (
         "fs_read",
         "fs.read",
-        "Read a UTF-8 text file. Optional 1-based start_line and max_lines page large files.",
+        "Read a UTF-8 text file. Use 1-based start_line and max_lines, or 0-based start_byte to continue an oversized line using the returned next offset.",
     ),
     (
         "fs_replace",
@@ -262,7 +263,7 @@ fn schema(name: &str) -> Value {
             json!(["command"]),
         ),
         "fs_read" => (
-            json!({"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"max_lines":{"type":"integer","minimum":1}}),
+            json!({"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"max_lines":{"type":"integer","minimum":1},"start_byte":{"type":"integer","minimum":0}}),
             json!(["path"]),
         ),
         "fs_replace" => (
@@ -284,6 +285,57 @@ fn parse<T: for<'de> Deserialize<'de>>(call: &ToolCall) -> Result<T> {
     serde_json::from_str(&call.arguments)
         .map_err(|_| GatewayError::invalid("tool arguments do not match the schema"))
 }
+fn byte_page(text: &str, start: usize) -> std::result::Result<String, String> {
+    if start > text.len() || !text.is_char_boundary(start) {
+        return Err("start_byte must be a UTF-8 boundary within the file".into());
+    }
+    let mut end = start.saturating_add(READ_CHARS).min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut body = text[start..end].to_string();
+    if end < text.len() {
+        body.push_str(&format!(
+            "\n[bytes {start}-{end} of {}; next start_byte={end}]",
+            text.len()
+        ));
+    }
+    Ok(body)
+}
+fn read_page(text: &str, a: &ReadArg) -> std::result::Result<String, String> {
+    if let Some(start) = a.start_byte {
+        if a.start_line.is_some() || a.max_lines.is_some() {
+            return Err("use byte paging or line paging, not both".into());
+        }
+        return byte_page(text, start);
+    }
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let start = (a.start_line.unwrap_or(1).max(1) - 1).min(lines.len());
+    let end = lines
+        .len()
+        .min(start.saturating_add(a.max_lines.unwrap_or(usize::MAX)));
+    let mut body = String::new();
+    let mut shown = start;
+    for l in lines.iter().take(end).skip(start) {
+        if body.len() + l.len() > READ_CHARS {
+            if body.is_empty() {
+                return byte_page(text, lines[..start].iter().map(|s| s.len()).sum());
+            }
+            break;
+        }
+        body.push_str(l);
+        shown += 1;
+    }
+    if start > 0 || shown < lines.len() {
+        body.push_str(&format!(
+            "\n[lines {}-{} of {}]",
+            start + 1,
+            shown,
+            lines.len()
+        ));
+    }
+    Ok(body)
+}
 fn run_tool(host: &mut Host, call: &ToolCall) -> std::result::Result<String, String> {
     match call.name.as_str() {
         "bash" => {
@@ -304,27 +356,7 @@ fn run_tool(host: &mut Host, call: &ToolCall) -> std::result::Result<String, Str
             let Ok(text) = String::from_utf8(bytes) else {
                 return Err("file is not UTF-8 text; inspect it with bash".into());
             };
-            let lines: Vec<&str> = text.split_inclusive('\n').collect();
-            let start = a.start_line.unwrap_or(1).max(1) - 1;
-            let end = lines.len().min(start + a.max_lines.unwrap_or(usize::MAX));
-            let mut body = String::new();
-            let mut shown = start;
-            for l in lines.iter().take(end).skip(start) {
-                if body.len() + l.len() > READ_CHARS {
-                    break;
-                }
-                body.push_str(l);
-                shown += 1;
-            }
-            if start > 0 || shown < lines.len() {
-                body.push_str(&format!(
-                    "\n[lines {}-{} of {}]",
-                    start + 1,
-                    shown,
-                    lines.len()
-                ));
-            }
-            Ok(body)
+            read_page(&text, &a)
         }
         "fs_replace" => {
             let a: ReplaceArg = parse(call).map_err(|e| e.message)?;
@@ -606,6 +638,32 @@ async fn run(host: Arc<Mutex<Host>>) -> std::result::Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn file_pages_saturate_offsets_and_recover_oversized_utf8_lines() {
+        let a = |value| serde_json::from_value::<ReadArg>(value).unwrap();
+        let page = read_page("one\ntwo\nthree\n", &a(json!({"path":"x", "start_line":2}))).unwrap();
+        assert!(page.starts_with("two\nthree\n"));
+        assert!(
+            read_page(
+                "x",
+                &a(json!({"path":"x", "start_line":usize::MAX, "max_lines":usize::MAX}))
+            )
+            .is_ok()
+        );
+        let text = "ğ".repeat(READ_CHARS);
+        let first = read_page(&text, &a(json!({"path":"x"}))).unwrap();
+        assert!(first.contains(&format!("next start_byte={READ_CHARS}")));
+        let second = read_page(&text, &a(json!({"path":"x", "start_byte":READ_CHARS}))).unwrap();
+        assert_eq!(format!("{}{}", &first[..READ_CHARS], second), text);
+        assert!(read_page(&text, &a(json!({"path":"x", "start_byte":1}))).is_err());
+        assert!(
+            read_page(
+                &text,
+                &a(json!({"path":"x", "start_line":1, "start_byte":0}))
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn replace_matches_repository_rules() {
         assert_eq!(replace_text(b"a-b\n", "-", "+", false).unwrap().0, b"a+b\n");
