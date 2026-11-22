@@ -355,6 +355,162 @@ fn tool_receipts(
         .collect()
 }
 
+struct CaptureProgress(Arc<Mutex<Vec<melissa_model_gateway::progress::RunProgress>>>);
+impl melissa_model_gateway::progress::ProgressObserver for CaptureProgress {
+    fn observe(&mut self, progress: &melissa_model_gateway::progress::RunProgress) {
+        self.0.lock().unwrap().push(progress.clone());
+    }
+}
+
+#[tokio::test]
+async fn live_time_guidance_is_bounded_and_progress_separates_pending_from_reported_usage() {
+    use melissa_model_gateway::progress::ProgressPhase;
+    let dir = tempfile::tempdir().unwrap();
+    let http = http_fixture(vec![
+        HttpPlan::sse(tool_response(&[(
+            "progress-call",
+            "process_exec",
+            r#"{"value":"secret-tool-argument"}"#,
+        )])),
+        HttpPlan::sse(text_response("secret-final-answer", false, true)),
+    ])
+    .await;
+    let captured = Arc::new(Mutex::new(vec![]));
+    let mut gateway = gateway(store(&dir.path().join("store"), 10_000), &http, policy())
+        .with_time_awareness()
+        .with_progress_observer(Box::new(CaptureProgress(captured.clone())));
+    let result = gateway
+        .run(
+            &spec("progress"),
+            &mut FakeTools::default(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.status, RunStatus::FinalCandidate);
+    let bodies = http.bodies.lock().unwrap();
+    let remaining = bodies
+        .iter()
+        .map(|b| {
+            let system = b["instructions"].as_str().unwrap();
+            assert_eq!(system.matches("HOST TIME BUDGET:").count(), 1);
+            system
+                .split("HOST TIME BUDGET: ")
+                .nth(1)
+                .unwrap()
+                .split(' ')
+                .next()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(remaining.len(), 2);
+    assert!(remaining[1] <= remaining[0] && remaining[0] <= policy().max_wall_time_ms);
+    let events = captured.lock().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|p| p.phase == ProgressPhase::RequestDispatched
+                && p.pending_requests == 1
+                && p.unreported_usage_requests == 1)
+    );
+    assert!(
+        events
+            .iter()
+            .any(|p| p.phase == ProgressPhase::ToolDispatched && p.tool_in_flight)
+    );
+    let final_event = events.last().unwrap();
+    assert_eq!(final_event.phase, ProgressPhase::Finished);
+    assert_eq!(final_event.tool_calls, 1);
+    assert_eq!(final_event.requests, 2);
+    assert_eq!(final_event.reported_input_tokens, 24);
+    assert_eq!(final_event.reported_output_tokens, 8);
+    assert_eq!(final_event.cached_input_tokens, 6);
+    assert_eq!(final_event.pending_requests, 0);
+    assert_eq!(final_event.unreported_usage_requests, 0);
+    let serialized = serde_json::to_string(&*events).unwrap();
+    assert!(!serialized.contains("secret-tool-argument"));
+    assert!(!serialized.contains("secret-final-answer"));
+}
+
+#[tokio::test]
+async fn progress_survives_a_sent_request_timeout_without_reporting_reserved_tokens_as_usage() {
+    use melissa_model_gateway::progress::ProgressPhase;
+    let dir = tempfile::tempdir().unwrap();
+    let http = http_fixture(vec![HttpPlan {
+        status: 200,
+        body: text_response("too late", false, true),
+        delay: Duration::from_secs(10),
+    }])
+    .await;
+    let mut limits = policy();
+    limits.max_wall_time_ms = 1000;
+    let captured = Arc::new(Mutex::new(vec![]));
+    let mut gateway = gateway(store(&dir.path().join("store"), 10_000), &http, limits)
+        .with_transient_retries()
+        .with_progress_observer(Box::new(CaptureProgress(captured.clone())));
+    let result = gateway
+        .run(
+            &spec("progress-timeout"),
+            &mut FakeTools::default(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(http.requests.load(Ordering::SeqCst), 1);
+    assert!(result.requires_reconciliation);
+    let events = captured.lock().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|p| p.phase == ProgressPhase::RequestDispatched && p.pending_requests == 1)
+    );
+    let last = events.last().unwrap();
+    assert_eq!(last.phase, ProgressPhase::Finished);
+    assert_eq!(last.unknown_requests, 1);
+    assert_eq!(last.unreported_usage_requests, 1);
+    assert_eq!(last.reported_input_tokens, 0);
+    assert!(last.requires_reconciliation);
+}
+
+#[tokio::test]
+async fn a_slow_progress_sink_cannot_start_a_tool_after_the_deadline() {
+    struct SlowProgress(Arc<AtomicBool>);
+    impl melissa_model_gateway::progress::ProgressObserver for SlowProgress {
+        fn observe(&mut self, progress: &melissa_model_gateway::progress::RunProgress) {
+            if progress.phase == melissa_model_gateway::progress::ProgressPhase::ToolDispatched {
+                self.0.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(1200));
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let http = http_fixture(vec![HttpPlan::sse(tool_response(&[(
+        "slow-observer",
+        "process_exec",
+        r#"{"value":"x"}"#,
+    )]))])
+    .await;
+    let mut limits = policy();
+    limits.max_wall_time_ms = 1000;
+    let observed = Arc::new(AtomicBool::new(false));
+    let mut gateway = gateway(store(&dir.path().join("store"), 10_000), &http, limits)
+        .with_progress_observer(Box::new(SlowProgress(observed.clone())));
+    let mut tools = FakeTools::default();
+    let result = gateway
+        .run(
+            &spec("slow-progress"),
+            &mut tools,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+    assert!(observed.load(Ordering::SeqCst));
+    assert_eq!(result.status, RunStatus::Deadline);
+    assert_eq!(tools.executed.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 async fn adapter_receipts_bind_actual_dispatch_and_keep_arguments_out_of_receipts() {
     use melissa_model_gateway::adapter::Status;

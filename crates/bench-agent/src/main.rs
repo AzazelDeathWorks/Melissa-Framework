@@ -30,6 +30,24 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
+struct FileProgress(std::path::PathBuf);
+impl melissa_model_gateway::progress::ProgressObserver for FileProgress {
+    fn observe(&mut self, progress: &melissa_model_gateway::progress::RunProgress) {
+        let write = || -> std::result::Result<(), Box<dyn std::error::Error>> {
+            let mut file = tempfile::NamedTempFile::new_in(
+                self.0.parent().ok_or("progress path requires parent")?,
+            )?;
+            serde_json::to_writer(file.as_file_mut(), progress)?;
+            file.as_file().sync_all()?;
+            file.persist(&self.0)?;
+            Ok(())
+        };
+        if write().is_err() {
+            eprintln!("benchmark progress write failed");
+        }
+    }
+}
+
 const TASK: &str = "task:bench";
 const PROFILE: &str = "melissa.code.implementer";
 const RESOURCE: &str = "provider:bench";
@@ -469,7 +487,7 @@ async fn run(host: Arc<Mutex<Host>>) -> std::result::Result<Value, String> {
             categories: BTreeSet::from(["coding".into()]),
             context_tokens: env_or("MELISSA_BENCH_CONTEXT_TOKENS", 1_000_000),
             max_output_tokens: 32_768,
-            timeout_ms: 300_000,
+            timeout_ms: env_or("MELISSA_BENCH_REQUEST_MS", 300_000).clamp(1, wall_ms),
             max_concurrency: 1,
             rate_card: Some(RateCard {
                 source: PriceSource::OperatorDeclared {
@@ -501,13 +519,19 @@ async fn run(host: Arc<Mutex<Host>>) -> std::result::Result<Value, String> {
     )
     .map_err(gw)?
     .with_host_run_limit(HostRunLimit::new(wall_ms).map_err(gw)?)
+    .with_time_awareness()
     .with_output_limit_retries(4)
     .with_transient_retries()
-    .with_rate_limit_retries()
     .with_request_limits(RequestLimits {
         max_history_bytes: 32 * 1024 * 1024,
     })
     .map_err(gw)?;
+    if std::env::var("MELISSA_BENCH_ZERO_USAGE_429").as_deref() == Ok("true") {
+        g = g.with_rate_limit_retries();
+    }
+    if let Some(path) = std::env::var_os("MELISSA_BENCH_PROGRESS_PATH") {
+        g = g.with_progress_observer(Box::new(FileProgress(path.into())));
+    }
     let spec = RunSpec {
         run_id: "bench".into(),
         task_id: TASK.into(),
@@ -555,13 +579,18 @@ async fn run(host: Arc<Mutex<Host>>) -> std::result::Result<Value, String> {
     let mut out = json!({
         "reported_input_tokens": usage_in, "reported_output_tokens": usage_out,
         "cached_input_tokens": cached, "request_failures": failures,
-        "requests": 0, "tool_calls": 0,
-        "input_tokens": budget.charged_input_tokens, "output_tokens": budget.charged_output_tokens,
+        "requests": records.len(), "tool_calls": Value::Null,
+        "telemetry_complete": budget.active_requests == 0 && budget.unknown_input_requests == 0 && budget.unknown_output_requests == 0,
+        "pending_requests": budget.active_requests,
+        "unknown_requests": budget.unknown_requests,
+        "unreported_usage_requests": records.iter().filter(|r| r.settlement.as_ref().is_none_or(|s| s.usage.input_tokens.is_none() || s.usage.output_tokens.is_none())).count(),
+        "charged_input_tokens": budget.charged_input_tokens, "charged_output_tokens": budget.charged_output_tokens,
         "elapsed_ms": started.elapsed().as_millis() as u64,
     });
     match r {
         Ok(r) => {
             out["status"] = json!(format!("{:?}", r.status));
+            out["requires_reconciliation"] = json!(r.requires_reconciliation);
             out["requests"] = json!(r.request_ids.len());
             out["tool_calls"] = json!(r.tool_calls);
             out["answer"] = json!(r.answer.map(|a| clip(&a, 4000)));

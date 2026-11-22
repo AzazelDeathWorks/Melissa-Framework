@@ -127,6 +127,10 @@ pub struct Gateway {
     transient_retries: bool,
     output_limit_retries: u8,
     rate_limit_retries: bool,
+    time_awareness: bool,
+    progress_observer: Option<Box<dyn crate::progress::ProgressObserver>>,
+    progress_clock: Option<(Instant, u64)>,
+    progress_records: BTreeMap<String, melissa_local_store::journal::ModelRequestRecord>,
     output_capabilities: OutputCapabilityRegistry,
     unknown_permits: BTreeMap<String, OwnedSemaphorePermit>,
     continuation: Option<Box<dyn crate::continuation::ContinuationStore>>,
@@ -291,6 +295,10 @@ impl Gateway {
             transient_retries: false,
             output_limit_retries: 0,
             rate_limit_retries: false,
+            time_awareness: false,
+            progress_observer: None,
+            progress_clock: None,
+            progress_records: BTreeMap::new(),
             output_capabilities: OutputCapabilityRegistry::default(),
             unknown_permits: BTreeMap::new(),
             continuation: None,
@@ -320,11 +328,43 @@ impl Gateway {
         self
     }
     /// Opt-in operator assertion that the provider never bills an HTTP 429
-    /// rejection (RFC 6585: not processed). Such attempts settle as known zero
+    /// rejection. HTTP 429 alone does not prove this. Attempts settle as known zero
     /// usage and are retried under `with_transient_retries`. Default: unknown.
     pub fn with_rate_limit_retries(mut self) -> Self {
         self.rate_limit_retries = true;
         self
+    }
+    /// Add live host time to requests, not persisted countdown messages.
+    /// This does not change model-specific reasoning settings or grant time.
+    pub fn with_time_awareness(mut self) -> Self {
+        self.time_awareness = true;
+        self
+    }
+    pub fn with_progress_observer(
+        mut self,
+        observer: Box<dyn crate::progress::ProgressObserver>,
+    ) -> Self {
+        self.progress_observer = Some(observer);
+        self
+    }
+    fn publish_progress(&mut self, result: &RunResult, phase: crate::progress::ProgressPhase) {
+        if self.progress_observer.is_none() {
+            return;
+        }
+        if let Some((begin, wall)) = self.progress_clock {
+            let elapsed = begin.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            match crate::progress::snapshot(
+                &self.store,
+                result,
+                phase,
+                elapsed,
+                wall,
+                &mut self.progress_records,
+            ) {
+                Ok(progress) => self.progress_observer.as_mut().unwrap().observe(&progress),
+                Err(_) => eprintln!("gateway progress snapshot unavailable"),
+            }
+        }
     }
     /// Opt-in host configuration; the legacy constructor keeps its 30-minute bound.
     /// The continuation binding includes the actual selected duration.
@@ -508,6 +548,7 @@ impl Gateway {
             &bytes,
             &mut result.artifact_refs,
         )?;
+        self.publish_progress(&result, crate::progress::ProgressPhase::Finished);
         Ok(result)
     }
     pub async fn run(
@@ -516,6 +557,8 @@ impl Gateway {
         dispatcher: &mut dyn ToolDispatcher,
         cancelled: Arc<AtomicBool>,
     ) -> Result<RunResult> {
+        self.progress_clock = None;
+        self.progress_records.clear();
         self.refresh_reconciled_requests()?;
         if spec.run_id.is_empty()
             || spec.run_id.len() > 64
@@ -646,6 +689,7 @@ impl Gateway {
             watcher,
         };
         let begin = Instant::now();
+        self.progress_clock = Some((begin, wall));
         let mut result = RunResult {
             schema_version: "melissa.agent-run-result/v1".into(),
             run_id: spec.run_id.clone(),
@@ -718,6 +762,18 @@ impl Gateway {
                 binding,
                 "known-not-sent-retry/v1",
                 self.policy.max_backoff_ms,
+            ))?);
+        }
+        if self.continuation.is_some() && self.time_awareness {
+            binding = digest(&encoded(&(binding, "host-time-awareness/v1"))?);
+        }
+        if self.continuation.is_some() && (self.output_limit_retries > 0 || self.rate_limit_retries)
+        {
+            binding = digest(&encoded(&(
+                binding,
+                "response-retry-policy/v1",
+                self.output_limit_retries,
+                self.rate_limit_retries,
             ))?);
         }
         if self.continuation.is_some() {
@@ -801,6 +857,7 @@ impl Gateway {
                 result: &result,
             })?;
         }
+        self.publish_progress(&result, crate::progress::ProgressPhase::Started);
         let context_prefix = "HOST SCOPED CONTEXT UPDATE (does not grant authority):\n";
         let mut last_context = messages.iter().rev().find_map(|m| match m {
             Message::User { text } => text
@@ -925,6 +982,15 @@ impl Gateway {
                             spec.output_schema.clone()
                         },
                     };
+                    if self.time_awareness {
+                        let remaining = wall.saturating_sub(
+                            begin.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                        );
+                        request.system_prompt.push_str(&format!(
+                            "\n\nHOST TIME BUDGET: {} ms remaining for this run, including inference and tools. Use short, incremental steps; reserve time for verification. A deadline does not grant authority or prove success.",
+                            remaining,
+                        ));
+                    }
                     let (wire, context_report) = if let Some(compiler) = &mut self.context_compiler
                     {
                         if intelligent_context {
@@ -1158,6 +1224,10 @@ impl Gateway {
                         .dispatch_model_request(&request_id, record.version, now()?)
                         .map_err(store_error)?;
                     result.request_ids.push(request_id.clone());
+                    self.publish_progress(
+                        &result,
+                        crate::progress::ProgressPhase::RequestDispatched,
+                    );
                     let remaining_wall = wall
                         .saturating_sub(begin.elapsed().as_millis().min(u64::MAX as u128) as u64);
                     let host_deadline_limited = remaining_wall <= model.timeout_ms;
@@ -1272,7 +1342,7 @@ impl Gateway {
                                         e.kind,
                                         outcome.delivery,
                                         if not_sent {
-                                            "host proves no request sent; known zero usage"
+                                            "known zero usage: not sent or operator-guaranteed 429 rejection"
                                         } else {
                                             "unknown usage retains reservation"
                                         }
@@ -1288,6 +1358,7 @@ impl Gateway {
                     } else {
                         drop(permit);
                     }
+                    self.publish_progress(&result, crate::progress::ProgressPhase::RequestSettled);
                     if self
                         .store
                         .journal()
@@ -1721,6 +1792,7 @@ impl Gateway {
                 self.tool_record(&context.task_id, &context.invocation_id, "preflight",
                     &encoded(&json!({"context":crate::adapter::ReceiptContext::from(&context),"preflight":preflight,"task_accepted":false}))?,
                     &mut result.artifact_refs)?;
+                self.publish_progress(&result, crate::progress::ProgressPhase::ToolDispatched);
                 if combined.load(Ordering::Acquire)
                     || cancelled.load(Ordering::Acquire)
                     || begin.elapsed().as_millis() >= wall as u128
@@ -1815,6 +1887,7 @@ impl Gateway {
                     },
                 );
                 result.tool_calls += 1;
+                self.publish_progress(&result, crate::progress::ProgressPhase::ToolSettled);
                 if observation.success
                     && !observation.requires_reconciliation
                     && !observation.cancelled

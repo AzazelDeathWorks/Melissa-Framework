@@ -1062,6 +1062,8 @@ fn gateway(
     let mut g = Gateway::new(store, resources::catalog()?, vec![model], policy, false)
         .map_err(gw)?
         .with_transient_retries()
+        .with_time_awareness()
+        .with_output_limit_retries(2)
         .with_host_run_limit(
             melissa_model_gateway::agent_loop::HostRunLimit::new(e.recipe.wall_time_ms)
                 .map_err(gw)?,
