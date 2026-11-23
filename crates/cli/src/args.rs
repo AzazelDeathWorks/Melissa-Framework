@@ -1,7 +1,6 @@
 use crate::{Error, Result};
 pub const EXTENSION_HELP: &str = "\nSkill/MCP/doküman/hook:\n  Oturum: /skills, /skill-import KLASOR, /extensions [JSON_DOSYASI]\n  melissa --json extension list --workspace PATH\n  melissa --json extension import-skill --path DIR [--digest BLAKE3]\n  melissa --json extension configure --workspace PATH --path JSON\n  melissa --json extension resolve --task TASK --source SOURCE --query TEXT\n  İçerik/ayarlar yeni görev onayına sabitlenir; eski göreve izin eklenmez. Belgeler: docs/EXTENSIONS_TR.md\n";
-pub const METRICS_HELP: &str =
-    "\nGörev ölçümleri:\n  melissa [--home PATH] --json task metrics ID\n";
+pub const METRICS_HELP: &str = "\nGörev ölçümleri:\n  melissa [--home PATH] --json task metrics ID\n  melissa --json resources   Geçerli CLI sürecinin kaynak örneği; model/worker başlatmaz\n";
 pub const SESSION_HELP: &str = "\nTerminal oturumu:\n  melissa\n  melissa [--home PATH] session [--workspace PATH]\n\nGörevini yaz veya oturum komutları için /help yaz.";
 pub const PROJECT_HELP: &str = "\nGenel proje ortamı ve komutları:\n  Oturum: /config PATH, /budget USD, /environment [IMAGE|JSON_PATH], /project-doctor\n  Amaç yaz, /create, /details, /approve, /run\n  /preflight, /environment-sync veya /exec JSON_COMMAND modeli çağırmaz; /resume ile model akışı sürer.\n  melissa --json project doctor --workspace PATH\n  melissa --json project preflight|sync TASK_ID\n  melissa --json project exec TASK_ID --command-json JSON_COMMAND\n  melissa --json project poll TASK_ID SESSION_ID [--after N]\n  melissa --json project stdin TASK_ID SESSION_ID --hex HEX_BYTES\n  melissa --json project eof|cancel TASK_ID SESSION_ID\n  Komutlar private snapshot kullanır; host mount/host writeback/ağ yoktur. Belgeler: docs/PROJECT_RUNTIME_TR.md\n";
 pub const CAPABILITIES_HELP: &str = "\nProje belleği ve görev hazırlığı:\n  melissa task prepare --workspace PATH --goal TEXT --out NEW_FILE [--acceptance PRIVATE_RECIPE]\n  melissa memory list --workspace PATH\n  melissa memory accept|reject|forget --workspace PATH --id MEMORY_ID --digest REVIEW_DIGEST\n  melissa task replan ID --recipe REVIEWED_RECIPE\n\nPrepare yerel, incelenebilir taslak çıkarır; modeli çalıştırmaz veya kabul cevabı uydurmaz. Bellek önerileri operatör kabul edene kadar aramada kullanılmaz. Replan güvenli pause durumunda yalnız kalan uzman adımlarını değiştirir; çalışan adım korunur, revizyon o adım bittikten sonra etkinleşir. İlk dosya, kabul, süre ve maliyet yetkisi değişmez.\n";
@@ -101,6 +100,7 @@ pub enum Command {
     Init,
     Profiles,
     Doctor,
+    Resources,
     Configure,
     ConfigImport(PathBuf),
     ConfigShow,
@@ -238,6 +238,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Options> {
         "init" => Command::Init,
         "profiles" => Command::Profiles,
         "doctor" => Command::Doctor,
+        "resources" => Command::Resources,
         "services" => {
             let action = text(
                 a.next()
