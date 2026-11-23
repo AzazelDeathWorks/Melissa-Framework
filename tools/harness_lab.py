@@ -64,8 +64,11 @@ def local_entry(path):
 
 def file_hash(path):
     require(stat.S_ISREG(local_entry(path).st_mode), "lab input must be a regular file")
+    digest = hashlib.sha256()
     with path.open("rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest()
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def tree(root):
