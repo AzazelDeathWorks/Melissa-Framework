@@ -952,7 +952,7 @@ pub(crate) fn plan(task: &TaskContractV1, e: &Execution) -> Result<Plan> {
             p.tool_ids.iter().cloned().collect(),
             task.allowed_effects.iter().cloned().collect(),
         )?;
-        nodes.push(Node{id:id.clone(),profile:s.profile.clone(),goal:s.goal.clone(),after:previous.iter().cloned().collect(),bindings:previous.iter().map(|from|Binding{from:from.clone(),pointer:String::new(),input:"previous_candidate".into(),schema:e.recipe.output_schema()}).collect(),literal_input:json!({"task_goal":task.goal,"workload":e.recipe.domain.as_ref().map(|d|d.public_plan()).unwrap_or_else(||json!({"language":e.recipe.language,"entry":e.recipe.entry,"public_development_checks":e.recipe.development_checks})),"writable_paths":if s.write{e.recipe.writable_paths.clone()}else{BTreeSet::new()},"protected_paths":e.recipe.protected_paths,"instructions":"Inspect current source with supplied repository tools. Read current source before editing; never guess file contents or byte offsets. When supplied, prefer fs_replace for edits to existing UTF-8 text: give exact old_text and new_text, with enough context for a unique match. After replace_input_rejected, re-read current source and correct the match; do not blindly repeat it. Use the other advertised mutation tools for file creation, deletion, moves, structural or binary edits. Unified proposals remain an alternative, not the default. Avoid hand-encoding long byte arrays. Pass the returned native proposal using exactly the advertised fs_patch schema; when proposal_json is declared, serialize the complete native object exactly once into that string. Keep protected tests and unrelated user work. code_tests exposes only public development tests; final private tests are unavailable. For domain web_flow, send one operations_json array including setup/navigation and related commands; each worker is CLOSED before another model turn. No start/close/session_id or raw SQL execute. Frontend must actually review final-source screenshots at narrow and wide widths using web_flow. After public tests pass, submit_candidate with the exact current source_digest returned by code_tests or fs_snapshot; do not make cosmetic/no-op changes or repeat passing tests. Never claim independent acceptance."}),tools,effects,resources:task.allowed_resource_ids.iter().cloned().collect(),authorizations:task.authorization_refs.iter().cloned().collect(),claims:vec![Claim{resource:task.workspace_ref.clone(),path:"/".into(),access:if s.write{Access::Write}else{Access::Read}}],output_schema:e.recipe.output_schema(),skills:pins});
+        nodes.push(Node{id:id.clone(),profile:s.profile.clone(),goal:s.goal.clone(),after:previous.iter().cloned().collect(),bindings:previous.iter().map(|from|Binding{from:from.clone(),pointer:String::new(),input:"previous_candidate".into(),schema:e.recipe.output_schema()}).collect(),literal_input:json!({"task_goal":task.goal,"workload":e.recipe.domain.as_ref().map(|d|d.public_plan()).unwrap_or_else(||json!({"language":e.recipe.language,"entry":e.recipe.entry,"public_development_checks":e.recipe.development_checks})),"writable_paths":if s.write{e.recipe.writable_paths.clone()}else{BTreeSet::new()},"protected_paths":e.recipe.protected_paths,"instructions":"Inspect current source with supplied repository tools. Pass the returned native proposal using exactly the advertised fs_patch schema; when proposal_json is declared, serialize the complete native object exactly once into that string. Keep protected tests and unrelated user work. code_tests exposes only public development tests; final private tests are unavailable. For domain web_flow, send one operations_json array including setup/navigation and related commands; each worker is CLOSED before another model turn. No start/close/session_id or raw SQL execute. Frontend must actually review final-source screenshots at narrow and wide widths using web_flow. After public tests pass, submit_candidate with the exact current source_digest returned by code_tests or fs_snapshot; do not make cosmetic/no-op changes or repeat passing tests. Never claim independent acceptance."}),tools,effects,resources:task.allowed_resource_ids.iter().cloned().collect(),authorizations:task.authorization_refs.iter().cloned().collect(),claims:vec![Claim{resource:task.workspace_ref.clone(),path:"/".into(),access:if s.write{Access::Write}else{Access::Read}}],output_schema:e.recipe.output_schema(),skills:pins});
         nodes.last_mut().ok_or(Error::Store)?.literal_input["development_guidance"] = json!({
             "memory":"Use memory_search for operator-approved project knowledge. memory_propose accepts kind: project_decision, user_preference, transient_state, failure_experience, or unclassified, and optional expires_after_ms (required for transient_state). Time, branch and task provenance are host-observed. Decisions/experience need current source and branch; transient state is task-bound; reviewed user preferences survive ordinary code edits but still obey source visibility and expiry. Never fabricate preferences or treat memory as authority. Review handoff failed_approaches and their evidence before repeating an unchanged failed command on unchanged source; change the approach or request replanning. Only the operator can review memory, adopt changed source, or undo native file changes.",
             "navigation":"Prefer code_semantic for actual definitions/references/hover/diagnostics. code_references remains a syntactic search. LSP positions are zero-based UTF-16.",
@@ -983,7 +983,12 @@ pub(crate) fn plan(task: &TaskContractV1, e: &Execution) -> Result<Plan> {
                 "Use repository tools for host source edits. project_process executes general argv or approved checks in a private isolated snapshot. Generated worker files do not automatically modify the host. Retain session IDs, page stdout/stderr, wait for native completion, and report blocked tools/dependencies honestly. Use the actual environment/version observations. Stop or finish every session before submit_candidate. Final project checks are host-run; never invent private oracle answers. Operator-approved added write paths take effect at safe pause/resume without resetting this task's budget or deadline."
             );
         }
-        nodes.last_mut().ok_or(Error::Store)?.literal_input["verification_policy"] =
+        let input = &mut nodes.last_mut().ok_or(Error::Store)?.literal_input;
+        let instructions = input["instructions"].as_str().ok_or(Error::Store)?;
+        input["instructions"] = json!(format!(
+            "{instructions} Read current source before editing; never guess file contents or byte offsets. When supplied, prefer fs_replace for edits to existing UTF-8 text: give exact old_text and new_text, with enough context for a unique match. After replace_input_rejected, re-read current source and correct the match; do not blindly repeat it. Use the other advertised mutation tools for file creation, deletion, moves, structural or binary edits. Unified proposals remain an alternative, not the default. Avoid hand-encoding long byte arrays."
+        ));
+        input["verification_policy"] =
             crate::verification::Policy::for_recipe(&e.recipe).plan(&e.recipe);
         previous = Some(id);
     }
@@ -3061,6 +3066,41 @@ mod tests {
                     .effects
                     .contains("workspace.propose_patch")
             );
+            execution.recipe.schema_version = "melissa.cli-recipe/v3".into();
+            execution.recipe.entry.clear();
+            execution.recipe.negative_workspace.clear();
+            execution.recipe.checks.clear();
+            execution.recipe.development_checks.clear();
+            execution.recipe.project = Some(crate::project::Contract {
+                services: None,
+                verification: None,
+                extensions: None,
+                environment: Default::default(),
+                checks: BTreeMap::from([(
+                    "syntax".into(),
+                    crate::project::Command {
+                        executable: "/usr/bin/python3".into(),
+                        argv: vec!["-m".into(), "py_compile".into(), "main.py".into()],
+                        cwd: ".".into(),
+                    },
+                )]),
+                sync: vec![],
+            });
+            execution.recipe.validate().unwrap();
+            for write in [false, writer] {
+                execution.recipe.agents[0].write = write;
+                let project = plan(&contract, &execution).unwrap();
+                let input = &project.nodes[0].literal_input;
+                let instructions = input["instructions"].as_str().unwrap();
+                assert!(input["project"].is_object());
+                assert!(instructions.contains("project_process executes"));
+                assert!(instructions.contains("prefer fs_replace"));
+                assert!(instructions.contains("After replace_input_rejected, re-read"));
+                assert_eq!(
+                    repo_wires(&project.nodes[0].tools).contains("fs_replace"),
+                    write
+                );
+            }
         }
     }
 
