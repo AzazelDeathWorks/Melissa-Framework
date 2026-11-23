@@ -14,6 +14,30 @@ pub(crate) struct ContextSnapshot {
     pub wire_tokens: Option<WireTokenMeasurement>,
     pub wire_tokenizer_status: String,
     pub summarizing: bool,
+    #[serde(default)]
+    pub budget: Option<melissa_model_gateway::context_budget::TokenBudget>,
+}
+impl ContextSnapshot {
+    pub fn badge(&self) -> String {
+        format!(
+            "{}Son istek: {} · çıktı rezervi {} · /status",
+            self.budget
+                .as_ref()
+                .map(|budget| format!(
+                    "Girdi üst sınırı: %{} · ",
+                    u128::from(budget.input_units()) * 100
+                        / u128::from(budget.input_budget_tokens.max(1))
+                ))
+                .unwrap_or_default(),
+            self.provider_input_tokens
+                .map(|n| format!("{n} girdi token (sağlayıcı)"))
+                .unwrap_or_else(|| format!(
+                    "{} bayt JSON; token bilinmiyor",
+                    self.native_body_bytes
+                )),
+            self.reserved_output_tokens
+        )
+    }
 }
 
 #[derive(Default)]
@@ -85,6 +109,9 @@ pub(crate) fn report(
             }
         ));
         if let Some(context) = &c.last_context {
+            if let Some(budget) = &context.budget {
+                lines.push(format!("Girdi bütçesi: {} · çerçeve dahil kullanılan üst sınır: {} · kalan üst-sınır birimi: {} ({})", budget.input_budget_tokens, budget.input_units(), count(budget.remaining_input_units), budget.basis));
+            }
             lines.push(format!(
                 "Son kaydedilen istek{}: {} bayt native JSON",
                 if context.summarizing { " (özet)" } else { "" },

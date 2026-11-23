@@ -5,6 +5,7 @@ pub mod agent_loop;
 pub mod anthropic;
 pub mod chat_completions;
 pub mod checkpoint;
+pub mod context_budget;
 pub mod context_compiler;
 pub mod context_intelligence;
 pub mod continuation;

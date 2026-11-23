@@ -48,6 +48,8 @@ pub struct ContextReport {
     pub capacity: u64,
     pub exact_token_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<crate::context_budget::TokenBudget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_token_measurement: Option<crate::local_tokenizer::WireTokenMeasurement>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_tokenizer_status: Option<String>,
@@ -874,25 +876,26 @@ impl ContextCompiler {
                 .len() as u64;
             // Covers framing beyond the serialized native request. No guessed
             // chars/4 conversion and no assertion of exact provider token counts.
-            let conservative_input_units = native_body_bytes
-                .saturating_add(1024)
-                .saturating_add(request.messages.len() as u64 * 64);
             let exact = self
                 .counter
                 .as_ref()
                 .map(|c| c.count(endpoint, &request.model, &wire))
                 .transpose()?
                 .flatten();
-            let input = exact.unwrap_or(conservative_input_units);
+            let budget = crate::context_budget::TokenBudget::assess(
+                native_body_bytes,
+                request.messages.len(),
+                exact,
+                capacity,
+                request.max_output_tokens,
+            )?;
+            let conservative_input_units = budget.conservative_input_units;
+            let input = budget.input_units();
             // Preserve existing vision behavior when no matching image tokenizer
             // is installed. Do not mistake compressed PNG/base64 bytes for image
             // tokens, shorten images, or report a verified capacity check.
             let unknown_images = has_images && exact.is_none();
-            if unknown_images
-                || input
-                    .checked_add(request.max_output_tokens)
-                    .is_some_and(|n| n <= capacity)
-            {
+            if unknown_images || budget.fits() {
                 if let Some(report) = intelligence.as_mut() {
                     report.sections = crate::context_intelligence::sections(
                         request,
@@ -957,6 +960,7 @@ impl ContextCompiler {
                         reserved_output_tokens: request.max_output_tokens,
                         capacity,
                         exact_token_count: exact,
+                        budget: (!unknown_images).then_some(budget),
                         wire_token_measurement,
                         wire_tokenizer_status,
                         capacity_check: if unknown_images {

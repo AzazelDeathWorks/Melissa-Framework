@@ -699,6 +699,14 @@ pub(crate) async fn turn(
                 Err(_) => (None, "tokenizer ölçümü başarısız; ölçülmedi"),
             },
         };
+        let budget = melissa_model_gateway::context_budget::TokenBudget::assess(
+            wire_bytes,
+            request.messages.len(),
+            None,
+            settings.context_tokens,
+            settings.max_output_tokens,
+        )
+        .map_err(|e| Error::Model(e.kind))?;
         let context = super::status::ContextSnapshot {
             native_body_bytes: wire_bytes,
             capacity_tokens: settings.context_tokens,
@@ -707,16 +715,9 @@ pub(crate) async fn turn(
             wire_tokenizer_status: wire_tokenizer_status.into(),
             wire_tokens,
             summarizing,
+            budget: Some(budget.clone()),
         };
-        if !summarizing
-            && summary_end > c.summary_through
-            && wire_bytes
-                > settings
-                    .context_tokens
-                    .saturating_sub(settings.max_output_tokens)
-                    .saturating_mul(4)
-                    / 5
-        {
+        if !summarizing && summary_end > c.summary_through && budget.should_compact() {
             summarizing = true;
             notice(Update::Text(
                 "Konuşma uzadı; eski kısmı özetliyorum. Özgün kayıt ve son isteğin korunacak."
@@ -725,13 +726,13 @@ pub(crate) async fn turn(
             continue;
         }
         // A byte-based upper bound is conservative; never silently trim history.
-        if wire_bytes.saturating_add(settings.max_output_tokens) > settings.context_tokens {
+        if !budget.fits() {
             return Err(Error::Conflict(
                 "İstek modelin bağlam kapasitesine sığmıyor. İçerik kesilmedi; daha küçük bir ek kullan veya /compact ile geçmişi özetle. Özgün kayıt korunuyor.",
             ));
         }
         if let Some(limit) = prefs.spending_micro_usd {
-            let reserved=settings.rate_card.upper_bound(wire_bytes,settings.max_output_tokens).map_err(|_|Error::Unavailable("Harcama sınırı için model fiyatını ayarlardan belirt; bilinmeyen maliyet sıfır sayılmadı."))?;
+            let reserved=settings.rate_card.upper_bound(budget.input_units(),settings.max_output_tokens).map_err(|_|Error::Unavailable("Harcama sınırı için model fiyatını ayarlardan belirt; bilinmeyen maliyet sıfır sayılmadı."))?;
             if c.cost_micro_usd
                 .and_then(|cost| cost.checked_add(reserved))
                 .is_none_or(|cost| cost > limit)
