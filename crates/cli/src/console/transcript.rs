@@ -37,6 +37,9 @@ pub(super) struct Transcript {
     cache: Vec<Line<'static>>,
 }
 impl Transcript {
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
     pub fn push(&mut self, text: &str) {
         if !text.is_empty() {
             self.entries.push(Entry::Text(safe_multiline(text)));

@@ -1,6 +1,7 @@
 //! Single terminal product surface. Legacy structured task commands remain
 //! available to automation; interactive users work in one conversation.
 mod chat;
+mod commands;
 mod configure;
 mod execution;
 mod interactions;
@@ -702,17 +703,22 @@ pub async fn run(home: &Path, workspace: &Path) -> Result {
             queue.len(),
             ui.terminal.size()?.width.saturating_sub(4),
         );
-        ui.draw(&mut input, &footer, &live, plan)?;
+        let context = conversation
+            .as_ref()
+            .and_then(|c| c.last_context.as_ref())
+            .map(status::ContextSnapshot::badge)
+            .unwrap_or_else(|| "Bağlam: henüz istek yok · /status ayrıntılar".into());
+        ui.draw(&mut input, &footer, &live, plan, &context)?;
         let event = if job.is_none() && advance_queue && draft.is_empty() && !queue.is_empty() {
             input.insert_str(queue.pop_front().unwrap_or_default());
             // Submit through the same command path on the next frame.
-            ui.draw(&mut input, &footer, &live, plan)?;
+            ui.draw(&mut input, &footer, &live, plan, &context)?;
             Some(Event::Key(crossterm::event::KeyEvent::new(
                 KeyCode::Enter,
                 crossterm::event::KeyModifiers::NONE,
             )))
         } else {
-            match ui.key()? {
+            match ui.key(job.is_some())? {
                 Some(event) => paste.push(event),
                 None => paste.flush_escape(),
             }
@@ -729,7 +735,18 @@ pub async fn run(home: &Path, workspace: &Path) -> Result {
                 input.insert_str(s.replace("\r\n", "\n").replace('\r', "\n"));
             }
             Event::Key(k) if k.kind != KeyEventKind::Release => {
-                if ui::control(&k, 'f') {
+                if ui::control(&k, 'p') {
+                    let labels = commands::COMMANDS
+                        .iter()
+                        .map(|(name, description)| format!("{name:<14} {description}"))
+                        .collect::<Vec<_>>();
+                    if let Some(index) =
+                        ui.choose("Komut paleti · seç, sonra Enter ile çalıştır", &labels)?
+                    {
+                        input = ui::editor();
+                        input.insert_str(commands::COMMANDS[index].0);
+                    }
+                } else if ui::control(&k, 'f') {
                     ui.search()?;
                 } else if ui::control(&k, 'q') && !draft.trim().is_empty() {
                     queue.push_back(draft.clone());
@@ -770,6 +787,11 @@ pub async fn run(home: &Path, workspace: &Path) -> Result {
                 {
                     input.insert_newline();
                 } else if k.code == KeyCode::Enter && !draft.trim().is_empty() {
+                    if draft.trim() == "/help" {
+                        input = ui::editor();
+                        ui.view("Komutlar ve kısayollar", &commands::help())?;
+                        continue;
+                    }
                     if draft.trim() == "/status" {
                         let selected = app.settings().ok();
                         let report = status::report(
@@ -969,28 +991,10 @@ pub async fn run(home: &Path, workspace: &Path) -> Result {
                 } else if k.code == KeyCode::Tab {
                     let choices = if draft.starts_with('/') && !draft.contains(char::is_whitespace)
                     {
-                        [
-                            "/help",
-                            "/search",
-                            "/compact",
-                            "/queue",
-                            "/transcript",
-                            "/apply",
-                            "/config",
-                            "/settings",
-                            "/model",
-                            "/plan",
-                            "/new",
-                            "/resume",
-                            "/diff",
-                            "/undo",
-                            "/project",
-                            "/exit",
-                        ]
-                        .iter()
-                        .filter(|s| s.starts_with(&draft))
-                        .map(|s| s.to_string())
-                        .collect::<Vec<_>>()
+                        commands::matching(&draft)
+                            .into_iter()
+                            .map(|(name, _)| name.to_owned())
+                            .collect::<Vec<_>>()
                     } else if let Some(token) = draft
                         .split_whitespace()
                         .last()

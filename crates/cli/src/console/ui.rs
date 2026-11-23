@@ -23,6 +23,66 @@ pub(crate) struct Ui {
     pub accent: Color,
     pub muted: Color,
     pub transcript: super::transcript::Transcript,
+    last_draw: Option<DrawCache>,
+}
+#[derive(Clone, Copy)]
+struct DrawInput<'a, 'b> {
+    size: (u16, u16),
+    editor: &'a TextArea<'b>,
+    transcript: &'a super::transcript::Transcript,
+    footer: &'a str,
+    live: &'a str,
+    context: &'a str,
+    plan: bool,
+}
+struct DrawCache {
+    size: (u16, u16),
+    lines: Vec<String>,
+    cursor: ratatui_textarea::DataCursor,
+    selection: Option<((usize, usize), (usize, usize))>,
+    scroll: (u16, u16),
+    revision: u64,
+    expanded: bool,
+    top: Option<usize>,
+    search: String,
+    footer: String,
+    live: String,
+    context: String,
+    plan: bool,
+}
+impl DrawCache {
+    fn matches(&self, i: &DrawInput<'_, '_>) -> bool {
+        self.size == i.size
+            && self.lines == i.editor.lines()
+            && self.cursor == i.editor.cursor()
+            && self.selection == i.editor.selection_range()
+            && self.scroll == i.editor.scroll_offset()
+            && self.revision == i.transcript.revision()
+            && self.expanded == i.transcript.expanded
+            && self.top == i.transcript.top
+            && self.search == i.transcript.search
+            && self.footer == i.footer
+            && self.live == i.live
+            && self.context == i.context
+            && self.plan == i.plan
+    }
+    fn capture(i: DrawInput<'_, '_>) -> Self {
+        Self {
+            size: i.size,
+            lines: i.editor.lines().to_vec(),
+            cursor: i.editor.cursor(),
+            selection: i.editor.selection_range(),
+            scroll: i.editor.scroll_offset(),
+            revision: i.transcript.revision(),
+            expanded: i.transcript.expanded,
+            top: i.transcript.top,
+            search: i.transcript.search.clone(),
+            footer: i.footer.into(),
+            live: i.live.into(),
+            context: i.context.into(),
+            plan: i.plan,
+        }
+    }
 }
 fn modal_prompt(title: &str, accent: Color, width: u16) -> (Paragraph<'static>, u16) {
     let lines = super::transcript::wrap(&display::safe(title), width, Style::default().fg(accent));
@@ -100,6 +160,7 @@ impl Ui {
                     Color::Reset
                 },
                 transcript: Default::default(),
+                last_draw: None,
             }),
             Err(e) => {
                 let _ = disable_raw_mode();
@@ -123,11 +184,39 @@ impl Ui {
         footer: &str,
         live: &str,
         plan: bool,
+        context: &str,
     ) -> Result {
+        let size = self.terminal.size()?;
+        let size = (size.width, size.height);
+        if self.last_draw.as_ref().is_some_and(|last| {
+            last.matches(&DrawInput {
+                size,
+                editor,
+                transcript: &self.transcript,
+                footer,
+                live,
+                context,
+                plan,
+            })
+        }) {
+            return Ok(());
+        }
         let transcript = &mut self.transcript;
         let (accent, muted) = (self.accent, self.muted);
-        self.terminal
-            .draw(|frame| render(frame, transcript, editor, footer, live, plan, accent, muted))?;
+        self.terminal.draw(|frame| {
+            render(
+                frame, transcript, editor, footer, live, plan, accent, muted, context,
+            )
+        })?;
+        self.last_draw = Some(DrawCache::capture(DrawInput {
+            size,
+            editor,
+            transcript: &self.transcript,
+            footer,
+            live,
+            context,
+            plan,
+        }));
         Ok(())
     }
     pub fn navigate(&mut self, event: &Event) -> bool {
@@ -174,6 +263,7 @@ impl Ui {
         Ok(())
     }
     pub fn view(&mut self, title: &str, text: &str) -> Result {
+        self.last_draw = None;
         let mut top = 0usize;
         loop {
             self.terminal.draw(|frame| {
@@ -226,6 +316,7 @@ impl Ui {
         }
     }
     pub fn choose(&mut self, title: &str, options: &[String]) -> Result<Option<usize>> {
+        self.last_draw = None;
         let mut query = String::new();
         let mut at = 0usize;
         loop {
@@ -330,6 +421,7 @@ impl Ui {
         secret: bool,
         validate: impl Fn(&str) -> Result<()>,
     ) -> Result<Option<Zeroizing<String>>> {
+        self.last_draw = None;
         let mut value = Zeroizing::new(default.to_owned());
         let mut cursor = value.len();
         let mut error: Option<String> = None;
@@ -457,8 +549,8 @@ impl Ui {
     pub fn confirm(&mut self, title: &str) -> Result<bool> {
         Ok(self.choose(title, &["Evet".into(), "Vazgeç".into()])? == Some(0))
     }
-    pub fn key(&self) -> Result<Option<Event>> {
-        if event::poll(Duration::from_millis(20))? {
+    pub fn key(&self, active: bool) -> Result<Option<Event>> {
+        if event::poll(Duration::from_millis(if active { 20 } else { 100 }))? {
             Ok(Some(event::read()?))
         } else {
             Ok(None)
@@ -506,6 +598,7 @@ fn render(
     plan: bool,
     accent: Color,
     muted: Color,
+    context: &str,
 ) {
     let area = frame.area();
     let margin = if area.width >= 45 { 2 } else { 1 };
@@ -516,26 +609,47 @@ fn render(
         area.height,
     );
     let editor_height = (editor.lines().len() as u16 + 2).clamp(3, (area.height / 3).max(3));
+    let draft = editor.lines().join("\n");
+    let suggestions = if area.height >= 18 {
+        super::commands::matching(&draft)
+            .into_iter()
+            .take(4)
+            .collect::<Vec<_>>()
+    } else {
+        vec![]
+    };
     let regions = Layout::vertical([
         Constraint::Length(if area.height < 12 { 1 } else { 2 }),
         Constraint::Min(1),
         Constraint::Length(if area.height < 12 { 0 } else { 1 }),
+        Constraint::Length(suggestions.len() as u16),
         Constraint::Length(editor_height),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
     .split(inside);
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                "✦ Melissa",
-                Style::default().fg(accent).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("  {}", env!("CARGO_PKG_VERSION")),
-                Style::default().fg(muted),
-            ),
-        ])),
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(
+                    "Melissa",
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        "  {} · {}",
+                        env!("CARGO_PKG_VERSION"),
+                        if plan {
+                            "PLAN · salt okunur"
+                        } else {
+                            "SOHBET"
+                        }
+                    ),
+                    Style::default().fg(muted),
+                ),
+            ]),
+            Line::styled(display::safe(context), Style::default().fg(muted)),
+        ]),
         regions[0],
     );
     transcript.height = regions[1].height as usize;
@@ -592,12 +706,26 @@ fn render(
             .border_style(Style::default().fg(accent))
             .title(if plan { " ❯ Plan " } else { " ❯ " }),
     );
-    frame.render_widget(&*editor, regions[3]);
+    frame.render_widget(
+        Paragraph::new(
+            suggestions
+                .iter()
+                .map(|(name, hint)| {
+                    Line::from(vec![
+                        Span::styled(format!("{name:<12}"), Style::default().fg(accent)),
+                        Span::styled(*hint, Style::default().fg(muted)),
+                    ])
+                })
+                .collect::<Vec<_>>(),
+        ),
+        regions[3],
+    );
+    frame.render_widget(&*editor, regions[4]);
     frame.render_widget(
         Paragraph::new(display::safe(footer)).style(Style::default().fg(muted)),
-        regions[4],
+        regions[5],
     );
-    frame.render_widget(Paragraph::new(if area.width >= 90 { "Enter gönder · Alt+Enter yeni satır · Shift+Tab plan · / komutlar · Ctrl+O araçlar · Ctrl+F ara" } else { "Enter gönder · Shift+Tab plan · / komutlar · Esc durdur" }).style(Style::default().fg(muted)), regions[5]);
+    frame.render_widget(Paragraph::new(if area.width >= 90 { "Enter gönder · Alt+Enter yeni satır · Shift+Tab plan · Ctrl+P komutlar · Ctrl+O araçlar · Ctrl+F ara" } else { "Enter gönder · Ctrl+P komutlar · Esc durdur" }).style(Style::default().fg(muted)), regions[6]);
 }
 pub(crate) fn editor() -> TextArea<'static> {
     let mut input = TextArea::default();
@@ -665,6 +793,99 @@ pub(crate) fn status_line(
 mod tests {
     use super::*;
     #[test]
+    fn unchanged_frames_are_cached_and_every_visible_change_invalidates() {
+        let input = editor();
+        let transcript = super::super::transcript::Transcript::default();
+        let frame = DrawInput {
+            size: (80, 24),
+            editor: &input,
+            transcript: &transcript,
+            footer: "hazır",
+            live: "",
+            context: "bilinmiyor",
+            plan: false,
+        };
+        let cache = DrawCache::capture(frame);
+        for _ in 0..1000 {
+            assert!(cache.matches(&frame));
+        }
+        assert!(!cache.matches(&DrawInput {
+            size: (40, 12),
+            ..frame
+        }));
+        assert!(!cache.matches(&DrawInput {
+            footer: "çalışıyor",
+            ..frame
+        }));
+        assert!(!cache.matches(&DrawInput {
+            live: "yanıt",
+            ..frame
+        }));
+        assert!(!cache.matches(&DrawInput {
+            context: "100 token",
+            ..frame
+        }));
+        assert!(!cache.matches(&DrawInput {
+            plan: true,
+            ..frame
+        }));
+        let mut changed = editor();
+        changed.insert_str("/st");
+        assert!(!cache.matches(&DrawInput {
+            editor: &changed,
+            ..frame
+        }));
+        let mut changed = super::super::transcript::Transcript::default();
+        changed.push("yeni mesaj");
+        assert!(!cache.matches(&DrawInput {
+            transcript: &changed,
+            ..frame
+        }));
+        let mut selected = editor();
+        selected.insert_str("aynı metin");
+        let cache = DrawCache::capture(DrawInput {
+            editor: &selected,
+            ..frame
+        });
+        selected.select_all();
+        assert!(!cache.matches(&DrawInput {
+            editor: &selected,
+            ..frame
+        }));
+    }
+    #[test]
+    fn slash_suggestions_show_descriptions_without_running_commands() {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        let mut transcript = super::super::transcript::Transcript::default();
+        let mut input = editor();
+        input.insert_str("/st");
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    &mut transcript,
+                    &mut input,
+                    "hazır",
+                    "",
+                    false,
+                    Color::Cyan,
+                    Color::DarkGray,
+                    "Girdi üst sınırı: %10; token bilinmiyor",
+                )
+            })
+            .unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(content.contains("/status"));
+        assert!(content.contains("API çağırmaz"));
+        assert!(content.contains("token bilinmiyor"));
+    }
+    #[test]
     fn long_modal_prompt_shows_the_end_of_the_confirmation() {
         let title = "Seçilen API mesajlarını ve gerekli görünür proje içeriğini alabilir; ücret doğabilir. Devam etmek istiyor musun?";
         for width in [32, 74, 90] {
@@ -720,6 +941,7 @@ mod tests {
                         false,
                         Color::Cyan,
                         Color::DarkGray,
+                        "Son istek: token bilinmiyor",
                     )
                 })
                 .unwrap();
