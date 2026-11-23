@@ -2,7 +2,7 @@
 name: safe-refactor
 description: Refactor existing code while preserving documented behavior and reviewing the affected dependency graph.
 metadata:
-  version: "1.1.0"
+  version: "1.2.0"
 ---
 
 # safe-refactor
@@ -23,8 +23,10 @@ Overlapping matches must be narrowed deliberately, not reordered silently.
 Read all advertised result pages before claiming the set is complete. Preserve
 source hashes and receipt references. STALE evidence is historical: re-observe
 source, regenerate the proposal, and review the new diff. Never reuse an old
-preimage or patch offset. Apply through the advertised `fs_patch` schema only;
-the host retains task/profile/path and exact-byte checks. A helper result grants
+preimage or patch offset. Prefer advertised `fs_replace` for existing UTF-8 text,
+using an exact, unique match from a fresh read. Apply native byte or structural
+proposals through the advertised `fs_patch` schema; never guess or translate byte
+offsets. The host retains task/profile/path and exact-byte checks. A helper result grants
 no new write paths. Check syntax/type/build/tests on the final source, including
 actual caller files and affected package checks. Record unsupported checks.
 
