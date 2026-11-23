@@ -628,19 +628,14 @@ pub(crate) async fn turn(
     c.save_locked(app)?;
     let endpoint = settings.endpoint_with_key(settings.key()?)?;
     let transport = HttpTransport::new(false).map_err(|e| Error::Model(e.kind))?;
-    let tokenizer = settings
-        .local_tokenizer
-        .as_ref()
-        .map(|config| {
-            melissa_model_gateway::local_tokenizer::LocalWireTokenizer::load(
-                config,
-                &settings.endpoint,
-                settings.protocol,
-                &settings.model,
-            )
-        })
-        .transpose()
-        .map_err(|e| Error::Model(e.kind))?;
+    let tokenizer = settings.local_tokenizer.as_ref().map(|config| {
+        melissa_model_gateway::local_tokenizer::LocalWireTokenizer::load(
+            config,
+            &settings.endpoint,
+            settings.protocol,
+            &settings.model,
+        )
+    });
     let mut summarizing = compact_requested;
     let summary_end = if compact_requested {
         c.messages.len()
@@ -695,25 +690,21 @@ pub(crate) async fn turn(
             let encoded = bytes(&wire)?;
             (encoded.len() as u64, crate::digest(&encoded))
         };
-        let wire_tokens = tokenizer
-            .as_ref()
-            .map(|t| t.measure(&endpoint, &settings.model, &wire))
-            .transpose()
-            .map_err(|e| Error::Model(e.kind))?
-            .flatten();
+        let (wire_tokens, wire_tokenizer_status) = match &tokenizer {
+            None => (None, "yapılandırılmadı"),
+            Some(Err(_)) => (None, "tokenizer yüklenemedi; ölçülmedi"),
+            Some(Ok(t)) => match t.measure(&endpoint, &settings.model, &wire) {
+                Ok(Some(tokens)) => (Some(tokens), "JSON metni; sağlayıcı girdisi değil"),
+                Ok(None) => (None, "istek boyutu/bağlantısı için kullanılamıyor"),
+                Err(_) => (None, "tokenizer ölçümü başarısız; ölçülmedi"),
+            },
+        };
         let context = super::status::ContextSnapshot {
             native_body_bytes: wire_bytes,
             capacity_tokens: settings.context_tokens,
             reserved_output_tokens: settings.max_output_tokens,
             provider_input_tokens: None,
-            wire_tokenizer_status: if wire_tokens.is_some() {
-                "JSON metni; sağlayıcı girdisi değil"
-            } else if tokenizer.is_some() {
-                "istek boyutu/bağlantısı için kullanılamıyor"
-            } else {
-                "yapılandırılmadı"
-            }
-            .into(),
+            wire_tokenizer_status: wire_tokenizer_status.into(),
             wire_tokens,
             summarizing,
         };
@@ -1168,6 +1159,54 @@ mod tests {
         );
         assert_eq!(observed.provider_input_tokens, Some(100));
         assert!(observed.wire_tokens.is_none());
+    }
+    #[tokio::test]
+    async fn unavailable_optional_wire_measurements_do_not_block_chat() {
+        for case in ["missing", "changed", "encoding_error"] {
+            let (endpoint, server) = fixture(vec![response(json!({"content":"ok"}), "stop")]).await;
+            let root = canonical_tempdir();
+            let (app, _, mut settings) = fixture_app(root.path(), &endpoint);
+            let mut artifact: Value = serde_json::from_slice(include_bytes!(
+                "../../../model-gateway/tests/fixtures/local-tokenizer.json"
+            ))
+            .unwrap();
+            if case == "encoding_error" {
+                artifact["model"]["unk_token"] = json!("[MISSING]");
+            }
+            let artifact = serde_json::to_vec(&artifact).unwrap();
+            let path = root.path().join("tokenizer.json");
+            fs::write(&path, &artifact).unwrap();
+            settings.local_tokenizer = Some(
+                melissa_model_gateway::local_tokenizer::LocalTokenizerConfig {
+                    path: path.clone(),
+                    blake3: blake3::hash(&artifact).to_hex().to_string(),
+                },
+            );
+            app.save_settings(&settings).unwrap();
+            match case {
+                "missing" => fs::remove_file(&path).unwrap(),
+                "changed" => fs::write(&path, b"{}").unwrap(),
+                _ => (),
+            }
+            let c = turn(
+                &app,
+                Conversation::new_in(None, &settings).unwrap(),
+                "Merhaba",
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(|_| {}),
+            )
+            .await
+            .unwrap();
+            assert!(c.pending.is_none());
+            let context = load(&app, &c.id).unwrap().last_context.unwrap();
+            assert!(context.wire_tokens.is_none(), "{case}");
+            assert_eq!(context.provider_input_tokens, Some(100));
+            assert!(
+                context.wire_tokenizer_status.contains("ölçülmedi"),
+                "{case}"
+            );
+            assert_eq!(server.await.unwrap().len(), 1);
+        }
     }
     #[tokio::test]
     async fn optional_wire_token_count_never_overrides_context_or_cost_authority() {

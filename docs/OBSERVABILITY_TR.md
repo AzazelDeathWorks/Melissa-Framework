@@ -55,7 +55,11 @@ Bağlam kapasitesi/çıktı rezervi token, native JSON boyutu bayt cinsindendir.
 Opsiyonel hash-sabitlenmiş tokenizer yalnız JSON metnini sayar; sağlayıcı chat
 şablonu/görsel genişlemesi olmadığı için gerçek girdi tokeni veya kapasite/maliyet
 yetkisi sayılmaz. Sağlayıcının son yanıtla bildirdiği girdi sayımı ayrı tutulur;
-sonraki isteğin tahmini değildir. Yeni ölçümler mevcut temkinli sınır ve
+sonraki isteğin tahmini değildir.
+Sohbette opsiyonel tokenizer kayıp/değişmişse veya ölçemiyorsa bu gözlem
+bilinmiyor kalır; sohbeti engellemez ve temkinli sınırlar korunur. Bu tolerans
+yalnız sohbet gözlemine aittir; görev/Gateway onay ve doğrulama yolu değişmez.
+Yeni ölçümler mevcut temkinli sınır ve
 kompaksiyon kurallarını gevşetmez. Sağlayıcı/model/endpoint değiştiğinde eski
 bağlam gözlemi temizlenir; özgün konuşma kaydı korunur.
 
