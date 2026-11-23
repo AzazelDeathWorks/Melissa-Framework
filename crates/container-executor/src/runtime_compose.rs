@@ -21,16 +21,11 @@ fn prepare_compose_client(docker:&mut Docker,backend:CreationBackend)->ExecutorR
         Ok(Some((file,ancestors)))
     }
     #[cfg(unix)] {
-        use std::os::unix::fs::OpenOptionsExt;
         let plugin=unix_host::compose_plugin()?;
-        let(mut source,_source_ancestors,source_identity)=pin_client_mode(&plugin,false)?;
-        std::io::Seek::rewind(&mut source)?;
+        let(source,_source_ancestors,source_identity)=pin_client_mode(&plugin,false)?;
         let directory=docker._config.path().join("cli-plugins");std::fs::create_dir(&directory)?;
         let copy=directory.join("docker-compose");
-        let mut output=OpenOptions::new().create_new(true).write(true).mode(0o700).open(&copy)?;
-        std::io::copy(&mut source,&mut output)?;output.sync_all()?;drop(output);
-        let (file,ancestors,identity)=pin_client(&copy)?;
-        if identity.rsplit(':').next()!=source_identity.rsplit(':').next(){return Err(fail("Compose copy differs from pinned installation bytes"))}
+        let (file,ancestors,identity)=unix_host::stage_client(source,&copy,&source_identity)?;
         std::fs::write(docker._config.path().join("config.json"),serde_json::to_vec(&serde_json::json!({"cliPluginsExtraDirs":[directory]}))?)?;
         docker.client_identity.push_str(&format!(":compose-source:{source_identity}:private:{identity}"));
         Ok(Some((file,ancestors)))

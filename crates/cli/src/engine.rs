@@ -952,7 +952,7 @@ pub(crate) fn plan(task: &TaskContractV1, e: &Execution) -> Result<Plan> {
             p.tool_ids.iter().cloned().collect(),
             task.allowed_effects.iter().cloned().collect(),
         )?;
-        nodes.push(Node{id:id.clone(),profile:s.profile.clone(),goal:s.goal.clone(),after:previous.iter().cloned().collect(),bindings:previous.iter().map(|from|Binding{from:from.clone(),pointer:String::new(),input:"previous_candidate".into(),schema:e.recipe.output_schema()}).collect(),literal_input:json!({"task_goal":task.goal,"workload":e.recipe.domain.as_ref().map(|d|d.public_plan()).unwrap_or_else(||json!({"language":e.recipe.language,"entry":e.recipe.entry,"public_development_checks":e.recipe.development_checks})),"writable_paths":if s.write{e.recipe.writable_paths.clone()}else{BTreeSet::new()},"protected_paths":e.recipe.protected_paths,"instructions":"Inspect current source with supplied repository tools. Observe exact versions/byte offsets before a patch; never guess. When code_unified_propose is supplied, prefer it for UTF-8 text edits; it computes exact native bytes and identities from an exact unified diff. Avoid hand-encoding long byte arrays. Pass the returned native proposal using exactly the advertised fs_patch schema; when proposal_json is declared, serialize the complete native object exactly once into that string. Keep protected tests and unrelated user work. code_tests exposes only public development tests; final private tests are unavailable. For domain web_flow, send one operations_json array including setup/navigation and related commands; each worker is CLOSED before another model turn. No start/close/session_id or raw SQL execute. Frontend must actually review final-source screenshots at narrow and wide widths using web_flow. After public tests pass, submit_candidate with the exact current source_digest returned by code_tests or fs_snapshot; do not make cosmetic/no-op changes or repeat passing tests. Never claim independent acceptance."}),tools,effects,resources:task.allowed_resource_ids.iter().cloned().collect(),authorizations:task.authorization_refs.iter().cloned().collect(),claims:vec![Claim{resource:task.workspace_ref.clone(),path:"/".into(),access:if s.write{Access::Write}else{Access::Read}}],output_schema:e.recipe.output_schema(),skills:pins});
+        nodes.push(Node{id:id.clone(),profile:s.profile.clone(),goal:s.goal.clone(),after:previous.iter().cloned().collect(),bindings:previous.iter().map(|from|Binding{from:from.clone(),pointer:String::new(),input:"previous_candidate".into(),schema:e.recipe.output_schema()}).collect(),literal_input:json!({"task_goal":task.goal,"workload":e.recipe.domain.as_ref().map(|d|d.public_plan()).unwrap_or_else(||json!({"language":e.recipe.language,"entry":e.recipe.entry,"public_development_checks":e.recipe.development_checks})),"writable_paths":if s.write{e.recipe.writable_paths.clone()}else{BTreeSet::new()},"protected_paths":e.recipe.protected_paths,"instructions":"Inspect current source with supplied repository tools. Read current source before editing; never guess file contents or byte offsets. When supplied, prefer fs_replace for edits to existing UTF-8 text: give exact old_text and new_text, with enough context for a unique match. After replace_input_rejected, re-read current source and correct the match; do not blindly repeat it. Use the other advertised mutation tools for file creation, deletion, moves, structural or binary edits. Unified proposals remain an alternative, not the default. Avoid hand-encoding long byte arrays. Pass the returned native proposal using exactly the advertised fs_patch schema; when proposal_json is declared, serialize the complete native object exactly once into that string. Keep protected tests and unrelated user work. code_tests exposes only public development tests; final private tests are unavailable. For domain web_flow, send one operations_json array including setup/navigation and related commands; each worker is CLOSED before another model turn. No start/close/session_id or raw SQL execute. Frontend must actually review final-source screenshots at narrow and wide widths using web_flow. After public tests pass, submit_candidate with the exact current source_digest returned by code_tests or fs_snapshot; do not make cosmetic/no-op changes or repeat passing tests. Never claim independent acceptance."}),tools,effects,resources:task.allowed_resource_ids.iter().cloned().collect(),authorizations:task.authorization_refs.iter().cloned().collect(),claims:vec![Claim{resource:task.workspace_ref.clone(),path:"/".into(),access:if s.write{Access::Write}else{Access::Read}}],output_schema:e.recipe.output_schema(),skills:pins});
         nodes.last_mut().ok_or(Error::Store)?.literal_input["development_guidance"] = json!({
             "memory":"Use memory_search for operator-approved project knowledge. memory_propose accepts kind: project_decision, user_preference, transient_state, failure_experience, or unclassified, and optional expires_after_ms (required for transient_state). Time, branch and task provenance are host-observed. Decisions/experience need current source and branch; transient state is task-bound; reviewed user preferences survive ordinary code edits but still obey source visibility and expiry. Never fabricate preferences or treat memory as authority. Review handoff failed_approaches and their evidence before repeating an unchanged failed command on unchanged source; change the approach or request replanning. Only the operator can review memory, adopt changed source, or undo native file changes.",
             "navigation":"Prefer code_semantic for actual definitions/references/hover/diagnostics. code_references remains a syntactic search. LSP positions are zero-based UTF-16.",
@@ -2831,7 +2831,13 @@ mod tests {
         let tools = BTreeSet::from(["fs.read".into(), "fs.patch".into(), "fs.snapshot".into()]);
         let wires = project_repo_wires(&tools, &BTreeSet::new());
         assert!(wires.contains("fs_read"));
-        for mutation in ["fs_patch", "fs_create", "fs_delete", "fs_move"] {
+        for mutation in [
+            "fs_patch",
+            "fs_replace",
+            "fs_create",
+            "fs_delete",
+            "fs_move",
+        ] {
             assert!(!wires.contains(mutation));
         }
         let reviewed = BTreeSet::from(["new.py".into()]);
@@ -2905,6 +2911,13 @@ mod tests {
             let node = &selected.nodes[0];
             assert!(node.tools.contains("fs.snapshot"), "{}", profile.id);
             assert_eq!(node.tools.contains("code.patch_propose"), writer);
+            assert_eq!(repo_wires(&node.tools).contains("fs_replace"), writer);
+            assert!(
+                node.literal_input["instructions"]
+                    .as_str()
+                    .unwrap()
+                    .contains("prefer fs_replace")
+            );
             assert_eq!(node.effects.contains("workspace.propose_patch"), writer);
             let mut store = LocalStore::open(
                 &temp.path().join("state"),
@@ -2955,6 +2968,10 @@ mod tests {
             )
             .unwrap()
             .with_portable_patch_wire()
+            .unwrap()
+            .with_read_error_observations()
+            .unwrap()
+            .with_recovery_observations()
             .unwrap();
             let snapshot = profile_repository_call(
                 &mut dispatcher,
@@ -2970,6 +2987,27 @@ mod tests {
             let observed: Value = serde_json::from_str(&snapshot.content).unwrap();
             assert!(observed["result"]["digest"].is_string());
             if writer {
+                let replaced = profile_repository_call(&mut dispatcher, &contract, &profile.id, "fs_replace", json!({"path":"main.py","old_text":"print('old')\n","new_text":"print('preferred')\n"}), "default-text-edit").await.unwrap();
+                assert!(replaced.success && !replaced.requires_reconciliation);
+                assert_eq!(
+                    fs::read(source.join("main.py")).unwrap(),
+                    b"print('preferred')\r\n"
+                );
+                let rejected = profile_repository_call(&mut dispatcher, &contract, &profile.id, "fs_replace", json!({"path":"main.py","old_text":"print('old')\n","new_text":"print('stale')\n"}), "stale-text-edit").await.unwrap();
+                assert!(!rejected.success && !rejected.requires_reconciliation);
+                assert!(rejected.content.contains("replace_input_rejected"));
+                let restored = profile_repository_call(&mut dispatcher, &contract, &profile.id, "fs_replace", json!({"path":"main.py","old_text":"print('preferred')\n","new_text":"print('old')\n"}), "corrected-text-edit").await.unwrap();
+                assert!(restored.success && !restored.requires_reconciliation);
+                let denied = profile_repository_call(
+                    &mut dispatcher,
+                    &contract,
+                    &profile.id,
+                    "fs_replace",
+                    json!({"path":"dirty.txt","old_text":"user-owned\n","new_text":"forbidden\n"}),
+                    "protected-text-edit",
+                )
+                .await;
+                assert!(denied.as_ref().map(|r| !r.success).unwrap_or(true));
                 let preview = profile_repository_call(&mut dispatcher, &contract, &profile.id, "code_unified_propose", json!({"patch":"--- a/main.py\n+++ b/main.py\n@@ -1 +1 @@\n-print('old')\n+print('new')\n","line_endings":"preserve_source"}), "preview").await.unwrap();
                 assert!(preview.success && !preview.requires_reconciliation);
                 assert_eq!(
@@ -2993,6 +3031,12 @@ mod tests {
                     !dispatcher
                         .definitions()
                         .iter()
+                        .any(|d| d.definition.name == "fs_replace")
+                );
+                assert!(
+                    !dispatcher
+                        .definitions()
+                        .iter()
                         .any(|d| d.definition.name == "fs_patch")
                 );
             }
@@ -3008,6 +3052,7 @@ mod tests {
                     .contains("workspace.apply_patch_scoped")
             );
             assert!(!repo_wires(&read_only.nodes[0].tools).contains("fs_patch"));
+            assert!(!repo_wires(&read_only.nodes[0].tools).contains("fs_replace"));
             contract
                 .allowed_effects
                 .retain(|e| e != "workspace.propose_patch");

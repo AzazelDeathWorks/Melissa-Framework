@@ -799,13 +799,60 @@ pub fn process_tool_schema() -> serde_json::Value {
 }
 
 pub fn environment_support() -> serde_json::Value {
-    json!({"schema_version":"melissa.execution-support/v1","platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,"native_backend":"windows_appcontainer_job","network":"offline_only","strict_disk_capacity":false,"strict_total_cpu":false,"sampled_modes_require_explicit_host_and_grant_opt_in":true,"real_ai_test":"not_run"})
+    json!({"schema_version":"melissa.execution-support/v1","platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,"native_backend":"windows_appcontainer_job","native_backend_available":cfg!(windows),"network":"offline_only","strict_disk_capacity":false,"strict_total_cpu":false,"sampled_modes_require_explicit_host_and_grant_opt_in":true,"real_ai_test":"not_run"})
 }
 
 #[cfg(test)]
 mod startup_control_tests {
     use super::*;
     use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+
+    #[test]
+    fn native_backend_availability_matches_the_host() {
+        assert_eq!(
+            environment_support()["native_backend_available"],
+            cfg!(windows)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_policy_cannot_enable_the_windows_native_executor() {
+        let spec: ProcessSpec = serde_json::from_slice(include_bytes!(
+            "../../../tests/fixtures/code03/process-exec-v2.json"
+        ))
+        .unwrap();
+        let policy = HostPolicy {
+            revision: "test:policy".into(),
+            revocation_epoch: 1,
+            issuer: "test:host".into(),
+            audience: "test:executor".into(),
+            key_id: "test:key".into(),
+            max_permit_lifetime_ms: 5000,
+            ceiling: spec.limits,
+            enforcement: policy::EnforcementCapabilities {
+                filesystem_isolation: true,
+                network_isolation: true,
+                cpu_time: false,
+                memory: true,
+                disk_quota: false,
+                process_tree: true,
+                output_limit: true,
+            },
+            allow_monitored_disk: true,
+            allow_monitored_cpu: true,
+            allowed_env_names: Default::default(),
+            grants: Default::default(),
+            control_grants: Default::default(),
+            revoked_authorization_refs: Default::default(),
+            revoked_permit_ids: Default::default(),
+            revoked_nonces: Default::default(),
+        };
+        assert!(
+            matches!(validate_enforcement(&policy), Err(BrokerError::Denied(message))
+            if message == "native Windows executor required")
+        );
+    }
 
     #[test]
     fn launch_waits_for_the_initial_control_read_and_obeys_its_cancellation() {

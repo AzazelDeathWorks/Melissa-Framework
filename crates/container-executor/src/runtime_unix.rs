@@ -2,14 +2,25 @@
 //! installation locations or the host user's environment, never model fields.
 use crate::{ExecutorError, ExecutorResult};
 use std::{
-    fs::File,
-    io::Read,
-    os::{fd::AsFd, unix::fs::MetadataExt},
+    fs::{File, OpenOptions, Permissions},
+    io::{Read, Seek},
+    os::{
+        fd::AsFd,
+        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Component, Path, PathBuf},
 };
 
 fn fail(message: &str) -> ExecutorError {
     ExecutorError::Unsupported(message.into())
+}
+
+const MAX_CLIENT_BYTES: u64 = 256 * 1024 * 1024;
+
+pub(super) fn private_config() -> ExecutorResult<tempfile::TempDir> {
+    Ok(tempfile::Builder::new()
+        .permissions(Permissions::from_mode(0o700))
+        .tempdir()?)
 }
 
 const CLIENTS: &[&str] = &[
@@ -128,17 +139,23 @@ pub(crate) fn pin_client_mode(
         .map_err(|_| fail("Docker client must be a regular installation file"))?,
     );
     let meta = file.metadata()?;
-    if !meta.is_file() || (single_link && meta.nlink() != 1) || meta.len() > 256 * 1024 * 1024 {
+    if !meta.is_file() || (single_link && meta.nlink() != 1) || meta.len() > MAX_CLIENT_BYTES {
         return Err(fail(
             "Docker client must be a bounded, unlinked regular installation file",
         ));
     }
     let mut hash = blake3::Hasher::new();
     let mut bytes = [0u8; 65536];
+    let mut bounded = (&mut file).take(MAX_CLIENT_BYTES + 1);
+    let mut total = 0;
     loop {
-        let count = file.read(&mut bytes)?;
+        let count = bounded.read(&mut bytes)?;
         if count == 0 {
             break;
+        }
+        total += count as u64;
+        if total > MAX_CLIENT_BYTES {
+            return Err(fail("Docker client grew beyond the size limit"));
         }
         hash.update(&bytes[..count]);
     }
@@ -149,4 +166,108 @@ pub(crate) fn pin_client_mode(
         hash.finalize().to_hex()
     );
     Ok((file, ancestors, identity))
+}
+
+/// Destination must be inside the host's private config, never a task mount.
+pub(super) fn stage_client(
+    mut source: File,
+    destination: &Path,
+    source_identity: &str,
+) -> ExecutorResult<(File, Vec<File>, String)> {
+    if source.metadata()?.mode() & 0o111 == 0 {
+        return Err(fail("Docker client is not executable"));
+    }
+    source.rewind()?;
+    let mut output = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(destination)?;
+    let copied = std::io::copy(&mut source.take(MAX_CLIENT_BYTES + 1), &mut output)?;
+    if copied > MAX_CLIENT_BYTES {
+        return Err(fail("Docker client copy exceeds the size limit"));
+    }
+    output.set_permissions(Permissions::from_mode(0o500))?;
+    drop(output);
+    let (file, ancestors, identity) = pin_client_mode(destination, true)?;
+    if identity.rsplit(':').next() != source_identity.rsplit(':').next() {
+        return Err(fail(
+            "private client differs from pinned installation bytes",
+        ));
+    }
+    Ok((file, ancestors, identity))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, os::unix::fs::symlink, process::Command};
+
+    fn client(directory: &Path) -> PathBuf {
+        let source = directory.join("client");
+        fs::write(&source, b"#!/bin/sh\nprintf original").unwrap();
+        fs::set_permissions(&source, Permissions::from_mode(0o700)).unwrap();
+        source
+    }
+
+    #[test]
+    fn staged_client_uses_pinned_bytes_after_source_path_replacement() {
+        let installed = tempfile::tempdir().unwrap();
+        let config = private_config().unwrap();
+        let source = client(installed.path());
+        let (file, _guards, identity) = pin_client_mode(&source, true).unwrap();
+        fs::rename(&source, installed.path().join("previous")).unwrap();
+        fs::write(&source, b"#!/bin/sh\nprintf replacement").unwrap();
+        let copy = config.path().join("docker");
+        let (_pin, _ancestors, private_identity) = stage_client(file, &copy, &identity).unwrap();
+        assert_eq!(
+            identity.rsplit(':').next(),
+            private_identity.rsplit(':').next()
+        );
+        assert_eq!(Command::new(&copy).output().unwrap().stdout, b"original");
+        assert_eq!(fs::metadata(&copy).unwrap().mode() & 0o777, 0o500);
+        assert_eq!(fs::metadata(config.path()).unwrap().mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn staged_client_rejects_in_place_changes_between_hash_and_copy() {
+        let installed = tempfile::tempdir().unwrap();
+        let config = private_config().unwrap();
+        let source = client(installed.path());
+        let (file, _guards, identity) = pin_client_mode(&source, true).unwrap();
+        fs::write(&source, b"#!/bin/sh\nprintf replacement").unwrap();
+        assert!(stage_client(file, &config.path().join("docker"), &identity).is_err());
+    }
+
+    #[test]
+    fn staging_never_follows_or_overwrites_an_existing_destination() {
+        let installed = tempfile::tempdir().unwrap();
+        let config = private_config().unwrap();
+        let source = client(installed.path());
+        let target = installed.path().join("untouched");
+        fs::write(&target, b"untouched").unwrap();
+        let copy = config.path().join("docker");
+        symlink(&target, &copy).unwrap();
+        let (file, _guards, identity) = pin_client_mode(&source, true).unwrap();
+        assert!(stage_client(file, &copy, &identity).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"untouched");
+        assert!(copy.is_symlink());
+    }
+
+    #[test]
+    fn oversized_and_non_executable_clients_are_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = client(directory.path());
+        OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_len(MAX_CLIENT_BYTES + 1)
+            .unwrap();
+        assert!(pin_client_mode(&source, true).is_err());
+        fs::write(&source, b"not executable").unwrap();
+        fs::set_permissions(&source, Permissions::from_mode(0o600)).unwrap();
+        let (file, _guards, identity) = pin_client_mode(&source, true).unwrap();
+        assert!(stage_client(file, &directory.path().join("docker"), &identity).is_err());
+    }
 }

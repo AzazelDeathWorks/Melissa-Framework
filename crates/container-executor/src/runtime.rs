@@ -1,7 +1,7 @@
 use crate::*;
 use serde_json::Value;
 use std::{
-    fs::{File, OpenOptions},
+    fs::File,
     io::{Read, Write},
     path::PathBuf,
     process::{Child, Command, Stdio},
@@ -9,6 +9,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(windows)]
+use std::fs::OpenOptions;
 
 #[cfg(windows)]
 const ENGINE: &str = "npipe:////./pipe/dockerDesktopLinuxEngine";
@@ -361,9 +364,30 @@ impl Docker {
         );
         #[cfg(unix)]
         let (executable, endpoint) = (unix_host::client()?, unix_host::endpoint()?);
+        Self::with_client(executable, endpoint)
+    }
+    fn with_client(executable: PathBuf, endpoint: String) -> ExecutorResult<Self> {
         let (pin, ancestors, client_identity) = pin_client(&executable)?;
+        #[cfg(windows)]
+        let config = tempfile::tempdir()?;
+        #[cfg(unix)]
+        let config = unix_host::private_config()?;
+        #[cfg(unix)]
+        let (pin, ancestors, client_identity, executable) = {
+            let copy = config.path().join("docker");
+            let (pin, private_ancestors, identity) =
+                unix_host::stage_client(pin, &copy, &client_identity)?;
+            let mut ancestors = ancestors;
+            ancestors.extend(private_ancestors);
+            (
+                pin,
+                ancestors,
+                format!("{client_identity}:private:{identity}"),
+                copy,
+            )
+        };
         Ok(Self {
-            _config: tempfile::tempdir()?,
+            _config: config,
             _pin: pin,
             _ancestors: ancestors,
             client_identity,
@@ -1255,6 +1279,53 @@ pub(crate) fn run_interactive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires installed Docker and Compose, but no daemon, image or model"]
+    fn private_docker_and_compose_clients_run_real_version_commands() {
+        let mut docker = Docker::new().unwrap();
+        let version = docker
+            .checked(&strings(&["--version"]), None, 4096)
+            .unwrap();
+        assert!(String::from_utf8_lossy(&version).contains("Docker version"));
+        let _compose = prepare_compose_client(&mut docker, CreationBackend::Compose).unwrap();
+        let version = docker
+            .checked(&strings(&["compose", "version", "--short"]), None, 4096)
+            .unwrap();
+        assert!(!version.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_commands_never_reopen_the_installation_after_staging() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let installed = tempfile::tempdir().unwrap();
+        let source = installed.path().join("docker");
+        std::fs::write(&source, b"#!/bin/sh\nprintf original").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let docker = Docker::with_client(source.clone(), "unix:///unused.sock".into()).unwrap();
+        let copy = docker.executable.clone();
+        assert_ne!(copy, source);
+        assert!(copy.starts_with(docker._config.path()));
+        assert_eq!(std::fs::metadata(&copy).unwrap().nlink(), 1);
+        assert!(docker.client_identity.contains(":private:unix-file:"));
+        std::fs::write(&source, b"#!/bin/sh\nprintf changed-in-place").unwrap();
+        let (status, output) = docker
+            .capture(&[], None, 1024, Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(status, Some(0));
+        assert_eq!(output.stdout, b"original");
+        std::fs::rename(&source, installed.path().join("old")).unwrap();
+        std::fs::write(&source, b"#!/bin/sh\nprintf replaced").unwrap();
+        let (status, output) = docker
+            .capture(&[], None, 1024, Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(status, Some(0));
+        assert_eq!(output.stdout, b"original");
+        drop(docker);
+        assert!(!copy.exists());
+    }
+
     #[test]
     fn bounded_http_chunk_parser() {
         let (status, body) =
