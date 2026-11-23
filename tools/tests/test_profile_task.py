@@ -70,6 +70,13 @@ class CounterTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform in ("linux", "darwin"), "wait4 requires POSIX")
 class HostTests(unittest.TestCase):
+    def test_output_is_drained_immediately_between_slow_resource_samples(self):
+        result = PROFILE.profile([sys.executable, "-c", "import os;os.write(1,b'x'*(1024*1024))"], interval=5, timeout=2)
+        self.assertEqual(result["exit_code"], 0)
+        self.assertIsNone(result["stop_reason"])
+        self.assertEqual(result["host_command"]["stdout_bytes"], 1024 * 1024)
+        self.assertTrue(result["host_command"]["output_counts_complete"])
+
     def test_completed_child_output_limit_keeps_child_status_but_fails_wrapper(self):
         wait4 = PROFILE.os.wait4
         with patch.object(PROFILE, "OUTPUT_LIMIT_BYTES", 4096), patch.object(PROFILE.os, "wait4", side_effect=lambda pid, flags: wait4(pid, 0)):

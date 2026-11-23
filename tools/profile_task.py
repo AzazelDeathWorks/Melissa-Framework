@@ -74,11 +74,15 @@ def profile(command, timeout=60, container=None, interval=0.05):
                     totals[ready.data] += len(block)
         def output_exceeded():
             return max(totals.values()) > OUTPUT_LIMIT_BYTES
+        next_sample = start
         try:
             while True:
-                rss = pid_sample(child.pid)["rss_bytes"]
-                if rss is not None: sampled_rss = max(rss, sampled_rss or 0)
-                if meter: meter.sample()
+                now = time.perf_counter_ns()
+                if now >= next_sample:
+                    rss = pid_sample(child.pid)["rss_bytes"]
+                    if rss is not None: sampled_rss = max(rss, sampled_rss or 0)
+                    if meter: meter.sample()
+                    next_sample = now + round(interval * 1e9)
                 drain()
                 pid, status, usage = os.wait4(child.pid, os.WNOHANG)
                 if pid:
@@ -95,7 +99,8 @@ def profile(command, timeout=60, container=None, interval=0.05):
                     _, status, usage = os.wait4(child.pid, 0)
                     drain()
                     break
-                time.sleep(min(interval, max(0, timeout - (time.perf_counter_ns() - start) / 1e9)))
+                now = time.perf_counter_ns()
+                streams.select(max(0, min(next_sample - now, start + round(timeout * 1e9) - now) / 1e9))
             child.returncode = os.waitstatus_to_exitcode(status)
         finally:
             if child.returncode is None:
