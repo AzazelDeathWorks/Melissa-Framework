@@ -94,12 +94,14 @@ def validate(manifest):
         raise ValueError("trial count exceeds schedule")
 
 
-def observations(path):
+def observations(path, trial_ids=None, content_hashes=None):
     _, manifest = load(path)
     validate(manifest)
     controls = manifest["controls"]
     root = Path(path).resolve().parent
     results, seen = {}, set()
+    trial_ids = set() if trial_ids is None else trial_ids
+    content_hashes = set() if content_hashes is None else content_hashes
     for entry in manifest["trials"]:
         keys(entry, "task repeat result result_sha256")
         integer(entry["repeat"], 0, controls["repeats"] - 1)
@@ -115,6 +117,12 @@ def observations(path):
         raw, trial = load(result_path)
         if sha(raw) != entry["result_sha256"]:
             raise ValueError("trial content digest mismatch")
+        trial_id = trial.get("id")
+        text(trial_id)
+        if trial_id in trial_ids or entry["result_sha256"] in content_hashes:
+            raise ValueError("reused Harbor trial ID or copied result content")
+        trial_ids.add(trial_id)
+        content_hashes.add(entry["result_sha256"])
         config = trial.get("config") or {}
         task = config.get("task") or {}
         agent = config.get("agent") or {}
@@ -135,8 +143,9 @@ def mcnemar(left_only, right_only):
 
 def compare(left_path, right_path, bootstrap=10000):
     integer(bootstrap, 100, 20000)
-    left, a = observations(left_path)
-    right, b = observations(right_path)
+    trial_ids, content_hashes = set(), set()
+    left, a = observations(left_path, trial_ids, content_hashes)
+    right, b = observations(right_path, trial_ids, content_hashes)
     if canonical(left["controls"]) != canonical(right["controls"]):
         raise ValueError("unmatched task/model/limit/retry/deadline/concurrency/environment controls")
     if left["agent"]["id"] == right["agent"]["id"]:

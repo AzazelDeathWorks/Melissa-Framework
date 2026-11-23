@@ -11,13 +11,15 @@ import platform
 import re
 import shutil
 import signal
+import selectors
 import subprocess
 import sys
-import tempfile
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bench" / "harbor"))
 from melissa_resources import CgroupMeter, pid_sample, unavailable_worker
+
+OUTPUT_LIMIT_BYTES = 64 * 1024 * 1024
 
 
 def container_identity(engine, container):
@@ -55,23 +57,43 @@ def profile(command, timeout=60, container=None, interval=0.05):
     sampled_rss = None
     reason = None
     start = time.perf_counter_ns()
-    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
-        child = subprocess.Popen(command, stdout=output, stderr=errors, start_new_session=True)
+    with selectors.DefaultSelector() as streams:
+        child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        totals = {"stdout": 0, "stderr": 0}
+        for name, stream in (("stdout", child.stdout), ("stderr", child.stderr)):
+            os.set_blocking(stream.fileno(), False)
+            streams.register(stream, selectors.EVENT_READ, name)
+        def drain():
+            for ready, _ in streams.select(0):
+                for _ in range(64):
+                    try: block = os.read(ready.fd, 65536)
+                    except BlockingIOError: break
+                    if not block:
+                        streams.unregister(ready.fileobj)
+                        break
+                    totals[ready.data] += len(block)
+        def output_exceeded():
+            return max(totals.values()) > OUTPUT_LIMIT_BYTES
         try:
             while True:
                 rss = pid_sample(child.pid)["rss_bytes"]
                 if rss is not None: sampled_rss = max(rss, sampled_rss or 0)
                 if meter: meter.sample()
+                drain()
                 pid, status, usage = os.wait4(child.pid, os.WNOHANG)
-                if pid: break
+                if pid:
+                    drain()
+                    if output_exceeded(): reason = "output_limit"
+                    break
                 if time.perf_counter_ns() - start >= timeout * 1_000_000_000:
                     reason = "host_timeout"
-                if max(os.fstat(output.fileno()).st_size, os.fstat(errors.fileno()).st_size) > 64 * 1024 * 1024:
+                if output_exceeded():
                     reason = "output_limit"
                 if reason:
                     try: os.killpg(child.pid, signal.SIGKILL)
                     except ProcessLookupError: pass
                     _, status, usage = os.wait4(child.pid, 0)
+                    drain()
                     break
                 time.sleep(min(interval, max(0, timeout - (time.perf_counter_ns() - start) / 1e9)))
             child.returncode = os.waitstatus_to_exitcode(status)
@@ -80,9 +102,11 @@ def profile(command, timeout=60, container=None, interval=0.05):
                 try: os.killpg(child.pid, signal.SIGKILL)
                 except ProcessLookupError: pass
                 child.wait()
+            child.stdout.close()
+            child.stderr.close()
         wall_us = (time.perf_counter_ns() - start) // 1000
-        output_bytes = os.fstat(output.fileno()).st_size
-        error_bytes = os.fstat(errors.fileno()).st_size
+        output_bytes, error_bytes = totals["stdout"], totals["stderr"]
+        counts_complete = not streams.get_map()
     stable = False
     if identity:
         try: stable = container_identity(engine, identity[0]) == identity
@@ -94,8 +118,8 @@ def profile(command, timeout=60, container=None, interval=0.05):
         "host_command": {"cpu_time_us": round((usage.ru_utime + usage.ru_stime) * 1e6),
             "sampled_root_peak_rss_bytes": sampled_rss,
             "process_lifetime_peak_rss_bytes": usage.ru_maxrss * (1 if platform.system() == "Darwin" else 1024),
-            "stdout_bytes": output_bytes, "stderr_bytes": error_bytes,
-            "scope": "wait4 CPU for the direct child and waited descendants; sampled RSS only the root process (Linux), not aggregate tree RAM. Lifetime RSS may include pre-exec launcher memory. Sampling/launch overhead included; monitor excluded."},
+            "stdout_bytes": output_bytes, "stderr_bytes": error_bytes, "output_counts_complete": counts_complete,
+            "scope": "wait4 CPU for the direct child and waited descendants; sampled RSS only the root process (Linux), not aggregate tree RAM. Lifetime RSS may include pre-exec launcher memory. Sampling/launch overhead included; monitor excluded. Output is drained and discarded without disk capture; byte counts are observed lower bounds when output_counts_complete is false."},
         "worker": meter.finish(stable) if meter else unavailable_worker(unavailable or "no_container_selected"),
         "cleanup_scope": "Timeout kills only the host process group, not detached children or commands inside a container. The owning harness must cancel its own worker; this monitor never stops an existing container.",
     }
@@ -111,7 +135,7 @@ def main():
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     result = profile(command, args.timeout, args.container, args.interval)
     print(json.dumps(result, indent=2))
-    return 0 if result["exit_code"] == 0 else 1
+    return 0 if result["exit_code"] == 0 and result["stop_reason"] is None else 1
 
 
 if __name__ == "__main__":

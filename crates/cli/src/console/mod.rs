@@ -736,15 +736,41 @@ pub async fn run(home: &Path, workspace: &Path) -> Result {
             }
             Event::Key(k) if k.kind != KeyEventKind::Release => {
                 if ui::control(&k, 'p') {
-                    let labels = commands::COMMANDS
+                    let choices = commands::available(job.is_some(), !draft.is_empty());
+                    let labels = choices
                         .iter()
                         .map(|(name, description)| format!("{name:<14} {description}"))
                         .collect::<Vec<_>>();
-                    if let Some(index) =
-                        ui.choose("Komut paleti · seç, sonra Enter ile çalıştır", &labels)?
-                    {
-                        input = ui::editor();
-                        input.insert_str(commands::COMMANDS[index].0);
+                    if let Some(index) = ui.choose(
+                        "Komut paleti · görünüm aç / boş taslağa komut ekle · Esc iptal",
+                        &labels,
+                    )? {
+                        match choices[index].0 {
+                            "/help" => ui.view("Komutlar ve kısayollar", &commands::help())?,
+                            "/search" => ui.search()?,
+                            "/transcript" => {
+                                let text = ui.transcript.plain();
+                                ui.view("Konuşma kaydı", &text)?;
+                            }
+                            "/status" => {
+                                let selected = app.settings().ok();
+                                let report = status::report(
+                                    selected.as_ref(),
+                                    conversation.as_ref(),
+                                    job.is_some(),
+                                    plan,
+                                    queue.len(),
+                                    &crate::process_measurement::Measurement::observe(
+                                        &resource_baseline,
+                                    ),
+                                );
+                                ui.view("Durum · bağlam ve kaynaklar", &report)?;
+                            }
+                            name if job.is_none() && draft.is_empty() => {
+                                input.insert_str(name);
+                            }
+                            _ => (),
+                        }
                     }
                 } else if ui::control(&k, 'f') {
                     ui.search()?;
@@ -807,6 +833,12 @@ pub async fn run(home: &Path, workspace: &Path) -> Result {
                         continue;
                     }
                     if job.is_some() {
+                        if commands::is_command(&draft)
+                            && !matches!(draft.trim(), "/exit" | "/questions")
+                        {
+                            ui.print("Bu komut etkin iş sırasında çalıştırılmaz; mesaj veya soru yanıtı olarak iletilmedi.")?;
+                            continue;
+                        }
                         if draft.trim() == "/exit" {
                             if let Some(active) = &job {
                                 active.request_stop(&mut ui, &app)?;

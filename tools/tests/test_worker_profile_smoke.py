@@ -36,7 +36,7 @@ class SmokeTests(unittest.TestCase):
                 else:
                     with self.assertRaises(ValueError): SMOKE.smoke("local-image", 1)
             removes = [command for command in commands if command[:2] == ["docker", "rm"]]
-            self.assertEqual(removes, [["docker", "rm", "-f", container]] if matched else [])
+            self.assertEqual(removes, [["docker", "rm", "-f", "-v", container]] if matched else [])
             starts = [command for command in commands if command[:2] == ["docker", "run"]]
             self.assertIn("never", starts[0])
             self.assertIn("no-new-privileges", starts[0])

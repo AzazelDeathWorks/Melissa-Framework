@@ -75,7 +75,7 @@ def smoke(image, repetitions=3):
                     parts = found.stdout.split()
                     if len(parts) != 2 or not re.fullmatch(r"[a-f0-9]{64}", parts[0]) or parts[1] != nonce:
                         raise ValueError("container ownership mismatch; cleanup refused")
-                    subprocess.run([engine, "rm", "-f", parts[0]], check=True, timeout=30, stdout=subprocess.DEVNULL)
+                    subprocess.run([engine, "rm", "-f", "-v", parts[0]], check=True, timeout=30, stdout=subprocess.DEVNULL)
     return {"scope": "Fresh unprivileged, network-isolated C CPU/RAM fixtures, not model quality or a harness competitor benchmark.",
             "image_id": image_id, "fixture_source_sha256": hashlib.sha256(SOURCE.encode()).hexdigest(),
             "fixture_binary_sha256": binary_hash, "records": records}

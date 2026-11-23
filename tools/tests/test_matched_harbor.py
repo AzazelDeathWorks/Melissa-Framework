@@ -32,6 +32,7 @@ class MatchedTests(unittest.TestCase):
         for repeat in range(repeats):
             for task, reward in zip(controls["tasks"], rewards):
                 trial = {"task_name": task, "config": {"task": {"git_url": controls["dataset"]["source_url"], "git_commit_id": controls["dataset"]["git_commit"]}, "agent": {"name": side, "model_name": "same-model"}}, "verifier_result": {"rewards": {"reward": reward}}, "exception_info": None}
+                trial["id"] = f"{side}-{task}-{repeat}"
                 file = self.root / f"{side}-{task}-{repeat}.json"
                 file.write_text(json.dumps(trial))
                 manifest["trials"].append({"task": task, "repeat": repeat, "result": file.name, "result_sha256": COMPARE.sha(file.read_bytes())})
@@ -61,6 +62,16 @@ class MatchedTests(unittest.TestCase):
         self.assertIsNone(result["statistics"])
         self.assertEqual(result["counts"]["left"]["missing_trial"], 2)
         self.assertEqual(result["scheduled_pairs"], 3)
+
+    def test_copied_results_and_reused_trial_ids_are_rejected(self):
+        a, b = self.manifest("a", [1], 2), self.manifest("b", [1], 2)
+        first, second = self.root / "a-one-0.json", self.root / "a-one-1.json"
+        second.write_bytes(first.read_bytes())
+        self.change(a, lambda x: x["trials"][1].update(result_sha256=COMPARE.sha(second.read_bytes())))
+        with self.assertRaisesRegex(ValueError, "reused Harbor"): COMPARE.compare(a, b, 100)
+        self.change(second, lambda x: x.update(extra_fixture_field=True))
+        self.change(a, lambda x: x["trials"][1].update(result_sha256=COMPARE.sha(second.read_bytes())))
+        with self.assertRaisesRegex(ValueError, "reused Harbor"): COMPARE.compare(a, b, 100)
 
     def test_mismatched_controls_and_altered_results_are_rejected(self):
         a, b = self.manifest("a", [1]), self.manifest("b", [1])

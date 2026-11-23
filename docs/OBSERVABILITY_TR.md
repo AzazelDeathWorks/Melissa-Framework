@@ -8,8 +8,11 @@ yüklemesi ayrı sonuçlardır. Canlı AI ve temiz Windows kabulü ayrıca gerek
 
 ### Konuşma arayüzü ve ortak bağlam bütçesi
 
-`Ctrl+P` komut paletini açar; seçim yalnız taslağı doldurur, çalıştırmak için
-ayrıca Enter gerekir. `/` ile komut açıklamaları, Tab ile tamamlama, `/help`
+`Ctrl+P` komut paletini açar; salt okunur görünümler taslağı koruyarak açılır.
+Diğer komutlar yalnız iş yokken boş taslağa eklenir ve ayrıca Enter gerektirir.
+Taslak varken veya iş sürerken palet yalnız dört salt okunur görünümü sunar;
+diğer komutlar için önce taslağı `Ctrl+Q` ile sıraya alabilirsin.
+`/` ile komut açıklamaları, Tab ile tamamlama, `/help`
 ile bütün kısayollar görünür. Plan, uygulama ve izin incelemesi aynı host
 sınırlarından geçer. Salt okunur `/status` API çağırmaz veya iş başlatmaz.
 Dar terminalde ayrıntılar `/status` ekranındadır. Değişmeyen ekran yeniden
