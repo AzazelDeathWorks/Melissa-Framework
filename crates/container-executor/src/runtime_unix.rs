@@ -224,7 +224,16 @@ mod tests {
             identity.rsplit(':').next(),
             private_identity.rsplit(':').next()
         );
-        assert_eq!(Command::new(&copy).output().unwrap().stdout, b"original");
+        let output = super::super::spawn_client(|| {
+            Command::new(&copy)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+        })
+        .unwrap()
+        .wait_with_output()
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"original");
         assert_eq!(fs::metadata(&copy).unwrap().mode() & 0o777, 0o500);
         assert_eq!(fs::metadata(config.path()).unwrap().mode() & 0o777, 0o700);
     }
@@ -237,6 +246,74 @@ mod tests {
         let (file, _guards, identity) = pin_client_mode(&source, true).unwrap();
         fs::write(&source, b"#!/bin/sh\nprintf replacement").unwrap();
         assert!(stage_client(file, &config.path().join("docker"), &identity).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn busy_client_retries_are_bounded_and_other_spawn_errors_stay_errors() {
+        let directory = private_config().unwrap();
+        let source = client(directory.path());
+        let writer = OpenOptions::new().write(true).open(&source).unwrap();
+        let mut command = Command::new(&source);
+        let error = super::super::spawn_client(|| command.spawn()).unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(rustix::io::Errno::TXTBSY.raw_os_error())
+        );
+        drop(writer);
+        assert!(
+            super::super::spawn_client(|| command.spawn())
+                .unwrap()
+                .wait()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            super::super::spawn_client(|| Command::new(directory.path().join("missing")).spawn())
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn transient_exec_busy_retries_stop_at_success_and_never_replay_a_client() {
+        let directory = private_config().unwrap();
+        let source = client(directory.path());
+        let busy = || std::io::Error::from_raw_os_error(rustix::io::Errno::TXTBSY.raw_os_error());
+        let mut attempts = 0;
+        let child = super::super::spawn_client(|| {
+            attempts += 1;
+            if attempts < 3 {
+                return Err(busy());
+            }
+            Command::new(&source)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+        })
+        .unwrap();
+        assert_eq!(attempts, 3);
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"original");
+        let mut attempts = 0;
+        assert!(
+            super::super::spawn_client(|| {
+                attempts += 1;
+                Err(busy())
+            })
+            .is_err()
+        );
+        assert_eq!(attempts, 5);
+        let mut attempts = 0;
+        assert!(
+            super::super::spawn_client(|| {
+                attempts += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            })
+            .is_err()
+        );
+        assert_eq!(attempts, 1);
     }
 
     #[test]

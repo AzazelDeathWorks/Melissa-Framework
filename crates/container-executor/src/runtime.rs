@@ -23,6 +23,22 @@ const CONTROL_LIMIT: usize = 1024 * 1024;
 // and could starve OCI exec initialization at small, correctly enforced quotas.
 const KEEPER: &str = "use POSIX qw(WNOHANG); $SIG{USR1}=sub{alarm $ARGV[0]}; $SIG{ALRM}=sub{exit 0}; $SIG{CHLD}=sub{while(waitpid(-1,WNOHANG)>0){}}; alarm 180; while(1){sleep 180}";
 const ATTEST: &str = "while IFS= read -r line; do case \"$line\" in Uid:*|CapEff:*|NoNewPrivs:*|Seccomp:*) printf '%s\\n' \"$line\";; esac; done < /proc/self/status; for file in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.swap.max /sys/fs/cgroup/pids.max /sys/fs/cgroup/cpu.max; do IFS= read -r value < \"$file\"; printf '%s\\n' \"$value\"; done; while IFS= read -r line; do case \"$line\" in 'Max file size '*) printf '%s\\n' \"$line\";; esac; done < /proc/self/limits; exec /usr/bin/stat -f -c '%S %b' /work";
+fn spawn_client(mut spawn: impl FnMut() -> std::io::Result<Child>) -> std::io::Result<Child> {
+    // Another fork can briefly retain a CLOEXEC write fd until its exec.
+    // Retry only a failed exec, never a command that has already started.
+    #[cfg(unix)]
+    for _ in 0..4 {
+        match spawn() {
+            Err(error)
+                if error.raw_os_error() == Some(rustix::io::Errno::TXTBSY.raw_os_error()) =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+    spawn()
+}
 fn strings(v: &[&str]) -> Vec<String> {
     v.iter().map(|v| v.to_string()).collect()
 }
@@ -71,7 +87,7 @@ impl Capture {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command.spawn()?;
+        let mut child = spawn_client(|| command.spawn())?;
         let out = Arc::new(Mutex::new(Output::default()));
         let mut readers = Vec::new();
         let response_pipe = conversation.as_ref().map(|c| c.output.clone());
