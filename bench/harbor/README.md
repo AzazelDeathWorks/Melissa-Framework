@@ -92,3 +92,67 @@ silently discard provider failures or merge retries into a selectively improved
 score. Use the original full task denominator and an identical model/configuration
 for comparisons. Provider prices in the bridge are accounting placeholders, not
 verified invoice rates. No paid benchmark is run by the tests above.
+
+## Task resource sidecar
+
+The bridge writes `agent/melissa-resources.json` on success, failure and graceful
+cancellation. Host Rust CPU/RSS observations are sampled **lower bounds**, not
+complete process totals; the Python bridge is not included. Visible Linux
+cgroup-v2 CPU/block-I/O deltas cover the task container, including its background
+processes, not only one tool. Sampled memory is not an exact peak; `memory.peak`
+is the cgroup's whole lifetime, never reset by the observer. Missing/reset or
+unsupported counters stay `null`. Docker Desktop/remote engines may make host
+cgroup files unavailable. Measurement cannot grant tool authority or prove task
+success; an optional observer failure does not block the model loop.
+
+The offline `tools/profile_task.py` wrapper and explicit, no-network
+`tools/worker_profile_smoke.py --image LOCAL_IMAGE` are documented in
+`docs/OBSERVABILITY_TR.md`. Neither script starts a paid model run by itself.
+
+## Matched comparison (offline only)
+
+`python3 bench/harbor/compare_matched.py LEFT.json RIGHT.json` validates the
+registered schedule, same controls and immutable result contents before reporting
+paired statistics. It never launches a provider or benchmark. Paid runs require a
+separately approved spending cap; a comparison report is not budget enforcement.
+
+Both manifests use this shape (replace placeholder digests with SHA-256 of the
+actual frozen policies/endpoint/environment; `git_commit` is the 40-digit commit
+from the downloaded task source):
+
+```json
+{
+  "schema_version": "melissa.matched-harbor/v1",
+  "controls": {
+    "dataset": {"name": "terminal-bench", "version": "2.0", "source_url": "https://github.com/laude-institute/terminal-bench-2.git", "git_commit": "<40 lowercase hex>"},
+    "tasks": ["fix-git"], "repeats": 1,
+    "model": {"id": "exact-model-id", "endpoint_sha256": "<64 lowercase hex>", "protocol": "open_ai_chat_completions"},
+    "context_tokens": 131072, "max_output_tokens": 8192, "max_turns": 200,
+    "deadline_policy_sha256": "<64 lowercase hex>", "retry_policy_sha256": "<64 lowercase hex>",
+    "authority_sha256": "<64 lowercase hex>", "environment_sha256": "<64 lowercase hex>",
+    "concurrency": 1, "seed": 42
+  },
+  "agent": {"id": "melissa", "harbor_agent": "melissa_agent:MelissaAgent", "revision_sha256": "<64 lowercase hex>"},
+  "trials": [{"task": "fix-git", "repeat": 0, "result": "left-job/fix-git__trial/result.json", "result_sha256": "<64 lowercase hex>"}]
+}
+```
+
+Freeze the controls and full schedule **before** starting either arm; append result
+content hashes afterward without changing the controls. Keep manifests above
+their trial artifacts; traversal, reused paths, duplicate task/repeat slots,
+changed result bytes, nonfinite/duplicate JSON and mismatched task/model/agent/git
+identity fail closed. Missing scheduled slots remain visible. Do not silently
+replace a failed trial with a retry: register a separate matched study instead.
+
+Incomplete/error studies get counts, not significance/ranking claims. Complete
+binary-verifier studies get a deterministic task-cluster paired-bootstrap interval;
+single-repeat studies also get exact McNemar p. Repeated tasks are not treated as
+independent samples for McNemar. Tiny/fixed suites and degenerate bootstrap
+intervals do not establish broad superiority. This is not an official dataset score.
+
+The tool checks **declarations and available artifacts**, not provider-internal
+routing or execution attestation. Endpoint/limits/retry/deadline/authority and
+environment policy digests must be reviewed against each agent's actual effective
+configuration; matching strings alone cannot prove those policies ran. It does not
+prove registration time, spending, or official release labels. The dataset git
+identity, not an invented version label, binds the tested artifact.

@@ -30,6 +30,7 @@ from harbor.tasks.client import TaskClient
 from harbor.trial.hooks import TrialEvent
 
 from melissa_runtime import atomic_bytes, atomic_json, remaining_wall_ms, update_context
+from melissa_resources import ResourceRecorder
 
 ROOT = Path(__file__).resolve().parents[2]
 BIN = Path(os.environ.get("MELISSA_BENCH_BIN", ROOT / "target/release/melissa-bench"))
@@ -161,15 +162,22 @@ class MelissaAgent(BaseAgent):
             proc = None
             done = {"status": "NoResult", "telemetry_complete": False}
             final_received = False
+            resources = ResourceRecorder()
             try:
                 wall_ms = self._wall_ms()
                 child_env["MELISSA_BENCH_WALL_MS"] = str(wall_ms)
                 deadline = time.monotonic() + wall_ms / 1000
+                await resources.prepare(environment)
+                remaining_ms = math.floor((deadline - time.monotonic()) * 1000)
+                if remaining_ms <= 0:
+                    raise TimeoutError("deadline elapsed before model process launch")
+                child_env["MELISSA_BENCH_WALL_MS"] = str(remaining_ms)
                 proc = await asyncio.create_subprocess_exec(
                     str(BIN), str(scratch / "instruction.md"),
                     stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                     stderr=stderr, env=child_env, limit=64 * 1024 * 1024,
                 )
+                resources.start(proc.pid)
                 async with asyncio.timeout_at(deadline):
                     done = await self._drive(proc, environment, scratch, trace)
                 final_received = True
@@ -200,6 +208,10 @@ class MelissaAgent(BaseAgent):
                     if not final_received or done.get("status") == "GatewayError":
                         done["telemetry_complete"] = False
                     done["wall_ms"] = int((time.monotonic() - started) * 1000)
+                    try:
+                        atomic_json(self.logs_dir / "melissa-resources.json", await resources.finish())
+                    except Exception:
+                        done["resource_measurement_unavailable"] = True
                     trace.flush()
                     stderr.flush()
                     atomic_bytes(self.logs_dir / "melissa-trace.jsonl", (scratch / "trace.jsonl").read_bytes())
