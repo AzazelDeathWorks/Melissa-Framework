@@ -18,9 +18,31 @@ fn fail(message: &str) -> ExecutorError {
 const MAX_CLIENT_BYTES: u64 = 256 * 1024 * 1024;
 
 pub(super) fn private_config() -> ExecutorResult<tempfile::TempDir> {
+    private_config_in(&std::env::temp_dir())
+}
+
+fn private_config_in(parent: &Path) -> ExecutorResult<tempfile::TempDir> {
+    use rustix::fs::{Mode, OFlags, open, openat};
+    let parent = std::fs::canonicalize(parent)?;
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut directory = File::from(open("/", flags, Mode::empty()).map_err(std::io::Error::from)?);
+    let uid = rustix::process::geteuid().as_raw();
+    for part in parent.components() {
+        if let Component::Normal(name) = part {
+            directory = File::from(
+                openat(&directory, name, flags, Mode::empty()).map_err(std::io::Error::from)?,
+            );
+        }
+        let meta = directory.metadata()?;
+        if (meta.uid() != 0 && meta.uid() != uid)
+            || (meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0)
+        {
+            return Err(fail("Docker staging path has a replaceable ancestor"));
+        }
+    }
     Ok(tempfile::Builder::new()
         .permissions(Permissions::from_mode(0o700))
-        .tempdir()?)
+        .tempdir_in(&parent)?)
 }
 
 const CLIENTS: &[&str] = &[
@@ -208,6 +230,37 @@ mod tests {
         fs::write(&source, b"#!/bin/sh\nprintf original").unwrap();
         fs::set_permissions(&source, Permissions::from_mode(0o700)).unwrap();
         source
+    }
+
+    #[test]
+    fn private_config_rejects_replaceable_parents_and_ancestors() {
+        let root = private_config().unwrap();
+        let shared = root.path().join("shared");
+        let child = shared.join("child");
+        fs::create_dir(&shared).unwrap();
+        fs::create_dir(&child).unwrap();
+        for mode in [0o777, 0o770] {
+            fs::set_permissions(&shared, Permissions::from_mode(mode)).unwrap();
+            assert!(private_config_in(&shared).is_err(), "mode {mode:o}");
+            assert!(private_config_in(&child).is_err(), "ancestor mode {mode:o}");
+            assert_eq!(fs::read_dir(&child).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn private_config_accepts_sticky_parent_and_resolves_alias_once() {
+        let root = private_config().unwrap();
+        let shared = root.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, Permissions::from_mode(0o1777)).unwrap();
+        let alias = root.path().join("alias");
+        symlink(&shared, &alias).unwrap();
+        let config = private_config_in(&alias).unwrap();
+        assert_eq!(
+            config.path().parent().unwrap(),
+            fs::canonicalize(&shared).unwrap()
+        );
+        assert_eq!(fs::metadata(config.path()).unwrap().mode() & 0o777, 0o700);
     }
 
     #[test]
