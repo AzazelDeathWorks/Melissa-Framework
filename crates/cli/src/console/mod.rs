@@ -996,10 +996,7 @@ pub async fn run(home: &Path, workspace: &Path) -> Result {
                                         conversation =
                                             Some(match workspace.as_deref() { Some(path) => Conversation::new(path, &selected_settings)?, None => Conversation::new_in(None, &selected_settings)? });
                                     }
-                                    let mut c = conversation.clone().ok_or(Error::Store)?;
-                                    c.plan = plan;
-                                    c.draft.clear();
-                                    c.save(&app)?;
+                                    let c = conversation.as_mut().ok_or(Error::Store)?.prepare_turn(&app, plan)?;
                                     let text = if command == "/plan" {
                                         arg.to_owned()
                                     } else {

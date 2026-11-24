@@ -188,6 +188,12 @@ impl Conversation {
         );
         Ok(())
     }
+    pub fn prepare_turn(&mut self, app: &App, plan: bool) -> Result<Self> {
+        self.plan = plan;
+        self.draft.clear();
+        self.save(app)?;
+        Ok(self.clone())
+    }
     pub fn save(&mut self, app: &App) -> Result {
         let _lock = session_lock(app, self)?;
         if self.directory(app).join("state.enc").exists()
@@ -1127,6 +1133,30 @@ mod tests {
         prefs.api_consent = true;
         super::super::settings::write(&app, &prefs).unwrap();
         (app, source, settings)
+    }
+    #[test]
+    fn preparing_turn_keeps_ui_worker_and_saved_mode_in_sync() {
+        for with_workspace in [false, true] {
+            let root = canonical_tempdir();
+            let (app, source, settings) =
+                fixture_app(root.path(), "http://127.0.0.1:1/v1/chat/completions");
+            let mut visible =
+                Conversation::new_in(with_workspace.then_some(source.as_path()), &settings)
+                    .unwrap();
+            for plan in [true, false, true] {
+                visible.draft = "submitted draft".into();
+                let worker = visible.prepare_turn(&app, plan).unwrap();
+                let saved = load(&app, &visible.id).unwrap();
+                for c in [&visible, &worker, &saved] {
+                    assert_eq!(c.plan, plan);
+                    assert!(c.draft.is_empty());
+                    assert_eq!(c.revision, worker.revision);
+                    assert_eq!(c.workspace.is_some(), with_workspace);
+                    assert_eq!(c.id, visible.id);
+                }
+                visible = saved;
+            }
+        }
     }
     #[tokio::test]
     async fn ordinary_chat_does_not_require_or_enumerate_a_workspace() {
