@@ -203,7 +203,7 @@ async fn real_compensation_is_separately_authorized_and_never_runs_twice() {
 }
 struct Lost {
     inner: RepositoryDispatcher,
-    hang: bool,
+    after_effect: Arc<tokio::sync::Notify>,
 }
 impl ToolDispatcher for Lost {
     fn definitions(&self) -> Vec<BoundTool> {
@@ -221,31 +221,32 @@ impl ToolDispatcher for Lost {
     {
         Box::pin(async move {
             self.inner.execute(c, t, f).await?;
-            if self.hang {
-                std::future::pending::<()>().await;
-            }
-            Err(melissa_model_gateway::GatewayError::new(
-                melissa_model_gateway::ErrorKind::Transport,
-                "injected lost receipt after authentic effect",
-            ))
+            self.after_effect.notify_one();
+            std::future::pending().await
         })
     }
 }
 #[tokio::test]
 async fn compensation_crash_after_effect_is_adopted_from_native_receipt_without_replay() {
-    let (_d, mut s, tools, plan, r) = prepared().await;
+    let (d, mut s, tools, plan, r) = prepared().await;
     let op = Compensation::create(&mut s, plan.clone(), r.clone()).unwrap();
+    let after_effect = Arc::new(tokio::sync::Notify::new());
     let mut lost = Lost {
         inner: tools,
-        hang: true,
+        after_effect: after_effect.clone(),
     };
-    assert!(
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            op.execute(&mut s, &mut lost, Arc::new(AtomicBool::new(false)))
-        )
-        .await
-        .is_err()
+    {
+        let execution = op.execute(&mut s, &mut lost, Arc::new(AtomicBool::new(false)));
+        tokio::pin!(execution);
+        tokio::select! {
+            _ = after_effect.notified() => {},
+            result = &mut execution => panic!("fault injection returned before receipt loss: {result:?}"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => panic!("native effect did not settle"),
+        }
+    }
+    assert_eq!(
+        std::fs::read(d.path().join("repo/value.txt")).unwrap(),
+        b"original\n"
     );
     assert_eq!(op.state(&s).unwrap().phase, Phase::Compensating);
     drop(op);
