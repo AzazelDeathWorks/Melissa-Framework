@@ -299,6 +299,7 @@ impl App {
         let mut plan = crate::engine::plan(&t.contract, &revised)?;
         plan.revision = old.plan.revision.checked_add(1).ok_or(Error::Store)?;
         plan.parent_digest = Some(old.plan.digest().map_err(|_| Error::Store)?);
+        keep_started_instructions(&old, &mut plan);
         plan.validate(&t.contract, &crate::resources::catalog()?)
             .map_err(|_| Error::Denied("Yeni plan görev yetkisi dışında."))?;
         preserve_started(&old, &plan)?;
@@ -324,6 +325,23 @@ impl App {
     }
 }
 
+fn keep_started_instructions(
+    old: &melissa_workflow::scheduler::State,
+    plan: &mut melissa_workflow::plan::Plan,
+) {
+    for previous in &old.plan.nodes {
+        if matches!(
+            old.slots[&previous.id].phase,
+            melissa_workflow::scheduler::Phase::Candidate
+                | melissa_workflow::scheduler::Phase::Leased
+        ) {
+            if let Some(node) = plan.nodes.iter_mut().find(|n| n.id == previous.id) {
+                node.literal_input["instructions"] = previous.literal_input["instructions"].clone();
+            }
+        }
+    }
+}
+
 fn preserve_started(
     old: &melissa_workflow::scheduler::State,
     plan: &melissa_workflow::plan::Plan,
@@ -341,6 +359,67 @@ fn preserve_started(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod replan_tests {
+    use super::*;
+    use melissa_workflow::{
+        plan::Plan,
+        scheduler::{Phase, State},
+    };
+
+    #[test]
+    fn legacy_started_instructions_are_frozen_without_hiding_node_changes() {
+        let node = json!({"id":"step-0","profile":"implementer","goal":"original",
+            "after":[],"bindings":[],"literal_input":{"instructions":"legacy"},
+            "tools":["fs.read"],"effects":["workspace.read"],"resources":["source"],
+            "authorizations":[],"claims":[],"output_schema":{},"skills":[]});
+        let mut pending = node.clone();
+        pending["id"] = json!("step-1");
+        let plan: Plan =
+            serde_json::from_value(json!({"schema_version":"melissa.workflow-plan/v1",
+            "id":"cli-workflow-v1","task":"task","revision":1,"parent_digest":null,
+            "workspace_digest":"source","policy_digest":"policy","mode":"conditional_delegation",
+            "delegation_reason":"test","max_parallel":1,"max_no_progress":8,
+            "nodes":[node,pending],"outputs":["step-1"]}))
+            .unwrap();
+        for phase in [Phase::Leased, Phase::Candidate] {
+            let old: State = serde_json::from_value(json!({"schema_version":"fixture","sequence":0,
+                "previous_digest":null,"plan":plan,"slots":{
+                    "step-0":{"phase":phase,"generation":0,"lease":null,"output":null,"native_run_ref":null},
+                    "step-1":{"phase":"pending","generation":0,"lease":null,"output":null,"native_run_ref":null}},
+                "cancel_requested":false,"cancellation_settled":false,"no_progress":0,
+                "last_clock_ms":0,"started_at_ms":0,"deadline_ms":1000,"reason":"fixture"})).unwrap();
+            let mut revised = plan.clone();
+            for node in &mut revised.nodes {
+                node.literal_input["instructions"] = json!("new compiler guidance");
+            }
+            revised.nodes[1].goal = "revised pending work".into();
+            keep_started_instructions(&old, &mut revised);
+            preserve_started(&old, &revised).unwrap();
+            assert_eq!(revised.nodes[0], old.plan.nodes[0]);
+            assert_eq!(
+                revised.nodes[1].literal_input["instructions"],
+                "new compiler guidance"
+            );
+            for field in ["goal", "profile", "tools", "effects", "claims"] {
+                let mut changed = serde_json::to_value(&revised).unwrap();
+                changed["nodes"][0][field] = match field {
+                    "goal" | "profile" => json!("changed"),
+                    "tools" | "effects" => json!(["changed"]),
+                    "claims" => json!([{"resource":"source","path":"/","access":"write"}]),
+                    _ => continue,
+                };
+                let mut changed: Plan = serde_json::from_value(changed).unwrap();
+                keep_started_instructions(&old, &mut changed);
+                assert!(preserve_started(&old, &changed).is_err(), "{field}");
+            }
+            revised.nodes.remove(0);
+            keep_started_instructions(&old, &mut revised);
+            assert!(preserve_started(&old, &revised).is_err());
+        }
+    }
 }
 fn next_revision_sequence(store: &melissa_local_store::LocalStore, task: &str) -> Result<u64> {
     let mut n = 0;
