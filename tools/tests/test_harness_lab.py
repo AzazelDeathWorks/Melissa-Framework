@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 from pathlib import Path
 import subprocess
 import sys
@@ -40,6 +41,12 @@ class HarnessLabTests(unittest.TestCase):
         path = self.root / "plan.json"
         LAB.write(path, self.plan)
         return LAB.freeze(path)
+
+    def test_streamed_hash_is_compatible_with_python310_and_multiple_blocks(self):
+        path = self.root / "hash-fixture"
+        for value in (b"", b"fixture" * 400000):
+            path.write_bytes(value)
+            self.assertEqual(LAB.file_hash(path), hashlib.sha256(value).hexdigest())
 
     def test_cap_rejects_before_environment_or_task_work(self):
         frozen = self.freeze()

@@ -330,6 +330,16 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
                 await self.agent.run("", None, self.context)
         self.assertEqual(self.result()["status"], "BridgeError")
 
+    async def test_observer_delay_does_not_launch_after_the_deadline(self):
+        self.agent.wall_time_sec = 0.05
+        async def delay(_):
+            await asyncio.sleep(.1)
+        with patch.object(self.module.ResourceRecorder, "prepare", side_effect=delay), patch.object(self.module.asyncio, "create_subprocess_exec") as spawn:
+            await self.agent.run("", None, self.context)
+        spawn.assert_not_called()
+        self.assertEqual(self.result()["status"], "Deadline")
+        self.assertFalse(self.result()["telemetry_complete"])
+
     async def test_deadline_plugin_matches_harbor_override_cap_and_multiplier(self):
         config = SimpleNamespace(
             agent=SimpleNamespace(name="melissa_agent:MelissaAgent", import_path=None,

@@ -6,6 +6,68 @@ yüklemesi ayrı sonuçlardır. Canlı AI ve temiz Windows kabulü ayrıca gerek
 
 ## Hatanın kaynağı
 
+### Konuşma arayüzü ve ortak bağlam bütçesi
+
+`Ctrl+P` komut paletini açar; salt okunur görünümler taslağı koruyarak açılır.
+Diğer komutlar yalnız iş yokken boş taslağa eklenir ve ayrıca Enter gerektirir.
+Taslak varken veya iş sürerken palet yalnız dört salt okunur görünümü sunar;
+diğer komutlar için önce taslağı `Ctrl+Q` ile sıraya alabilirsin.
+`/` ile komut açıklamaları, Tab ile tamamlama, `/help`
+ile bütün kısayollar görünür. Plan, uygulama ve izin incelemesi aynı host
+sınırlarından geçer. Salt okunur `/status` API çağırmaz veya iş başlatmaz.
+Dar terminalde ayrıntılar `/status` ekranındadır. Değişmeyen ekran yeniden
+çizilmez; boyut, imleç/seçim, taslak, araç, arama veya bağlam değişirse çizilir.
+Boşta giriş yoklaması 100 ms, aktif işte 20 ms'dir; tuş gelince hemen uyanır.
+
+Sohbet ve Gateway aynı `TokenBudget` hesabını kullanır. Çıktı rezervi önce
+kapasiteden ayrılır, asla sessizce düşürülmez. Güvenilir, native istek/model/uç
+nokta eşleşmeli sayaç varsa gerçek sayım kullanılabilir. Yoksa native JSON
+baytlarına 1024 çerçeve birimi ve mesaj başına 64 birim eklenir; **bu ölçülmüş
+token değildir**. CLI üst-sınır göstergesi bu temkinli girdi bütçesinin oranıdır,
+sağlayıcının gerçek doluluk yüzdesi değildir. Sağlayıcının son yanıt sayımı ve
+yerel JSON tokenizer gözlemi ayrı kalır; sonraki isteğe kesin tahmin sayılmaz.
+Görseller/opaque continuation için desteklenmeyen native sayım bilinmiyor kalır.
+Bu host politikası sunucunun gizli chat şablonunu/ek bağlamını doğrulamaz;
+model kapasitesi ve protokol ayarları operatörün doğru yapılandırmasına bağlıdır.
+
+Sohbetin mevcut otomatik özetlemesi girdi bütçesinin yüzde 80 eşiğini kullanır;
+özet de kendi tam bütçe denetiminden geçer. Sığmayan istek kesilip gönderilmez;
+özgün kayıt korunur, daha küçük ek veya `/compact` istenir. Gateway mevcut
+güvenli araç çıktısı arşivlemesini aynı bütçeye karşı dener. Opsiyonel tokenizer
+ölçüm hatası konuşmayı durdurmaz; host kapasite/harcama korumaları sürer.
+
+### Gerçek komut ve container worker profili
+
+```sh
+# Açıkça seçilen bir komutu ölçer; komutun kendi izin/ücret politikasını değiştirmez.
+python3 tools/profile_task.py --timeout 60 --container EXISTING_CONTAINER -- YOUR_COMMAND
+# Ücretsiz, ağsız, root olmayan CPU/RAM fixture; yalnız zaten yerel olan Linux imajı.
+python3 tools/worker_profile_smoke.py --image LOCAL_IMAGE --repetitions 3 > worker-profile.json
+```
+
+İlk araç Linux/macOS `wait4` CPU'sunu (beklenmiş alt süreçler dahil), süreç ömrü
+RSS tepesini ve Linux'ta yalnız kök sürecin örneklenmiş RSS alt sınırını ayırır.
+Duvar süresi başlatma ve örnekleme çözünürlüğünü içerir. Komut argümanları,
+ortam değerleri ve çıktı içerikleri rapora alınmaz. Başarısız/timeout komutları
+exit code ve duruş nedeni ile korunur. Timeout yalnız host süreç grubunu öldürür;
+container içindeki işi durdurduğunu kanıtlamaz. Mevcut container durdurulmaz;
+worker iptali sahibi olan harness'in sorumluluğudur.
+
+Linux'ta seçilen container'ın hostta görülebilen cgroup-v2 CPU ve block-I/O sayaç
+farkları ölçülür. RAM örnek tepesinin kaçırılmış zirveleri olabilir; kernel
+`memory.peak` ise tüm cgroup ömrüdür, sıfırlanmaz. Bunlar CLI belleği veya fiziksel
+disk I/O değildir. Desteklenmeyen, sıfırlanan veya değişen kimlikteki sayaç `null`
+kalır. I/O cihazlar üzerinde toplanır; stacked cihazlar çift sayabilir, pencere
+sonrasında diske aktarılan kirli sayfalar bu pencerenin sayımına girmez.
+Uzak Docker, Docker Desktop VM'si ve Windows'ta bu Linux sayaçlarının
+hosttan erişilememesi sıfır kullanım anlamına gelmez.
+
+Smoke sürücüsü statik derleme destekli `cc` ister; özel home-altı geçici alanda
+public bir C fixture üretir. Her tekrarda yeni, ağsız, salt-okunur, capability'siz
+container kullanır (1 CPU, 128 MiB, 64 PID, UID 65534). İmaj çekmez, model çağırmaz;
+yalnız kendi rastgele ad/etiket kimliği doğrulanan container'larını temizler.
+Bu sentetik yük harness/model başarısı veya rakiplere üstünlük kanıtı değildir.
+
 ### CLI sürecinin gerçek kaynakları
 
 ```text
