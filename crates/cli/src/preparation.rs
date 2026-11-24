@@ -389,7 +389,9 @@ mod replan_tests {
         use melissa_local_store::{LocalStore, StoreKey};
         use melissa_workflow::scheduler::{Freshness, Scheduler};
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
+        let root = temp.path().to_path_buf();
+        #[cfg(not(windows))]
+        let root = root.canonicalize().unwrap();
         let mut task: TaskContractV1 = serde_json::from_slice(include_bytes!(
             "../../../tests/fixtures/code01/wire/task-contract-v1.json"
         ))
