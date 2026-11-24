@@ -12,6 +12,7 @@ pub mod local_tokenizer;
 pub mod observations;
 pub mod openai;
 pub mod output_capabilities;
+pub mod progress;
 pub mod recovery;
 pub mod routing;
 pub mod schema;

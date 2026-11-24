@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core-contracts", "crates/local-store", "crates/windows-executor", "crates/execution-broker", "crates/container-executor", "crates/model-gateway", "crates/repository", "crates/build-test", "crates/skill-context", "crates/workflow", "crates/recovery", "crates/web-development", "crates/code-quality", "crates/cli", "crates/verification"]
+members = ["crates/core-contracts", "crates/local-store", "crates/windows-executor", "crates/execution-broker", "crates/container-executor", "crates/model-gateway", "crates/repository", "crates/build-test", "crates/skill-context", "crates/workflow", "crates/recovery", "crates/web-development", "crates/code-quality", "crates/cli", "crates/verification", "crates/bench-agent"]
 
 [workspace.package]
 edition = "2024"

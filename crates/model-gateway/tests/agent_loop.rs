@@ -355,6 +355,174 @@ fn tool_receipts(
         .collect()
 }
 
+struct CaptureProgress(Arc<Mutex<Vec<melissa_model_gateway::progress::RunProgress>>>);
+impl melissa_model_gateway::progress::ProgressObserver for CaptureProgress {
+    fn observe(&mut self, progress: &melissa_model_gateway::progress::RunProgress) {
+        self.0.lock().unwrap().push(progress.clone());
+    }
+}
+
+#[tokio::test]
+async fn live_time_guidance_is_bounded_and_progress_separates_pending_from_reported_usage() {
+    use melissa_model_gateway::progress::ProgressPhase;
+    let dir = tempfile::tempdir().unwrap();
+    let http = http_fixture(vec![
+        HttpPlan::sse(tool_response(&[(
+            "progress-call",
+            "process_exec",
+            r#"{"value":"secret-tool-argument"}"#,
+        )])),
+        HttpPlan::sse(text_response("secret-final-answer", false, true)),
+    ])
+    .await;
+    let captured = Arc::new(Mutex::new(vec![]));
+    let mut gateway = gateway(store(&dir.path().join("store"), 10_000), &http, policy())
+        .with_time_awareness()
+        .with_progress_observer(Box::new(CaptureProgress(captured.clone())));
+    let result = gateway
+        .run(
+            &spec("progress"),
+            &mut FakeTools::default(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.status, RunStatus::FinalCandidate);
+    let bodies = http.bodies.lock().unwrap();
+    let remaining = bodies
+        .iter()
+        .map(|b| {
+            assert!(
+                !b["instructions"]
+                    .as_str()
+                    .unwrap()
+                    .contains("HOST TIME BUDGET:")
+            );
+            assert_eq!(b.to_string().matches("HOST TIME BUDGET:").count(), 1);
+            let notice = b["input"].as_array().unwrap().last().unwrap()["content"][0]["text"]
+                .as_str()
+                .unwrap();
+            notice
+                .split("HOST TIME BUDGET: ")
+                .nth(1)
+                .unwrap()
+                .split(' ')
+                .next()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(remaining.len(), 2);
+    assert_eq!(bodies[0]["instructions"], bodies[1]["instructions"]);
+    let first = bodies[0]["input"].as_array().unwrap();
+    let second = bodies[1]["input"].as_array().unwrap();
+    assert_eq!(first[..first.len() - 1], second[..first.len() - 1]);
+    assert!(remaining[1] <= remaining[0] && remaining[0] <= policy().max_wall_time_ms);
+    let events = captured.lock().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|p| p.phase == ProgressPhase::RequestDispatched
+                && p.pending_requests == 1
+                && p.unreported_usage_requests == 1)
+    );
+    assert!(
+        events
+            .iter()
+            .any(|p| p.phase == ProgressPhase::ToolDispatched && p.tool_in_flight)
+    );
+    let final_event = events.last().unwrap();
+    assert_eq!(final_event.phase, ProgressPhase::Finished);
+    assert_eq!(final_event.tool_calls, 1);
+    assert_eq!(final_event.requests, 2);
+    assert_eq!(final_event.reported_input_tokens, 24);
+    assert_eq!(final_event.reported_output_tokens, 8);
+    assert_eq!(final_event.cached_input_tokens, 6);
+    assert_eq!(final_event.pending_requests, 0);
+    assert_eq!(final_event.unreported_usage_requests, 0);
+    let serialized = serde_json::to_string(&*events).unwrap();
+    assert!(!serialized.contains("secret-tool-argument"));
+    assert!(!serialized.contains("secret-final-answer"));
+}
+
+#[tokio::test]
+async fn progress_survives_a_sent_request_timeout_without_reporting_reserved_tokens_as_usage() {
+    use melissa_model_gateway::progress::ProgressPhase;
+    let dir = tempfile::tempdir().unwrap();
+    let http = http_fixture(vec![HttpPlan {
+        status: 200,
+        body: text_response("too late", false, true),
+        delay: Duration::from_secs(10),
+    }])
+    .await;
+    let mut limits = policy();
+    limits.max_wall_time_ms = 1000;
+    let captured = Arc::new(Mutex::new(vec![]));
+    let mut gateway = gateway(store(&dir.path().join("store"), 10_000), &http, limits)
+        .with_transient_retries()
+        .with_progress_observer(Box::new(CaptureProgress(captured.clone())));
+    let result = gateway
+        .run(
+            &spec("progress-timeout"),
+            &mut FakeTools::default(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(http.requests.load(Ordering::SeqCst), 1);
+    assert!(result.requires_reconciliation);
+    let events = captured.lock().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|p| p.phase == ProgressPhase::RequestDispatched && p.pending_requests == 1)
+    );
+    let last = events.last().unwrap();
+    assert_eq!(last.phase, ProgressPhase::Finished);
+    assert_eq!(last.unknown_requests, 1);
+    assert_eq!(last.unreported_usage_requests, 1);
+    assert_eq!(last.reported_input_tokens, 0);
+    assert!(last.requires_reconciliation);
+}
+
+#[tokio::test]
+async fn a_slow_progress_sink_cannot_start_a_tool_after_the_deadline() {
+    struct SlowProgress(Arc<AtomicBool>);
+    impl melissa_model_gateway::progress::ProgressObserver for SlowProgress {
+        fn observe(&mut self, progress: &melissa_model_gateway::progress::RunProgress) {
+            if progress.phase == melissa_model_gateway::progress::ProgressPhase::ToolDispatched {
+                self.0.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(1200));
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let http = http_fixture(vec![HttpPlan::sse(tool_response(&[(
+        "slow-observer",
+        "process_exec",
+        r#"{"value":"x"}"#,
+    )]))])
+    .await;
+    let mut limits = policy();
+    limits.max_wall_time_ms = 1000;
+    let observed = Arc::new(AtomicBool::new(false));
+    let mut gateway = gateway(store(&dir.path().join("store"), 10_000), &http, limits)
+        .with_progress_observer(Box::new(SlowProgress(observed.clone())));
+    let mut tools = FakeTools::default();
+    let result = gateway
+        .run(
+            &spec("slow-progress"),
+            &mut tools,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+    assert!(observed.load(Ordering::SeqCst));
+    assert_eq!(result.status, RunStatus::Deadline);
+    assert_eq!(tools.executed.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 async fn adapter_receipts_bind_actual_dispatch_and_keep_arguments_out_of_receipts() {
     use melissa_model_gateway::adapter::Status;
@@ -515,6 +683,44 @@ async fn opted_in_transient_retry_only_retries_proven_not_sent_and_keeps_zero_us
             .unwrap()
             .iter()
             .all(|record| record.state == ModelRequestState::Failed)
+    );
+}
+
+#[tokio::test]
+async fn opted_in_retry_treats_http_429_as_known_zero_usage_rejection() {
+    let dir = tempfile::tempdir().unwrap();
+    let http = http_fixture(vec![
+        HttpPlan {
+            status: 429,
+            body: b"{}".to_vec(),
+            delay: Duration::ZERO,
+        },
+        HttpPlan::sse(text_response("done", false, true)),
+    ])
+    .await;
+    let mut policy = policy();
+    policy.max_backoff_ms = 100;
+    let mut g = gateway(store(&dir.path().join("store"), 10_000), &http, policy)
+        .with_transient_retries()
+        .with_rate_limit_retries();
+    let r = g
+        .run(
+            &spec("ratelimited"),
+            &mut FakeTools::default(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status, RunStatus::FinalCandidate);
+    assert_eq!(http.requests.load(Ordering::SeqCst), 2);
+    assert!(!r.requires_reconciliation);
+    assert_eq!(
+        g.store()
+            .journal()
+            .model_budget(TASK)
+            .unwrap()
+            .unknown_requests,
+        0
     );
 }
 
@@ -1096,6 +1302,111 @@ async fn refusal_and_provider_output_limits_do_not_execute_or_fake_a_final_resul
         assert_eq!(tools.executed.load(Ordering::SeqCst), 0);
         assert!(!r.task_accepted);
     }
+}
+
+#[tokio::test]
+async fn opted_in_output_limit_retry_discards_the_cut_reply_and_asks_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let limited = || {
+        wire(vec![
+            created(),
+            json!({"type":"response.incomplete","response":{"id":"resp_fixture","model":"fixture-snapshot","status":"incomplete","output":[],"usage":{"input_tokens":12,"output_tokens":4,"total_tokens":16},"error":null,"incomplete_details":{"reason":"max_output_tokens"}}}),
+        ])
+    };
+    let http = http_fixture(vec![
+        HttpPlan::sse(limited()),
+        HttpPlan::sse(text_response("done", false, true)),
+    ])
+    .await;
+    let mut g = gateway(store(&dir.path().join("store"), 10_000), &http, policy())
+        .with_output_limit_retries(1);
+    let mut tools = FakeTools::default();
+    let r = g
+        .run(
+            &spec("limitretry"),
+            &mut tools,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status, RunStatus::FinalCandidate);
+    assert_eq!(r.answer.as_deref(), Some("done"));
+    assert_eq!(tools.executed.load(Ordering::SeqCst), 0);
+    assert_eq!(http.requests.load(Ordering::SeqCst), 2);
+    let second = http.bodies.lock().unwrap()[1].to_string();
+    assert!(second.contains("output token limit"));
+    assert!(!r.task_accepted);
+
+    let dir = tempfile::tempdir().unwrap();
+    let http = http_fixture(vec![HttpPlan::sse(limited()), HttpPlan::sse(limited())]).await;
+    let mut g = gateway(store(&dir.path().join("store"), 10_000), &http, policy())
+        .with_output_limit_retries(1);
+    let r = g
+        .run(
+            &spec("limitretry2"),
+            &mut tools,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status, RunStatus::InvalidOutput);
+    assert_eq!(http.requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn output_limit_retry_honors_a_safe_pause_before_another_paid_request() {
+    use melissa_model_gateway::continuation::{ContinuationStore, Phase, TurnCheckpoint};
+    struct PauseRetry;
+    impl ContinuationStore for PauseRetry {
+        fn begin(
+            &mut self,
+            _: &mut LocalStore,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> melissa_model_gateway::Result<Option<TurnCheckpoint>> {
+            Ok(None)
+        }
+        fn publish(
+            &mut self,
+            _: &mut LocalStore,
+            state: &TurnCheckpoint,
+        ) -> melissa_model_gateway::Result<()> {
+            if state.phase == Phase::Safe && state.next_turn == 1 {
+                assert_eq!(state.result.request_ids.len(), 1);
+                assert!(state.messages.last().is_some_and(|m| matches!(m, melissa_model_gateway::Message::User {text} if text.contains("output token limit"))));
+                return Err(GatewayError::new(
+                    ErrorKind::Cancelled,
+                    "fixture safe pause",
+                ));
+            }
+            Ok(())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let limited = wire(vec![
+        created(),
+        json!({"type":"response.incomplete","response":{"id":"resp_fixture","model":"fixture-snapshot","status":"incomplete","output":[],"usage":{"input_tokens":12,"output_tokens":4,"total_tokens":16},"error":null,"incomplete_details":{"reason":"max_output_tokens"}}}),
+    ]);
+    let http = http_fixture(vec![
+        HttpPlan::sse(limited),
+        HttpPlan::sse(text_response("not requested", false, true)),
+    ])
+    .await;
+    let mut g = gateway(store(&dir.path().join("store"), 10_000), &http, policy())
+        .with_output_limit_retries(1)
+        .with_continuation(Box::new(PauseRetry));
+    let mut tools = FakeTools::default();
+    let result = g
+        .run(
+            &spec("pause-limit-retry"),
+            &mut tools,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+    assert_eq!(result.unwrap_err().kind, ErrorKind::Cancelled);
+    assert_eq!(http.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(tools.executed.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

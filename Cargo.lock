@@ -1348,6 +1348,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc04a4c58212d57930a24bf47d3fa87485264a3a054e9c10e042eb373573ad3c"
 
 [[package]]
+name = "melissa-bench-agent"
+version = "0.1.0"
+dependencies = [
+ "melissa-core-contracts",
+ "melissa-execution-broker",
+ "melissa-local-store",
+ "melissa-model-gateway",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "melissa-build-test"
 version = "0.1.0"
 dependencies = [
