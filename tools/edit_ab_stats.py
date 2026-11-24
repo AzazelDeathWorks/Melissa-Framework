@@ -34,7 +34,7 @@ def mcnemar_exact(b, c):
 
 def bootstrap_mean_ci(diffs, iters, seed):
     if not diffs:
-        return (math.nan, math.nan)
+        return (None, None)
     rng = random.Random(seed)
     means = sorted(
         statistics.fmean(rng.choices(diffs, k=len(diffs))) for _ in range(iters)
@@ -91,19 +91,21 @@ def main():
         "pairs": len(full),
         "treatment_only_success": b,
         "baseline_only_success": c,
-        "mcnemar_exact_p": round(mcnemar_exact(b, c), 4),
+        "mcnemar_exact_p": round(mcnemar_exact(b, c), 4) if full else None,
     }
     for metric in ("tokens", "requests", "elapsed_ms"):
         diffs = [p[a.treatment][metric] - p[a.baseline][metric] for p in full]
         lo, hi = bootstrap_mean_ci(diffs, a.iters, a.seed)
-        base = statistics.fmean(p[a.baseline][metric] for p in full) if full else math.nan
+        base = statistics.fmean(p[a.baseline][metric] for p in full) if full else None
         paired[f"{metric}_mean_diff"] = round(statistics.fmean(diffs), 2) if diffs else None
-        paired[f"{metric}_mean_diff_ci95"] = [round(lo, 2), round(hi, 2)]
+        paired[f"{metric}_mean_diff_ci95"] = [
+            round(bound, 2) if bound is not None else None for bound in (lo, hi)
+        ]
         paired[f"{metric}_relative_change"] = (
             round(statistics.fmean(diffs) / base, 4) if diffs and base else None
         )
     out["paired"] = {"baseline": a.baseline, "treatment": a.treatment, **paired}
-    print(json.dumps(out, indent=2, ensure_ascii=False))
+    print(json.dumps(out, indent=2, ensure_ascii=False, allow_nan=False))
 
 
 if __name__ == "__main__":
