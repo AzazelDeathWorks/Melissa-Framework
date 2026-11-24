@@ -19,6 +19,11 @@ pub async fn run(options: &args::Options) -> Result<Value> {
     if matches!(options.command, Command::Doctor) {
         return crate::views::doctor();
     }
+    if matches!(options.command, Command::Resources) {
+        return Ok(
+            json!({"command":"resources","scope":crate::process_measurement::SCOPE,"sample":crate::process_measurement::sample()}),
+        );
+    }
     if matches!(options.command, Command::Profiles) {
         return Ok(
             json!({"command":"profiles","profiles":crate::app::profiles()?.profiles,"definition_only":true}),

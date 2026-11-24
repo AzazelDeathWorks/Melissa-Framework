@@ -8,6 +8,33 @@ fn parse(a: &[&str]) -> melissa_cli::Result<args::Options> {
     args::parse(a.iter().map(std::ffi::OsString::from))
 }
 
+#[tokio::test]
+async fn resources_requires_no_home_configuration_or_secret() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("not-created");
+    let options = args::parse([
+        std::ffi::OsString::from("--home"),
+        home.clone().into_os_string(),
+        "--json".into(),
+        "resources".into(),
+    ])
+    .unwrap();
+    assert!(matches!(options.command, Command::Resources));
+    let report = melissa_cli::dispatch::run(&options).await.unwrap();
+    assert!(!home.exists());
+    assert_eq!(report["command"], "resources");
+    assert!(
+        report["scope"]
+            .as_str()
+            .unwrap()
+            .contains("workers not included")
+    );
+    assert!(report["sample"]["cpu_time_us"].is_u64());
+    assert!(report["sample"]["working_set_bytes"].as_u64().unwrap() > 0);
+    assert!(display::human(&report).unwrap().contains("cpu_time_us"));
+    assert!(parse(&["resources", "unexpected"]).is_err());
+}
+
 #[test]
 fn settings_entry_opens_the_dialog_and_keeps_explicit_automation_commands() {
     for command in ["config", "settings"] {

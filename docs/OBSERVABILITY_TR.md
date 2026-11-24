@@ -6,6 +6,63 @@ yüklemesi ayrı sonuçlardır. Canlı AI ve temiz Windows kabulü ayrıca gerek
 
 ## Hatanın kaynağı
 
+### CLI sürecinin gerçek kaynakları
+
+```text
+melissa --json resources
+```
+
+Bu salt okunur komut home/sağlayıcı ayarı veya API anahtarı olmadan çalışır.
+Windows, Linux ve macOS'ta geçerli CLI sürecinin RSS, süreç ömrü tepe RSS ve
+kümülatif user+system CPU süresini (`cpu_time_us`) örnekler. Görev metriklerinde
+başlangıç/son örnek farkı `cpu_time_delta_us` olarak saklanır. Eksik/eski sayaç
+`null` kalır; bilinmeyen kullanım sıfır sayılmaz. Paralel CPU süresi duvar
+süresini aşabilir; CPU yüzdesi hesaplanmaz. Tepe bellek görev öncesi kurulumu da
+içerebilir; Unix'te exec öncesi başlatıcının belleğini de kapsayabilir.
+Linux'ta `/proc/self/status` `VmHWM`, Windows'ta yeni sürecin peak working set
+değeri ayrıca `post_exec_peak_working_set_bytes` olarak verilir; macOS'ta bu
+ayrı sayaç henüz yoktur (`null`). Worker/alt süreçler bu ölçüme dahil değildir.
+
+Windows aktarım sayaçları ve Linux `/proc/self/io` içindeki `rchar`/`wchar`
+fiziksel disk I/O ölçümü değildir. macOS'ta aktarım sayaçları henüz yoktur ve
+`null` döner. Bu gözlemler görev/worker kaynak sınırlarını değiştirmez.
+
+Linux/macOS'ta API veya Docker çalıştırmadan tekrarlanabilir başlangıç profili:
+
+```sh
+cargo build --locked --release -p melissa-cli
+python3 tools/profile_cli.py --binary target/release/melissa --repetitions 10 > profile.json
+```
+
+Python 3.10+ gerekir. Her tekrar yeni süreç ve ayrı geçici home kullanır;
+`version`, `resources`, `init` ve `profiles` ölçülür. Çocuk süreç başına
+`wait4` CPU/RSS, duvar süresi ve süreç çıktıktan sonraki CLI veri klasörünün
+mantıksal/tahsisli boyutu raporlanır. Binary SHA-256 ve boyutu ayrıca kaydedilir.
+CPU Python sürücüsünü içermez; süreç ömrü tepe RSS exec öncesi başlatıcı
+belleğini içerebilir. `resources` vakası CLI'nin kendi RSS ve desteklendiğinde
+exec sonrası tepe RSS örneğini ayrı kaydeder. Duvar süresi başlatma/ölçüm yükünü ve 1 ms
+çıkış yoklama çözünürlüğünü içerir. Dosya sistemi önbelleği temizlenmez. Disk
+anlık boyutu I/O veya tepe kullanım değildir; binary/build bağımlılıkları ve
+Docker imajları CLI veri klasörü toplamına dahil değildir. Bu bir interaktif
+oturum, model görevi veya rakip karşılaştırması değildir.
+
+Etkileşimli terminalde `/status` model, plan/çalışma durumu, son kayıtlı isteğin
+bağlam gözlemlerini ve aynı CLI sürecinin kaynaklarını gösterir. Etkin iş
+sırasında önceki konuşma ölçümleri güncel token/maliyet sayımı diye sunulmaz.
+Ekran model çağırmaz, talimat kuyruğuna girmez ve yetki oluşturmaz.
+
+Bağlam kapasitesi/çıktı rezervi token, native JSON boyutu bayt cinsindendir.
+Opsiyonel hash-sabitlenmiş tokenizer yalnız JSON metnini sayar; sağlayıcı chat
+şablonu/görsel genişlemesi olmadığı için gerçek girdi tokeni veya kapasite/maliyet
+yetkisi sayılmaz. Sağlayıcının son yanıtla bildirdiği girdi sayımı ayrı tutulur;
+sonraki isteğin tahmini değildir.
+Sohbette opsiyonel tokenizer kayıp/değişmişse veya ölçemiyorsa bu gözlem
+bilinmiyor kalır; sohbeti engellemez ve temkinli sınırlar korunur. Bu tolerans
+yalnız sohbet gözlemine aittir; görev/Gateway onay ve doğrulama yolu değişmez.
+Yeni ölçümler mevcut temkinli sınır ve
+kompaksiyon kurallarını gevşetmez. Sağlayıcı/model/endpoint değiştiğinde eski
+bağlam gözlemi temizlenir; özgün konuşma kaydı korunur.
+
 ```text
 melissa --json observe diagnose TASK
 melissa --json task metrics TASK

@@ -70,6 +70,8 @@ pub(crate) struct Conversation {
     pub summary: String,
     #[serde(default)]
     pub summary_through: usize,
+    #[serde(default)]
+    pub last_context: Option<super::status::ContextSnapshot>,
 }
 impl Conversation {
     pub fn new(workspace: &Path, settings: &Settings) -> Result<Self> {
@@ -101,6 +103,7 @@ impl Conversation {
             workspace_request: None,
             summary: String::new(),
             summary_through: 0,
+            last_context: None,
         })
     }
     pub fn workspace(&self) -> Result<&Path> {
@@ -124,6 +127,7 @@ impl Conversation {
             self.provider_id = settings.provider_id.clone();
             self.endpoint = settings.endpoint.clone();
             self.proposal = None;
+            self.last_context = None;
         }
         Ok(())
     }
@@ -624,6 +628,14 @@ pub(crate) async fn turn(
     c.save_locked(app)?;
     let endpoint = settings.endpoint_with_key(settings.key()?)?;
     let transport = HttpTransport::new(false).map_err(|e| Error::Model(e.kind))?;
+    let tokenizer = settings.local_tokenizer.as_ref().map(|config| {
+        melissa_model_gateway::local_tokenizer::LocalWireTokenizer::load(
+            config,
+            &settings.endpoint,
+            settings.protocol,
+            &settings.model,
+        )
+    });
     let mut summarizing = compact_requested;
     let summary_end = if compact_requested {
         c.messages.len()
@@ -674,7 +686,28 @@ pub(crate) async fn turn(
         let wire = transport
             .request_body(&endpoint, &request)
             .map_err(|e| Error::Model(e.kind))?;
-        let wire_bytes = bytes(&wire)?.len() as u64;
+        let (wire_bytes, wire_digest) = {
+            let encoded = bytes(&wire)?;
+            (encoded.len() as u64, crate::digest(&encoded))
+        };
+        let (wire_tokens, wire_tokenizer_status) = match &tokenizer {
+            None => (None, "yapılandırılmadı"),
+            Some(Err(_)) => (None, "tokenizer yüklenemedi; ölçülmedi"),
+            Some(Ok(t)) => match t.measure(&endpoint, &settings.model, &wire) {
+                Ok(Some(tokens)) => (Some(tokens), "JSON metni; sağlayıcı girdisi değil"),
+                Ok(None) => (None, "istek boyutu/bağlantısı için kullanılamıyor"),
+                Err(_) => (None, "tokenizer ölçümü başarısız; ölçülmedi"),
+            },
+        };
+        let context = super::status::ContextSnapshot {
+            native_body_bytes: wire_bytes,
+            capacity_tokens: settings.context_tokens,
+            reserved_output_tokens: settings.max_output_tokens,
+            provider_input_tokens: None,
+            wire_tokenizer_status: wire_tokenizer_status.into(),
+            wire_tokens,
+            summarizing,
+        };
         if !summarizing
             && summary_end > c.summary_through
             && wire_bytes
@@ -713,8 +746,9 @@ pub(crate) async fn turn(
             app,
             &c,
             &format!("{request_id}-request"),
-            &json!({"request":request,"source_digest":repository.as_ref().map(|(_, s)| &s.digest),"wire_digest":crate::digest(&bytes(&wire)?),"status":"pending"}),
+            &json!({"request":request,"context":context,"source_digest":repository.as_ref().map(|(_, s)| &s.digest),"wire_digest":wire_digest,"status":"pending"}),
         )?;
+        c.last_context = Some(context);
         c.pending = Some(request_id.clone());
         c.save_locked(app)?;
         let outcome = transport
@@ -750,6 +784,9 @@ pub(crate) async fn turn(
             ));
         };
         c.pending = None;
+        if let Some(context) = &mut c.last_context {
+            context.provider_input_tokens = response.usage.input_tokens;
+        }
         c.input_tokens = c
             .input_tokens
             .saturating_add(response.usage.input_tokens.unwrap_or(0));
@@ -888,9 +925,19 @@ pub(crate) async fn turn(
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    fn canonical_tempdir() -> tempfile::TempDir {
+        #[cfg(unix)]
+        {
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap()
+        }
+        #[cfg(not(unix))]
+        {
+            tempfile::tempdir().unwrap()
+        }
+    }
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires explicit private settings and paid API authorization; never run in normal CI"]
@@ -1084,7 +1131,7 @@ mod tests {
     async fn ordinary_chat_does_not_require_or_enumerate_a_workspace() {
         let (endpoint, server) =
             fixture(vec![response(json!({"content":"Merhaba!"}), "stop")]).await;
-        let root = tempfile::tempdir().unwrap();
+        let root = canonical_tempdir();
         let (app, _, settings) = fixture_app(root.path(), &endpoint);
         let mut c = Conversation::new_in(None, &settings).unwrap();
         c.save(&app).unwrap();
@@ -1105,6 +1152,135 @@ mod tests {
         assert!(!wire.contains("list_files"));
         assert!(wire.contains("request_workspace"));
         assert_eq!(load(&app, &c.id).unwrap().messages, c.messages);
+        let observed = load(&app, &c.id).unwrap().last_context.unwrap();
+        assert_eq!(
+            observed.native_body_bytes,
+            serde_json::to_vec(&requests[0]).unwrap().len() as u64
+        );
+        assert_eq!(observed.provider_input_tokens, Some(100));
+        assert!(observed.wire_tokens.is_none());
+    }
+    #[tokio::test]
+    async fn unavailable_optional_wire_measurements_do_not_block_chat() {
+        for case in ["missing", "changed", "encoding_error"] {
+            let (endpoint, server) = fixture(vec![response(json!({"content":"ok"}), "stop")]).await;
+            let root = canonical_tempdir();
+            let (app, _, mut settings) = fixture_app(root.path(), &endpoint);
+            let mut artifact: Value = serde_json::from_slice(include_bytes!(
+                "../../../model-gateway/tests/fixtures/local-tokenizer.json"
+            ))
+            .unwrap();
+            if case == "encoding_error" {
+                artifact["model"]["unk_token"] = json!("[MISSING]");
+            }
+            let artifact = serde_json::to_vec(&artifact).unwrap();
+            let path = root.path().join("tokenizer.json");
+            fs::write(&path, &artifact).unwrap();
+            settings.local_tokenizer = Some(
+                melissa_model_gateway::local_tokenizer::LocalTokenizerConfig {
+                    path: path.clone(),
+                    blake3: blake3::hash(&artifact).to_hex().to_string(),
+                },
+            );
+            app.save_settings(&settings).unwrap();
+            match case {
+                "missing" => fs::remove_file(&path).unwrap(),
+                "changed" => fs::write(&path, b"{}").unwrap(),
+                _ => (),
+            }
+            let c = turn(
+                &app,
+                Conversation::new_in(None, &settings).unwrap(),
+                "Merhaba",
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(|_| {}),
+            )
+            .await
+            .unwrap();
+            assert!(c.pending.is_none());
+            let context = load(&app, &c.id).unwrap().last_context.unwrap();
+            assert!(context.wire_tokens.is_none(), "{case}");
+            assert_eq!(context.provider_input_tokens, Some(100));
+            assert!(
+                context.wire_tokenizer_status.contains("ölçülmedi"),
+                "{case}"
+            );
+            assert_eq!(server.await.unwrap().len(), 1);
+        }
+    }
+    #[tokio::test]
+    async fn optional_wire_token_count_never_overrides_context_or_cost_authority() {
+        let (endpoint, server) = fixture(vec![response(json!({"content":"ok"}), "stop")]).await;
+        let root = canonical_tempdir();
+        let (app, _, mut settings) = fixture_app(root.path(), &endpoint);
+        let artifact = include_bytes!("../../../model-gateway/tests/fixtures/local-tokenizer.json");
+        let path = root.path().join("tokenizer.json");
+        fs::write(&path, artifact).unwrap();
+        settings.local_tokenizer = Some(
+            melissa_model_gateway::local_tokenizer::LocalTokenizerConfig {
+                path,
+                blake3: blake3::hash(artifact).to_hex().to_string(),
+            },
+        );
+        app.save_settings(&settings).unwrap();
+        let c = Conversation::new_in(None, &settings).unwrap();
+        let c = turn(
+            &app,
+            c,
+            "Merhaba",
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(|_| {}),
+        )
+        .await
+        .unwrap();
+        let context = c.last_context.as_ref().unwrap();
+        assert!(context.wire_tokens.is_some());
+        assert_eq!(context.provider_input_tokens, Some(100));
+        assert_eq!(context.reserved_output_tokens, settings.max_output_tokens);
+        assert_eq!(server.await.unwrap().len(), 1);
+        let mut rebound = c.clone();
+        settings.model = "other".into();
+        rebound.rebind(&settings).unwrap();
+        assert!(rebound.last_context.is_none());
+        settings.model = c.model.clone();
+        settings.context_tokens = 8192;
+        settings.max_output_tokens = 1024;
+        app.save_settings(&settings).unwrap();
+        let c = Conversation::new_in(None, &settings).unwrap();
+        let id = c.id.clone();
+        let result = turn(
+            &app,
+            c,
+            &"oversized ".repeat(4000),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(|_| {}),
+        )
+        .await;
+        assert!(matches!(result, Err(Error::Conflict(_))));
+        assert!(load(&app, &id).unwrap().pending.is_none());
+        settings.context_tokens = 1_000_000;
+        settings.rate_card.input_micro_usd_per_million = 1_000_000;
+        settings.rate_card.output_micro_usd_per_million = 1_000_000;
+        app.save_settings(&settings).unwrap();
+        let measured = context.wire_tokens.as_ref().unwrap().token_count;
+        assert!(measured + 100 < context.native_body_bytes);
+        let mut prefs = super::super::settings::read(&app).unwrap();
+        prefs.spending_micro_usd = Some(
+            settings
+                .rate_card
+                .upper_bound(measured + 100, settings.max_output_tokens)
+                .unwrap(),
+        );
+        super::super::settings::write(&app, &prefs).unwrap();
+        let result = turn(
+            &app,
+            Conversation::new_in(None, &settings).unwrap(),
+            "Merhaba",
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(|_| {}),
+        )
+        .await;
+        assert!(matches!(result, Err(Error::Denied(_))));
     }
     #[tokio::test]
     async fn compact_preserves_original_messages_and_followup_uses_summary() {
@@ -1117,7 +1293,7 @@ mod tests {
             response(json!({"content":"Devam edelim."}), "stop"),
         ])
         .await;
-        let root = tempfile::tempdir().unwrap();
+        let root = canonical_tempdir();
         let (app, _, settings) = fixture_app(root.path(), &endpoint);
         let mut c = Conversation::new_in(None, &settings).unwrap();
         c.save(&app).unwrap();
@@ -1165,7 +1341,7 @@ mod tests {
     #[tokio::test]
     async fn website_request_can_request_folder_without_creating_source_files() {
         let (endpoint, server) = fixture(vec![response(json!({"tool_calls":[{"index":0,"id":"folder1","type":"function","function":{"name":"request_workspace","arguments":"{\"reason\":\"Site dosyalarının oluşturulacağı klasörü seç.\"}"}}]}), "tool_calls")]).await;
-        let root = tempfile::tempdir().unwrap();
+        let root = canonical_tempdir();
         let (app, source, settings) = fixture_app(root.path(), &endpoint);
         let mut c = Conversation::new_in(None, &settings).unwrap();
         c.save(&app).unwrap();
@@ -1186,7 +1362,7 @@ mod tests {
     }
     #[test]
     fn model_switch_keeps_transcript_but_does_not_transfer_private_continuation() {
-        let root = tempfile::tempdir().unwrap();
+        let root = canonical_tempdir();
         let (_, source, mut settings) =
             fixture_app(root.path(), "http://127.0.0.1:1/v1/chat/completions");
         let mut c = Conversation::new(&source, &settings).unwrap();
@@ -1238,7 +1414,7 @@ mod tests {
             response(json!({"content":"Plan ready; nothing changed."}), "stop"),
         ])
         .await;
-        let root = tempfile::tempdir().unwrap();
+        let root = canonical_tempdir();
         let (app, source, settings) = fixture_app(root.path(), &endpoint);
         let mut c = Conversation::new(&source, &settings).unwrap();
         c.plan = true;
@@ -1267,7 +1443,7 @@ mod tests {
     #[tokio::test]
     async fn interrupted_model_call_is_durable_and_not_retried() {
         let (endpoint, server) = fixture(vec!["data: {\"id\":\"unfinished\"}\n\n".into()]).await;
-        let root = tempfile::tempdir().unwrap();
+        let root = canonical_tempdir();
         let (app, source, settings) = fixture_app(root.path(), &endpoint);
         let mut c = Conversation::new(&source, &settings).unwrap();
         c.save(&app).unwrap();
@@ -1300,7 +1476,7 @@ mod tests {
     }
     #[test]
     fn stale_or_busy_session_cannot_overwrite_newer_state() {
-        let root = tempfile::tempdir().unwrap();
+        let root = canonical_tempdir();
         let (app, source, settings) =
             fixture_app(root.path(), "http://127.0.0.1:1/v1/chat/completions");
         let mut first = Conversation::new(&source, &settings).unwrap();
@@ -1315,7 +1491,7 @@ mod tests {
     }
     #[tokio::test]
     async fn same_model_at_a_different_endpoint_cannot_receive_old_history() {
-        let root = tempfile::tempdir().unwrap();
+        let root = canonical_tempdir();
         let (app, source, mut settings) =
             fixture_app(root.path(), "http://127.0.0.1:1/v1/chat/completions");
         let mut c = Conversation::new(&source, &settings).unwrap();
@@ -1336,7 +1512,7 @@ mod tests {
     }
     #[test]
     fn attached_files_are_explicit_visible_and_decorators_are_plain_text() {
-        let root = tempfile::tempdir().unwrap();
+        let root = canonical_tempdir();
         let source = root.path().join("source");
         fs::create_dir(&source).unwrap();
         fs::write(source.join("my file.rs"), "fn main() {}").unwrap();
@@ -1356,7 +1532,7 @@ mod tests {
     }
     #[test]
     fn native_resume_does_not_double_charge_and_unknown_cost_stays_unknown() {
-        let root = tempfile::tempdir().unwrap();
+        let root = canonical_tempdir();
         let (app, source, settings) =
             fixture_app(root.path(), "http://127.0.0.1:1/v1/chat/completions");
         let mut c = Conversation::new(&source, &settings).unwrap();
@@ -1374,7 +1550,7 @@ mod tests {
     }
     #[test]
     fn plan_cannot_invoke_mutation_even_with_forged_tool() {
-        let root = tempfile::tempdir().unwrap();
+        let root = canonical_tempdir();
         let home = root.path().join("home");
         let source = root.path().join("source");
         fs::create_dir(&source).unwrap();

@@ -79,7 +79,7 @@ impl App {
                 .max()
         );
         value["metrics"]["host_measurement_scope"] = json!(
-            "CLI process lifetime peak, not task-only/worker RAM; transfer I/O is not physical disk I/O"
+            "CLI process lifetime peak can include launcher memory before exec; post-exec peak is separate where supported; not task-only/worker RAM; transfer I/O is not physical disk I/O"
         );
         Ok(value)
     }

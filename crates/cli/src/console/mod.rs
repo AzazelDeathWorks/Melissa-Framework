@@ -5,6 +5,7 @@ mod configure;
 mod execution;
 mod interactions;
 mod settings;
+mod status;
 mod transcript;
 mod ui;
 use crate::{
@@ -26,7 +27,7 @@ use std::{
 use tokio::sync::mpsc;
 use ui::Ui;
 
-const HELP: &str = "Bir şey sor veya yapmak istediğini yaz. Sohbet için proje seçmek gerekmez.\n\n/settings  Sağlayıcı, anahtar, model ve tercihler\n/model     Konuşmayı koruyarak model değiştir\n/plan      Plan modu (Shift+Tab ile normal moda dön)\n/apply     Konuşulan planı kapsam incelemesine al\n/new       Yeni konuşma; önceki kayıt korunur\n/resume    Tüm kayıtlı konuşmalar\n/project   Gerektiğinde klasör bağla veya oluştur\n/diff      Değişiklikleri incele\n/undo      Seçilen değişikliği geri al\n/search    Konuşmada ara (Ctrl+F, F3 sonraki)\n/compact   Geçmişi silmeden model bağlamını özetle\n/transcript  Konuşma ve araç ayrıntıları\n/queue     Bekleyen mesajları incele / taslağa geri al\n/exit      Güvenle çık\n\nPgUp/PgDn ve tekerlek geçmişi kaydırır. Ctrl+End sona döner.\nCtrl+O araç ayrıntılarını açar. Ctrl+R önceki mesajlarını gösterir.\nEnter gönderir; Alt+Enter veya Ctrl+J yeni satır ekler.\nYanıt gelirken Enter mesajı sıraya alır; kod çalışırken yeni talimat işe iletilir.\nCtrl+Q mesajı sonraki işe bırakır. Esc işi durdurur.\nTeknik otomasyon komutları: melissa --help-all";
+const HELP: &str = "Bir şey sor veya yapmak istediğini yaz. Sohbet için proje seçmek gerekmez.\n\n/settings  Sağlayıcı, anahtar, model ve tercihler\n/model     Konuşmayı koruyarak model değiştir\n/plan      Plan modu (Shift+Tab ile normal moda dön)\n/apply     Konuşulan planı kapsam incelemesine al\n/new       Yeni konuşma; önceki kayıt korunur\n/resume    Tüm kayıtlı konuşmalar\n/project   Gerektiğinde klasör bağla veya oluştur\n/diff      Değişiklikleri incele\n/undo      Seçilen değişikliği geri al\n/search    Konuşmada ara (Ctrl+F, F3 sonraki)\n/compact   Geçmişi silmeden model bağlamını özetle\n/status    Durum, bağlam sayımı ve CLI kaynakları (API çağırmaz)\n/transcript  Konuşma ve araç ayrıntıları\n/queue     Bekleyen mesajları incele / taslağa geri al\n/exit      Güvenle çık\n\nPgUp/PgDn ve tekerlek geçmişi kaydırır. Ctrl+End sona döner.\nCtrl+O araç ayrıntılarını açar. Ctrl+R önceki mesajlarını gösterir.\nEnter gönderir; Alt+Enter veya Ctrl+J yeni satır ekler.\nYanıt gelirken Enter mesajı sıraya alır; kod çalışırken yeni talimat işe iletilir.\nCtrl+Q mesajı sonraki işe bırakır. Esc işi durdurur.\nTeknik otomasyon komutları: melissa --help-all";
 
 enum Finished {
     Chat(Box<Conversation>),
@@ -402,6 +403,8 @@ pub async fn settings_dialog(home: &Path) -> Result {
     configure::menu(&mut ui, &app, None).await
 }
 pub async fn run(home: &Path, workspace: &Path) -> Result {
+    let resource_baseline = crate::process_measurement::sample();
+    let mut model_label = status::ModelLabel::default();
     let app = open_app(home)?;
     let mut ui = Ui::new()?;
     let mut workspace = suitable_project(&app, workspace).then(|| workspace.to_owned());
@@ -674,11 +677,7 @@ pub async fn run(home: &Path, workspace: &Path) -> Result {
             dirty = false;
             saved_at = Instant::now();
         }
-        let selected = app.settings().ok();
-        let model = selected
-            .as_ref()
-            .map(|s| s.model.as_str())
-            .unwrap_or("model seçilmedi");
+        let model = model_label.get(Instant::now(), || app.settings().ok().map(|s| s.model));
         let name = workspace
             .as_ref()
             .and_then(|p| p.file_name())
@@ -771,6 +770,20 @@ pub async fn run(home: &Path, workspace: &Path) -> Result {
                 {
                     input.insert_newline();
                 } else if k.code == KeyCode::Enter && !draft.trim().is_empty() {
+                    if draft.trim() == "/status" {
+                        let selected = app.settings().ok();
+                        let report = status::report(
+                            selected.as_ref(),
+                            conversation.as_ref(),
+                            job.is_some(),
+                            plan,
+                            queue.len(),
+                            &crate::process_measurement::Measurement::observe(&resource_baseline),
+                        );
+                        input = ui::editor();
+                        ui.view("Durum · bağlam ve kaynaklar", &report)?;
+                        continue;
+                    }
                     if job.is_some() {
                         if draft.trim() == "/exit" {
                             if let Some(active) = &job {
@@ -811,6 +824,9 @@ pub async fn run(home: &Path, workspace: &Path) -> Result {
                         text.split_once(char::is_whitespace).unwrap_or((&text, ""));
                     if command == "/exit" {
                         break;
+                    }
+                    if matches!(command, "/config" | "/settings" | "/model" | "/models") {
+                        model_label.invalidate();
                     }
                     let result: Result = async { match command {
                         "/help" => ui.print(HELP),
