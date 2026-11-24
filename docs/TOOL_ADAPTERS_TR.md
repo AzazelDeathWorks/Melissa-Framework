@@ -1,6 +1,14 @@
 # Araç ön kontrolü ve sonuç kayıtları
 
 CLI uzman araçları mevcut yetki, kaynak ve worker kontrollerini kullanır.
+Yazıcı uzmanlar mevcut UTF-8 dosyalarda varsayılan olarak `fs_replace` kullanır:
+önce güncel metni okur, sonra tekil `old_text`/`new_text` eşleşmesi gönderir.
+Eşleşme reddedilirse güncel kaynağa göre düzeltir; eski isteği körlemesine
+tekrarlamaz. Yeni dosya, taşıma/silme, yapısal ve binary işlemlerin mevcut
+araçları korunur; unified proposal + `fs_patch` uyumluluk yolu kaldırılmadı.
+Bu tercih yeni bir yetki değildir: salt-okunur uzman ve boş yazma kapsamı
+`fs_replace` dahil hiçbir mutation aracı kazanmaz.
+
 Her çağrıdan önce `TaskAdapter`, mevcut kaynak özetini ve kaynak görünürlük
 politikasını yakalar. Ortam parmak izi incelenmiş ayar, tarif ve yürütücü kimliğini
 bağlar; Docker veya başka bir servisin sağlıklı olduğu iddiası değildir.

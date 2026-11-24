@@ -15,6 +15,8 @@ use melissa_core_contracts::{catalog::safe_relative_path, validation::Validate};
 
 const MAX_EXECUTABLE_BYTES: u64 = 128 * 1024 * 1024;
 
+/// Identity evidence, not an immutable executable snapshot on Unix. The native
+/// broker remains Windows-only; Unix container clients use private verified copies.
 pub struct PinnedProcess {
     resolved: ResolvedProcess,
     _guards: Vec<File>,

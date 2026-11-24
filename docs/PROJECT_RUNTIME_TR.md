@@ -53,6 +53,23 @@ süreçte `RUSTUP_TOOLCHAIN` ile, uv Python seçimi `UV_PYTHON` ile uygulanır;
 iki projenin seçimi birbirini değiştirmez. Çalışma anında eksik bir sürüm veya
 araç sessizce başka sürümle değiştirilmez: `BLOCKED` kaydı oluşur.
 
+## Unix host istemcisinin güven sınırı
+
+Linux/macOS'ta native Windows AppContainer broker'ı kullanılamaz; sınırsız host
+süreç çalıştırmaya geri dönüş yoktur. Proje komutları Docker Linux worker'ında
+çalışır. Host'un seçtiği Docker istemcisi ve Compose eklentisi, açık kaynak dosya
+tanıtıcısından özel host dizinine kopyalanır; kopyanın BLAKE3 özeti doğrulanmadan
+çalıştırılmaz. Kurulu dosyanın sonradan değiştirilmesi çalıştırılan kopyayı
+değiştirmez. Hash ve kopyalama 256 MiB ile sınırlıdır. Kopyalar yazma izinsizdir
+(0500), geçici üst dizin yalnız host kullanıcısına açıktır (0700) ve worker'a
+bağlanmaz. İşlem bitince bu kopyalar silinir; kalıcı bir executable cache yoktur.
+
+Bu sınır görev kaynakları/worker içindir; aynı host kullanıcısı olarak çalışan
+kötü amaçlı bir süreçten koruma iddiası değildir. Interpreter ve paylaşılan
+kütüphaneler ayrıca sabitlenmez. İstemcinin taşınmaya uygun olmadığı veya geçici
+konumdan çalıştırmanın yasak olduğu sistemlerde işlem hata verir; doğrulanmamış
+kurulu dosyaya sessiz geri dönüş yapılmaz.
+
 ## Proje keşfi ve bağımlılıklar
 
 Kök ve görünür alt projelerde Cargo.toml/lock, package.json ve Node kilitleri,

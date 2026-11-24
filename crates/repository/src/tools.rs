@@ -172,7 +172,7 @@ const ROUTES: &[(&str, &str, &str)] = &[
     (
         "fs_replace",
         "fs.patch",
-        "Replace exact text in one existing file. old_text must match exactly once (copy it verbatim from a fresh read, with enough surrounding lines to be unique) unless replace_all is true. The host binds the edit to the file's current identity and applies it like fs_patch.",
+        "Replace exact text in one existing file. old_text must match exactly once (copy it verbatim from a fresh read, with enough surrounding lines to be unique) unless replace_all is true. In uniformly CRLF files, LF in both old_text and new_text is treated as CRLF, preserving complete line separators. The host binds the edit to the file's current identity and applies it like fs_patch.",
     ),
     (
         "fs_create",
@@ -247,19 +247,28 @@ fn occurrences(haystack: &[u8], needle: &[u8], step: usize) -> Vec<usize> {
     hits
 }
 /// Turns an exact text replacement into a byte patch bound to the current
-/// file version. LF-only text also matches a CRLF file.
+/// file version. Uniform CRLF is preserved in both match and replacement text.
 fn replacement_patch(
     root_identity: &str,
     version: FileVersion,
     bytes: &[u8],
     r: &ReplaceArg,
 ) -> crate::Result<PatchProposal> {
-    let crlf = |s: &str| s.replace("\r\n", "\n").replace('\n', "\r\n");
-    let mut old = r.old_text.as_bytes().to_vec();
-    let mut new = r.new_text.as_bytes().to_vec();
-    if old.is_empty() {
+    if r.old_text.is_empty() {
         return Err(Error::Invalid("old_text must not be empty"));
     }
+    let crlf = |s: &str| s.replace("\r\n", "\n").replace('\n', "\r\n");
+    let (mut old, mut new) = if crate::unified::source_eol(bytes).is_ok_and(|eol| eol == b"\r\n") {
+        (
+            crlf(&r.old_text).into_bytes(),
+            crlf(&r.new_text).into_bytes(),
+        )
+    } else {
+        (
+            r.old_text.as_bytes().to_vec(),
+            r.new_text.as_bytes().to_vec(),
+        )
+    };
     let mut hits = occurrences(bytes, &old, 1);
     if hits.is_empty() && r.old_text.contains('\n') && bytes.windows(2).any(|w| w == b"\r\n") {
         old = crlf(&r.old_text).into_bytes();
@@ -1162,5 +1171,52 @@ mod replacement_tests {
         assert_eq!((edits[0].start, edits[0].end), (0, 6));
         assert_eq!(edits[0].replacement, b"qq");
         assert_eq!((edits[1].start, edits[1].end), (11, 14));
+    }
+
+    #[test]
+    fn crlf_source_keeps_its_line_endings_for_exact_and_normalized_matches() {
+        let source = b"before\r\ntarget\r\nafter\r\n";
+        for (old, new, expected) in [
+            ("target", "first\nsecond", "first\r\nsecond"),
+            ("\ntarget", "\nfirst\nsecond", "\r\nfirst\r\nsecond"),
+            ("target\r\n", "first\nsecond\n", "first\r\nsecond\r\n"),
+            ("target\n", "first\nsecond\n", "first\r\nsecond\r\n"),
+            ("target", "first\r\nsecond", "first\r\nsecond"),
+            ("target", "", ""),
+        ] {
+            let p = patch(source, old, new, false).unwrap();
+            let edit = &p.files[0].edits[0];
+            assert_eq!(edit.replacement, expected.as_bytes(), "old={old:?}");
+            let mut after = source.to_vec();
+            after.splice(
+                edit.start as usize..edit.end as usize,
+                edit.replacement.clone(),
+            );
+            assert_eq!(crate::unified::source_eol(&after).unwrap(), b"\r\n");
+        }
+    }
+
+    #[test]
+    fn normalized_text_fragments_never_split_crlf_separators() {
+        let logical = "alpha\nbeta\ngamma\n";
+        let source = logical.replace('\n', "\r\n").into_bytes();
+        for start in 0..logical.len() {
+            for end in start + 1..=logical.len() {
+                let old = &logical[start..end];
+                let p = patch(&source, old, "\nupdated\n", true).unwrap();
+                let mut after = source.clone();
+                for edit in p.files[0].edits.iter().rev() {
+                    after.splice(
+                        edit.start as usize..edit.end as usize,
+                        edit.replacement.clone(),
+                    );
+                }
+                assert_eq!(
+                    crate::unified::source_eol(&after).unwrap(),
+                    b"\r\n",
+                    "old={old:?}"
+                );
+            }
+        }
     }
 }

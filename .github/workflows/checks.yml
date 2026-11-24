@@ -134,6 +134,8 @@ jobs:
         run: cargo +1.98.0 test --locked -p melissa-repository --lib --test closeout_contracts --test read_error_observations --test incremental_parse --test property_contracts --test sensitive_visibility --test syntax --test text_eol_contract --test repository_agent_loop --test archive_ancestors --test graph_facts
       - name: Store and vault
         run: cargo +1.98.0 test --locked -p melissa-core-contracts -p melissa-local-store -p melissa-code-quality --lib
+      - name: Verified host executable copies
+        run: cargo +1.98.0 test --locked -p melissa-container-executor -p melissa-execution-broker --lib
   secrets:
     runs-on: ubuntu-latest
     steps:
