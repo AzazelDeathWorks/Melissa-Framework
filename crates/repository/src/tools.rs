@@ -256,7 +256,11 @@ fn replacement_patch(
 ) -> crate::Result<PatchProposal> {
     let crlf = |s: &str| s.replace("\r\n", "\n").replace('\n', "\r\n");
     let mut old = r.old_text.as_bytes().to_vec();
-    let mut new = r.new_text.as_bytes().to_vec();
+    let mut new = if crate::unified::source_eol(bytes).is_ok_and(|eol| eol == b"\r\n") {
+        crlf(&r.new_text).into_bytes()
+    } else {
+        r.new_text.as_bytes().to_vec()
+    };
     if old.is_empty() {
         return Err(Error::Invalid("old_text must not be empty"));
     }
@@ -1162,5 +1166,27 @@ mod replacement_tests {
         assert_eq!((edits[0].start, edits[0].end), (0, 6));
         assert_eq!(edits[0].replacement, b"qq");
         assert_eq!((edits[1].start, edits[1].end), (11, 14));
+    }
+
+    #[test]
+    fn crlf_source_keeps_its_line_endings_for_exact_and_normalized_matches() {
+        let source = b"before\r\ntarget\r\nafter\r\n";
+        for (old, new, expected) in [
+            ("target", "first\nsecond", "first\r\nsecond"),
+            ("target\r\n", "first\nsecond\n", "first\r\nsecond\r\n"),
+            ("target\n", "first\nsecond\n", "first\r\nsecond\r\n"),
+            ("target", "first\r\nsecond", "first\r\nsecond"),
+            ("target", "", ""),
+        ] {
+            let p = patch(source, old, new, false).unwrap();
+            let edit = &p.files[0].edits[0];
+            assert_eq!(edit.replacement, expected.as_bytes(), "old={old:?}");
+            let mut after = source.to_vec();
+            after.splice(
+                edit.start as usize..edit.end as usize,
+                edit.replacement.clone(),
+            );
+            assert_eq!(crate::unified::source_eol(&after).unwrap(), b"\r\n");
+        }
     }
 }

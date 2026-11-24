@@ -179,7 +179,7 @@ fn text_line(bytes: &[u8]) -> (&[u8], bool) {
         (bytes, false)
     }
 }
-fn source_eol(before: &[u8]) -> Result<&'static [u8]> {
+pub(crate) fn source_eol(before: &[u8]) -> Result<&'static [u8]> {
     let mut eol: Option<&[u8]> = None;
     for line in before.split_inclusive(|b| *b == b'\n') {
         let (content, terminated) = text_line(line);
