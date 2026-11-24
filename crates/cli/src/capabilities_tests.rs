@@ -1166,7 +1166,14 @@ async fn replan_preserves_active_step_then_changes_pending_steps_without_budget_
         &bytes(&execution).unwrap(),
     )
     .unwrap();
-    let plan = crate::engine::plan(&task, &execution).unwrap();
+    let mut plan = crate::engine::plan(&task, &execution).unwrap();
+    let instructions = plan.nodes[0].literal_input["instructions"]
+        .as_str()
+        .unwrap();
+    let (legacy, _) = instructions
+        .split_once(" Read current source before editing;")
+        .unwrap();
+    plan.nodes[0].literal_input["instructions"] = json!(legacy);
     let source_digest = task.input_snapshot_digest.clone();
     let policy = execution.settings_digest.clone();
     let refresh: Refresh = Arc::new(move || {
@@ -1218,6 +1225,12 @@ async fn replan_preserves_active_step_then_changes_pending_steps_without_budget_
     invalid.agents[0].goal = "replace active work".into();
     assert!(app.replan(&task.task_id, invalid).is_err());
     let mut invalid = recipe.clone();
+    invalid.agents[0].write = false;
+    assert!(app.replan(&task.task_id, invalid).is_err());
+    let mut invalid = recipe.clone();
+    invalid.agents.remove(0);
+    assert!(app.replan(&task.task_id, invalid).is_err());
+    let mut invalid = recipe.clone();
     invalid.checks[0].expected = json!(999);
     assert!(app.replan(&task.task_id, invalid).is_err());
     recipe.agents[1].goal = "Revised remaining work".into();
@@ -1259,6 +1272,13 @@ async fn replan_preserves_active_step_then_changes_pending_steps_without_budget_
     let after = scheduler.state().unwrap();
     assert_eq!(after.plan.revision, 2);
     assert_eq!(after.plan.nodes.len(), 3);
+    assert_eq!(after.plan.nodes[0], before.plan.nodes[0]);
+    assert!(
+        after.plan.nodes[1].literal_input["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("prefer fs_replace")
+    );
     assert_eq!(after.slots["step-0"].phase, Phase::Candidate);
     assert_eq!(after.slots["step-1"].phase, Phase::Pending);
     assert_eq!(after.deadline_ms, before.deadline_ms);
