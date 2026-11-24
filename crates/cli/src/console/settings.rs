@@ -318,3 +318,131 @@ mod tests {
         assert!(endpoint("https://api.example.com/v1\n/path", P::OpenAiResponses).is_err());
     }
 }
+
+/// Starting points only: every field stays editable, and any other
+/// OpenAI- or Anthropic-compatible server is configured through "custom".
+pub(crate) struct Preset {
+    pub label: &'static str,
+    pub id: &'static str,
+    pub protocol: melissa_model_gateway::Protocol,
+    pub base: &'static str,
+    pub env: &'static str,
+}
+const fn preset(
+    label: &'static str,
+    id: &'static str,
+    protocol: melissa_model_gateway::Protocol,
+    base: &'static str,
+    env: &'static str,
+) -> Preset {
+    Preset {
+        label,
+        id,
+        protocol,
+        base,
+        env,
+    }
+}
+pub(crate) const PRESETS: &[Preset] = &[
+    preset(
+        "OpenAI",
+        "openai",
+        melissa_model_gateway::Protocol::OpenAiResponses,
+        "https://api.openai.com/v1",
+        "OPENAI_API_KEY",
+    ),
+    preset(
+        "Anthropic",
+        "anthropic",
+        melissa_model_gateway::Protocol::AnthropicMessages,
+        "https://api.anthropic.com/v1",
+        "ANTHROPIC_API_KEY",
+    ),
+    preset(
+        "Google Gemini",
+        "gemini",
+        melissa_model_gateway::Protocol::OpenAiChatCompletions,
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+        "GEMINI_API_KEY",
+    ),
+    preset(
+        "OpenRouter",
+        "openrouter",
+        melissa_model_gateway::Protocol::OpenAiChatCompletions,
+        "https://openrouter.ai/api/v1",
+        "OPENROUTER_API_KEY",
+    ),
+    preset(
+        "DeepSeek",
+        "deepseek",
+        melissa_model_gateway::Protocol::OpenAiChatCompletions,
+        "https://api.deepseek.com/v1",
+        "DEEPSEEK_API_KEY",
+    ),
+    preset(
+        "Groq",
+        "groq",
+        melissa_model_gateway::Protocol::OpenAiChatCompletions,
+        "https://api.groq.com/openai/v1",
+        "GROQ_API_KEY",
+    ),
+    preset(
+        "Mistral",
+        "mistral",
+        melissa_model_gateway::Protocol::OpenAiChatCompletions,
+        "https://api.mistral.ai/v1",
+        "MISTRAL_API_KEY",
+    ),
+    preset(
+        "xAI",
+        "xai",
+        melissa_model_gateway::Protocol::OpenAiChatCompletions,
+        "https://api.x.ai/v1",
+        "XAI_API_KEY",
+    ),
+    preset(
+        "Together AI",
+        "together",
+        melissa_model_gateway::Protocol::OpenAiChatCompletions,
+        "https://api.together.xyz/v1",
+        "TOGETHER_API_KEY",
+    ),
+    preset(
+        "Fireworks AI",
+        "fireworks",
+        melissa_model_gateway::Protocol::OpenAiChatCompletions,
+        "https://api.fireworks.ai/inference/v1",
+        "FIREWORKS_API_KEY",
+    ),
+    preset(
+        "Ollama (yerel)",
+        "ollama",
+        melissa_model_gateway::Protocol::OpenAiChatCompletions,
+        "http://127.0.0.1:11434/v1",
+        "",
+    ),
+    preset(
+        "LM Studio (yerel)",
+        "lmstudio",
+        melissa_model_gateway::Protocol::OpenAiChatCompletions,
+        "http://127.0.0.1:1234/v1",
+        "",
+    ),
+    preset(
+        "vLLM / llama.cpp (yerel)",
+        "vllm",
+        melissa_model_gateway::Protocol::OpenAiChatCompletions,
+        "http://127.0.0.1:8000/v1",
+        "",
+    ),
+];
+
+#[cfg(test)]
+mod preset_tests {
+    #[test]
+    fn every_preset_base_is_an_accepted_endpoint() {
+        for p in super::PRESETS {
+            super::endpoint(p.base, p.protocol).unwrap_or_else(|e| panic!("{}: {e:?}", p.id));
+        }
+    }
+}

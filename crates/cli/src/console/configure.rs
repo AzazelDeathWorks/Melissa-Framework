@@ -50,37 +50,57 @@ pub(crate) fn money(s: &str) -> Result<u64> {
         .ok_or(Error::Usage("Tutar çok büyük."))
 }
 pub(crate) async fn provider(ui: &mut Ui, app: &App, existing: Option<Settings>) -> Result {
+    let preset = if existing.is_some() {
+        None
+    } else {
+        let mut labels: Vec<String> = settings::PRESETS.iter().map(|p| p.label.into()).collect();
+        labels.push("Özel · OpenAI veya Anthropic uyumlu herhangi bir sunucu".into());
+        let Some(i) = ui.choose("Sağlayıcı · hazır ayar veya özel", &labels)? else {
+            return Ok(());
+        };
+        settings::PRESETS.get(i)
+    };
     let Some(name) = ui.input(
         "Sağlayıcı adı (harf, sayı, - veya _)",
         existing
             .as_ref()
             .map(|s| s.provider_id.as_str())
+            .or(preset.map(|p| p.id))
             .unwrap_or("custom"),
         false,
     )?
     else {
         return Ok(());
     };
-    let Some(protocol) = ui.choose(
-        "API uyumluluğu · sağlayıcının desteklediği protokol",
-        &[
-            "OpenAI uyumlu · Chat Completions".into(),
-            "OpenAI Responses".into(),
-            "Anthropic Messages".into(),
-        ],
-    )?
-    else {
-        return Ok(());
-    };
-    let protocol = match protocol {
-        0 => Protocol::OpenAiChatCompletions,
-        1 => Protocol::OpenAiResponses,
-        _ => Protocol::AnthropicMessages,
+    let protocol = match preset {
+        Some(p) => p.protocol,
+        None => {
+            let Some(protocol) = ui.choose(
+                "API uyumluluğu · sağlayıcının desteklediği protokol",
+                &[
+                    "OpenAI uyumlu · Chat Completions".into(),
+                    "OpenAI Responses".into(),
+                    "Anthropic Messages".into(),
+                ],
+            )?
+            else {
+                return Ok(());
+            };
+            match protocol {
+                0 => Protocol::OpenAiChatCompletions,
+                1 => Protocol::OpenAiResponses,
+                _ => Protocol::AnthropicMessages,
+            }
+        }
     };
     let Some(base) = ui.input_checked(
         "Base URL (API sunucu adresi)",
         "Örnek: https://api.example.com/v1\nBuraya API anahtarını yazma; anahtar sonraki adımda sorulacak.\nBase URL veya seçilen protokolün tam istek adresi kabul edilir.",
-        existing.as_ref().map(|s| s.endpoint.as_str()).unwrap_or(""),
+        existing
+            .as_ref()
+            .map(|s| s.endpoint.as_str())
+            .or(preset.map(|p| p.base))
+            .unwrap_or(""),
         false,
         |value| settings::endpoint(value, protocol).map(|_| ()),
     )?
@@ -117,7 +137,11 @@ pub(crate) async fn provider(ui: &mut Ui, app: &App, existing: Option<Settings>)
             settings::save_key(app, zeroize::Zeroizing::new(secret.trim().to_owned()))?
         }
         "Ortam değişkeni kullan" => {
-            let Some(s) = ui.input("Değişken adı", "MELISSA_API_KEY", false)? else {
+            let default = preset
+                .map(|p| p.env)
+                .filter(|e| !e.is_empty())
+                .unwrap_or("MELISSA_API_KEY");
+            let Some(s) = ui.input("Değişken adı", default, false)? else {
                 return Ok(());
             };
             Credential::Environment {

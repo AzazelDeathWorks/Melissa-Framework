@@ -1,10 +1,27 @@
-//! Windows share restrictions retain ancestors and targets through I/O.
+//! Windows share restrictions retain ancestors and targets through I/O; Unix
+//! walks every component with O_NOFOLLOW relative to held parents.
 //! Pathname prechecks alone are never used as the filesystem boundary.
 use crate::{Error, Result};
+#[cfg(windows)]
+use std::fs::OpenOptions;
+#[cfg(windows)]
+use std::path::Component;
 use std::{
-    fs::{File, OpenOptions},
-    path::{Component, Path, PathBuf},
+    fs::File,
+    path::{Path, PathBuf},
 };
+#[cfg(unix)]
+#[path = "paths_unix.rs"]
+mod unix;
+
+/// Canonical slash-separated repository path in host spelling.
+pub(crate) fn native(path: &str) -> std::borrow::Cow<'_, str> {
+    if cfg!(windows) {
+        path.replace('/', "\\").into()
+    } else {
+        path.into()
+    }
+}
 
 pub(crate) fn relative(path: &str) -> Result {
     if path.is_empty()
@@ -196,12 +213,9 @@ pub(crate) fn with_read_child<T>(
             _ancestors: vec![],
         })
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
-        let _ = (parent, dir, visit);
-        Err(Error::Unsupported(
-            "Windows handle-pinned filesystem required",
-        ))
+        visit(&mut unix::read_child(parent, name, dir)?)
     }
 }
 
@@ -299,20 +313,17 @@ pub(crate) fn create_directory(parent: &Pinned, name: &str) -> Result<Pinned> {
             _ancestors: vec![],
         })
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
-        let _ = parent;
-        Err(Error::Unsupported("Windows directory create required"))
+        unix::create_directory(parent, name)
     }
 }
 
 fn pin_mode(path: &Path, dir: bool, write: bool, delete: bool, host_root: bool) -> Result<Pinned> {
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
-        let _ = (path, dir, write, delete, host_root);
-        Err(Error::Unsupported(
-            "Windows handle-pinned filesystem required",
-        ))
+        let _ = delete;
+        unix::pin_mode(path, dir, write, host_root)
     }
     #[cfg(windows)]
     {
@@ -356,10 +367,9 @@ pub(crate) fn create_new(path: &Path) -> Result<Pinned> {
             _ancestors: vec![],
         })
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
-        let _ = path;
-        Err(Error::Unsupported("Windows create required"))
+        unix::create_new(path)
     }
 }
 
@@ -396,10 +406,9 @@ pub(crate) fn move_no_replace(source: &Pinned, destination: &Path) -> Result {
         }
         Ok(())
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
-        let _ = (source, destination);
-        Err(Error::Unsupported("Windows move required"))
+        unix::move_no_replace(source, destination)
     }
 }
 
@@ -425,9 +434,8 @@ pub(crate) fn delete(source: Pinned) -> Result {
         drop(source);
         Ok(())
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
-        let _ = source;
-        Err(Error::Unsupported("Windows delete required"))
+        unix::delete(source)
     }
 }

@@ -170,7 +170,7 @@ impl melissa_core_contracts::validation::Validate for MutationProposal {
 }
 
 fn path(repo: &Repository, p: &str) -> PathBuf {
-    repo.root_path().join(p.replace('/', "\\"))
+    repo.root_path().join(&*paths::native(p))
 }
 fn absent(parent: &paths::Pinned, target: &std::path::Path, limit: usize) -> Result {
     match fs::symlink_metadata(target) {

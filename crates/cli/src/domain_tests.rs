@@ -48,7 +48,7 @@ fn model_operations_cannot_choose_a_foreign_service_raw_sql_or_session_lifecycle
 }
 #[test]
 fn v2_program_has_disjoint_public_development_and_private_report_acceptance() {
-    let mut r:Recipe=serde_json::from_value(json!({"schema_version":"melissa.cli-recipe/v2","agents":[{"profile":"melissa.code.implementer","goal":"fix","write":true}],"writable_paths":["main.py"],"protected_paths":[],"language":"python","entry":"main.py","negative_workspace":"C:/negative","checks":[{"id":"secret-a","input":71,"expected":"PRIVATE_ANSWER_92041"},{"id":"secret-b","input":72,"expected":72}],"development_checks":[{"id":"public-a","input":1,"expected":1},{"id":"public-b","input":2,"expected":2}],"report_checks":[{"operator":"equals","pointer":"/finding","value":"PRIVATE_REPORT_802"}],"max_cost_micro_usd":5000000,"wall_time_ms":1800000})).unwrap();
+    let mut r:Recipe=serde_json::from_value(json!({"schema_version":"melissa.cli-recipe/v2","agents":[{"profile":"melissa.code.implementer","goal":"fix","write":true}],"writable_paths":["main.py"],"protected_paths":[],"language":"python","entry":"main.py","negative_workspace":if cfg!(windows) {"C:/negative"} else {"/negative"},"checks":[{"id":"secret-a","input":71,"expected":"PRIVATE_ANSWER_92041"},{"id":"secret-b","input":72,"expected":72}],"development_checks":[{"id":"public-a","input":1,"expected":1},{"id":"public-b","input":2,"expected":2}],"report_checks":[{"operator":"equals","pointer":"/finding","value":"PRIVATE_REPORT_802"}],"max_cost_micro_usd":5000000,"wall_time_ms":1800000})).unwrap();
     r.validate().unwrap();
     assert_ne!(
         r.development_suite().unwrap().digest(),

@@ -291,7 +291,7 @@ fn capture_metadata(
     let path = if rel.is_empty() {
         root.to_path_buf()
     } else {
-        root.join(rel.replace('/', "\\"))
+        root.join(&*crate::paths::native(rel))
     };
     let _guard = paths::pin(&path, true, false)?;
     for entry in fs::read_dir(path)? {

@@ -60,6 +60,7 @@ impl Paste {
         Some(event)
     }
 }
+#[cfg(windows)]
 pub(crate) fn clipboard() -> crate::Result<String> {
     use windows_sys::Win32::System::{
         DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard},
@@ -98,6 +99,47 @@ pub(crate) fn clipboard() -> crate::Result<String> {
         GlobalUnlock(data);
         Ok(value.replace("\r\n", "\n").replace('\r', "\n"))
     }
+}
+/// Unix clipboards are owned by the desktop session; read through its CLI.
+#[cfg(unix)]
+pub(crate) fn clipboard() -> crate::Result<String> {
+    use std::process::{Command, Stdio};
+    let candidates: &[&[&str]] = if cfg!(target_vendor = "apple") {
+        &[&["pbpaste"]]
+    } else if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        &[
+            &["wl-paste", "--no-newline"],
+            &["xclip", "-selection", "clipboard", "-o"],
+        ]
+    } else {
+        &[
+            &["xclip", "-selection", "clipboard", "-o"],
+            &["xsel", "--clipboard", "--output"],
+        ]
+    };
+    for argv in candidates {
+        let Ok(out) = Command::new(argv[0])
+            .args(&argv[1..])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        else {
+            continue;
+        };
+        if !out.status.success() {
+            continue;
+        }
+        if out.stdout.len() > 32 * 1024 * 1024 {
+            return Err(crate::Error::Unavailable(
+                "Pano metni geçersiz veya tek aktarım için çok büyük.",
+            ));
+        }
+        let value = String::from_utf8_lossy(&out.stdout).into_owned();
+        return Ok(value.replace("\r\n", "\n").replace('\r', "\n"));
+    }
+    Err(crate::Error::Unavailable(
+        "Pano okunamadı; pbpaste, wl-paste, xclip veya xsel gerekli.",
+    ))
 }
 #[cfg(test)]
 mod tests {

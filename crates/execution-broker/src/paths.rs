@@ -1,6 +1,8 @@
 //! Handle-pinned path resolution for one owned staged workspace.
+#[cfg(windows)]
+use std::fs::OpenOptions;
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Seek, SeekFrom},
     path::{Component, Path, PathBuf},
 };
@@ -22,18 +24,14 @@ impl PinnedProcess {
     pub fn resolve(spec: &ProcessSpec, workspace: &Path) -> BrokerResult<Self> {
         spec.validate()
             .map_err(|error| BrokerError::Invalid(error.to_string()))?;
-        #[cfg(not(windows))]
-        {
-            let _ = workspace;
-            return Err(BrokerError::Denied(
-                "native Windows resolver required".into(),
-            ));
-        }
-        #[cfg(windows)]
         {
             validate_absolute(workspace)?;
             validate_absolute(Path::new(&spec.executable))?;
             if spec.cwd != "." {
+                #[cfg(unix)]
+                if spec.cwd.contains('\\') {
+                    return Err(BrokerError::Invalid("cwd must be slash-separated".into()));
+                }
                 safe_relative_path(&spec.cwd.replace('\\', "/"))
                     .map_err(|error| BrokerError::Invalid(error.to_string()))?;
             }
@@ -43,7 +41,11 @@ impl PinnedProcess {
             let cwd = if spec.cwd == "." {
                 workspace.to_path_buf()
             } else {
-                workspace.join(spec.cwd.replace('/', "\\"))
+                workspace.join(if cfg!(windows) {
+                    spec.cwd.replace('/', "\\")
+                } else {
+                    spec.cwd.clone()
+                })
             };
             let (canonical_cwd, cwd_identity) = pin_directory_chain(&cwd, &mut guards)?;
             if !within(&canonical_cwd, &canonical_workspace) {
@@ -52,12 +54,21 @@ impl PinnedProcess {
                 ));
             }
             let executable = Path::new(&spec.executable);
-            if let Some(parent) = executable.parent() {
-                pin_directory_chain(parent, &mut guards)?;
-            }
-            let mut executable_file = open_pinned(executable, false)?;
-            let (canonical_executable, executable_identity, links) =
-                file_identity(&executable_file)?;
+            #[cfg(windows)]
+            let (mut executable_file, canonical_executable, executable_identity, links) = {
+                if let Some(parent) = executable.parent() {
+                    pin_directory_chain(parent, &mut guards)?;
+                }
+                let file = open_pinned(executable, false)?;
+                let (canonical, identity, links) = file_identity(&file)?;
+                (file, canonical, identity, links)
+            };
+            #[cfg(unix)]
+            let (mut executable_file, canonical_executable, executable_identity, links) = {
+                let (canonical, file) = open_pinned_unix(executable, &mut guards)?;
+                let (_, identity, links) = file_identity_unix(&file)?;
+                (file, canonical, identity, links)
+            };
             if links != 1 {
                 return Err(BrokerError::Denied(
                     "hard-linked executables require a separate verified staging copy".into(),
@@ -245,14 +256,12 @@ fn file_identity(file: &File) -> BrokerResult<(PathBuf, String, u32)> {
     Ok((canonical, identity, information.nNumberOfLinks))
 }
 
-#[cfg(windows)]
 fn unicode_path(path: &Path) -> BrokerResult<String> {
     path.to_str()
         .map(str::to_owned)
         .ok_or_else(|| BrokerError::Invalid("invalid Unicode target".into()))
 }
 
-#[cfg(windows)]
 fn hash_executable(file: &mut File) -> BrokerResult<String> {
     if file.metadata()?.len() > MAX_EXECUTABLE_BYTES {
         return Err(BrokerError::Denied(
@@ -282,4 +291,90 @@ fn hash_executable(file: &mut File) -> BrokerResult<String> {
 fn within(path: &Path, root: &Path) -> bool {
     PathBuf::from(path.to_string_lossy().to_lowercase())
         .starts_with(PathBuf::from(root.to_string_lossy().to_lowercase()))
+}
+
+/// Unix: the host-chosen spelling is resolved once, then every component of
+/// the canonical path is reopened relative to its held parent with
+/// O_NOFOLLOW, so a swapped link after resolution is denied, not followed.
+#[cfg(unix)]
+fn validate_absolute(path: &Path) -> BrokerResult<()> {
+    if !path.is_absolute() {
+        return Err(BrokerError::Invalid("absolute local path required".into()));
+    }
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                let text = name
+                    .to_str()
+                    .ok_or_else(|| BrokerError::Invalid("invalid Unicode path".into()))?;
+                if text.is_empty() || text.contains('\0') {
+                    return Err(BrokerError::Invalid("invalid path component".into()));
+                }
+            }
+            _ => return Err(BrokerError::Denied("path traversal is forbidden".into())),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn walk_unix(
+    path: &Path,
+    leaf_directory: bool,
+    guards: &mut Vec<File>,
+) -> BrokerResult<(PathBuf, File)> {
+    use rustix::fs::{Mode, OFlags, openat};
+    validate_absolute(path)?;
+    let canonical = fs::canonicalize(path)?;
+    validate_absolute(&canonical)?;
+    let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut current =
+        File::from(rustix::fs::open("/", dir_flags, Mode::empty()).map_err(std::io::Error::from)?);
+    let parts: Vec<_> = canonical.components().skip(1).collect();
+    for (i, component) in parts.iter().enumerate() {
+        let last = i + 1 == parts.len();
+        let flags = if last && !leaf_directory {
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK
+        } else {
+            dir_flags
+        };
+        let next = openat(&current, component.as_os_str(), flags, Mode::empty())
+            .map_err(|_| BrokerError::Denied("linked, missing or wrong-kind target".into()))?;
+        guards.push(std::mem::replace(&mut current, File::from(next)));
+    }
+    Ok((canonical, current))
+}
+
+#[cfg(unix)]
+fn pin_directory_chain(path: &Path, guards: &mut Vec<File>) -> BrokerResult<(PathBuf, String)> {
+    let (canonical, file) = walk_unix(path, true, guards)?;
+    let (_, identity, _) = file_identity_unix(&file)?;
+    guards.push(file);
+    Ok((canonical, identity))
+}
+
+#[cfg(unix)]
+fn open_pinned_unix(path: &Path, guards: &mut Vec<File>) -> BrokerResult<(PathBuf, File)> {
+    let (canonical, file) = walk_unix(path, false, guards)?;
+    if !file.metadata()?.is_file() {
+        return Err(BrokerError::Denied("reparse or wrong-kind target".into()));
+    }
+    Ok((canonical, file))
+}
+
+#[cfg(unix)]
+fn file_identity_unix(file: &File) -> BrokerResult<(PathBuf, String, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    Ok((
+        PathBuf::new(),
+        format!("dev:{:016x}/ino:{:016x}", metadata.dev(), metadata.ino()),
+        metadata.nlink() as u32,
+    ))
+}
+
+#[cfg(unix)]
+fn within(path: &Path, root: &Path) -> bool {
+    path.starts_with(root)
 }

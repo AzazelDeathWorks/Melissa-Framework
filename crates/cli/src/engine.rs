@@ -2305,7 +2305,7 @@ impl App {
                     | "sandbox_format_check" => {
                         Some((d.definition.name, melissa_recovery::FailureKind::BuildError))
                     }
-                    "fs_patch" => {
+                    "fs_patch" | "fs_replace" => {
                         Some((d.definition.name, melissa_recovery::FailureKind::StalePatch))
                     }
                     _ => None,
@@ -2732,6 +2732,7 @@ fn repo_wires(tools: &BTreeSet<String>) -> BTreeSet<String> {
         ("code_unified_propose", "code.patch_propose"),
         ("fs_absent", "fs.read"),
         ("fs_patch", "fs.patch"),
+        ("fs_replace", "fs.patch"),
         ("fs_create", "fs.patch"),
         ("fs_delete", "fs.patch"),
         ("fs_move", "fs.patch"),
@@ -2746,7 +2747,13 @@ fn project_repo_wires(tools: &BTreeSet<String>, writes: &BTreeSet<String>) -> BT
     if writes.is_empty() {
         // Empty scope means no mutation authority. A reviewed scope amendment
         // can enable these routes only when the dispatcher is rebuilt on resume.
-        for wire in ["fs_patch", "fs_create", "fs_delete", "fs_move"] {
+        for wire in [
+            "fs_patch",
+            "fs_replace",
+            "fs_create",
+            "fs_delete",
+            "fs_move",
+        ] {
             wires.remove(wire);
         }
     }
@@ -2808,6 +2815,14 @@ fn mirror_qa(root: &mut LocalStore, parent: &str, qa: &ProtectedQa) -> Result {
 
 #[cfg(test)]
 mod tests {
+    /// macOS temp dirs sit under the /var symlink, which the stores reject.
+    fn canonical_tempdir() -> tempfile::TempDir {
+        if cfg!(windows) {
+            // canonicalize yields a \\?\ verbatim path that the stores refuse.
+            return tempfile::tempdir().unwrap();
+        }
+        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap()
+    }
     use super::*;
     #[test]
     fn empty_project_scope_never_exposes_mutation_routes() {
@@ -2859,7 +2874,7 @@ mod tests {
             .filter(|p| p.id.starts_with("melissa.code."))
         {
             let writer = profile.tool_ids.iter().any(|t| t == "fs.patch");
-            let temp = tempfile::tempdir().unwrap();
+            let temp = canonical_tempdir();
             let source = temp.path().join("source");
             fs::create_dir(&source).unwrap();
             fs::write(source.join("main.py"), b"print('old')\r\n").unwrap();
@@ -3004,7 +3019,7 @@ mod tests {
 
     #[test]
     fn long_recipe_constructs_the_real_gateway_with_a_separate_request_timeout() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = canonical_tempdir();
         let mut s: Settings = serde_json::from_slice(include_bytes!(
             "../../../examples/cli/settings.template.json"
         ))
@@ -3043,7 +3058,7 @@ mod tests {
     }
     #[test]
     fn immutable_qa_child_binds_new_source_and_evidence_mirroring_is_idempotent() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = canonical_tempdir();
         let source = temp.path().join("source");
         fs::create_dir(&source).unwrap();
         fs::write(source.join("main.py"), b"print(0)\n").unwrap();
@@ -3201,7 +3216,7 @@ mod tests {
     }
     fn adaptive_test_for(language: melissa_code_quality::protected::Language) -> AdaptiveTest {
         use melissa_code_quality::protected::Language;
-        let temp = tempfile::tempdir().unwrap();
+        let temp = canonical_tempdir();
         let source = temp.path().join("source");
         fs::create_dir(&source).unwrap();
         let (entry, writable) = match language {

@@ -57,9 +57,60 @@ fn identity(pid: u32) -> Result<ProcessIdentity> {
         })
     }
 }
-#[cfg(not(windows))]
+/// Linux: /proc start time in clock ticks since boot; zombies are not alive.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn identity(pid: u32) -> Result<ProcessIdentity> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map_err(|_| Error::Unavailable("Çalıştırıcı süreci bulunamadı."))?;
+    let rest = stat
+        .rsplit_once(')')
+        .map(|(_, r)| r)
+        .ok_or(Error::Unavailable("Süreç kimliği okunamadı."))?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    if matches!(fields.first(), Some(&"Z") | Some(&"X") | None) {
+        return Err(Error::Unavailable("Çalıştırıcı süreci sonlanmış."));
+    }
+    let created = fields
+        .get(19)
+        .and_then(|v| v.parse().ok())
+        .ok_or(Error::Unavailable("Süreç kimliği okunamadı."))?;
+    Ok(ProcessIdentity { pid, created })
+}
+#[cfg(target_os = "macos")]
+fn identity(pid: u32) -> Result<ProcessIdentity> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    // SAFETY: the buffer is a properly sized, writable proc_bsdinfo.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if n != size {
+        return Err(Error::Unavailable("Çalıştırıcı süreci bulunamadı."));
+    }
+    if info.pbi_status == libc::SZOMB {
+        return Err(Error::Unavailable("Çalıştırıcı süreci sonlanmış."));
+    }
+    Ok(ProcessIdentity {
+        pid,
+        created: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
+    })
+}
+#[cfg(not(any(
+    windows,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos"
+)))]
 fn identity(_: u32) -> Result<ProcessIdentity> {
-    Err(Error::Unavailable("Bu yürütücü Windows gerektirir."))
+    Err(Error::Unavailable(
+        "Bu platformda süreç kimliği desteklenmiyor.",
+    ))
 }
 impl ProcessIdentity {
     pub fn current() -> Result<Self> {

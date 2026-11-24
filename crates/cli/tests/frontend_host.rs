@@ -1,4 +1,3 @@
-#![cfg(windows)]
 use melissa_cli::{
     app::App,
     frontend::{Action, Host, Request, Response, pipe::Client},

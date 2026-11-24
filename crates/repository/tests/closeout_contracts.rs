@@ -1,4 +1,3 @@
-#![cfg(windows)]
 mod support;
 use melissa_model_gateway::{
     ToolCall,
@@ -415,13 +414,7 @@ async fn large_file_and_artifact_pages_reassemble_exactly_and_reject_stale_or_fo
         let r=call(&mut d,"fs_artifact_page",json!({"artifact_id":meta["artifact_id"],"digest":meta["digest"],"offset":offset,"max_bytes":32768}),&format!("page{count}")).await.unwrap();
         let v: Value = serde_json::from_str(&r.content).unwrap();
         let page = &v["result"];
-        reconstructed.extend(
-            page["bytes"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_u64().unwrap() as u8),
-        );
+        reconstructed.extend(page_bytes(&page));
         count += 1;
         if page["complete"] == true {
             break;
@@ -429,7 +422,7 @@ async fn large_file_and_artifact_pages_reassemble_exactly_and_reject_stale_or_fo
         offset = page["next_offset"].as_u64().unwrap();
     }
     let whole: Value = serde_json::from_slice(&reconstructed).unwrap();
-    let got: Vec<u8> = serde_json::from_value(whole["result"]["bytes"].clone()).unwrap();
+    let got = page_bytes(&whole["result"]);
     assert_eq!(got, bytes);
     let r = call(
         &mut d,
@@ -440,7 +433,7 @@ async fn large_file_and_artifact_pages_reassemble_exactly_and_reject_stale_or_fo
     .await
     .unwrap();
     let v: Value = serde_json::from_str(&r.content).unwrap();
-    assert_eq!(v["result"]["bytes"], json!(&bytes[42..554]));
+    assert_eq!(page_bytes(&v["result"]), bytes[42..554]);
     assert!(call(&mut d,"fs_artifact_page",json!({"artifact_id":"other-task:artifact","digest":meta["digest"],"offset":0,"max_bytes":1}),"foreign").await.is_err());
     let mut stale = version;
     stale.digest = "blake3:0000000000000000000000000000000000000000000000000000000000000000".into();
@@ -498,5 +491,12 @@ async fn directory_discovery_unified_and_polyglot_are_real_model_callable_routes
         ),
     ] {
         assert!(call(&mut d, name, args, name).await.unwrap().success);
+    }
+}
+
+fn page_bytes(page: &Value) -> Vec<u8> {
+    match page["text"].as_str() {
+        Some(text) => text.as_bytes().to_vec(),
+        None => serde_json::from_value(page["bytes"].clone()).unwrap(),
     }
 }

@@ -79,7 +79,7 @@ impl Transcript {
             "memory_recall" => "Proje belleği",
             "conversation_history" => "Önceki konuşma",
             "fs_create" => "Dosya oluşturma",
-            "fs_patch" => "Dosya düzenleme",
+            "fs_patch" | "fs_replace" => "Dosya düzenleme",
             "fs_move" => "Dosya taşıma",
             "fs_delete" => "Dosya silme",
             "fs_mkdir" => "Klasör oluşturma",

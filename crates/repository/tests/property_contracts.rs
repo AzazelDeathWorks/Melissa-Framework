@@ -1,4 +1,3 @@
-#![cfg(windows)]
 mod support;
 use melissa_repository::{
     PatchBroker,

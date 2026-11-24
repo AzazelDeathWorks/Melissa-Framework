@@ -7,6 +7,7 @@ use std::{collections::BTreeMap, fmt, sync::atomic::AtomicBool};
 mod archive;
 pub mod recovery;
 mod runtime;
+pub use runtime::docker_host;
 
 pub const EXECUTION_CONTRACT: &str = "linux.docker.readonly-tmpfs/v1";
 const MAX_CAPTURE: u64 = 64 * 1024 * 1024;

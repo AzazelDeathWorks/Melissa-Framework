@@ -78,7 +78,6 @@ pub async fn run(
     input: &mut impl BufRead,
     output: &mut impl Write,
 ) -> Result {
-    #[cfg(windows)]
     if std::io::IsTerminal::is_terminal(&std::io::stdin())
         && std::io::IsTerminal::is_terminal(&std::io::stdout())
     {

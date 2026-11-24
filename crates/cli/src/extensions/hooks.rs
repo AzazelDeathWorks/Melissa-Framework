@@ -309,7 +309,7 @@ impl melissa_model_gateway::tools::ToolDispatcher for Dispatcher {
                         .is_ok_and(|c| c["mutation_applied"] == true)
             }) && matches!(
                 c.name.as_str(),
-                "fs_patch" | "fs_create" | "fs_delete" | "fs_move"
+                "fs_patch" | "fs_replace" | "fs_create" | "fs_delete" | "fs_move"
             );
             let result_context = json!({"request":context,"tool_returned":outcome.is_ok(),"mutation_applied":mutated,"success":outcome.as_ref().is_ok_and(|v|v.success)});
             let after = self
