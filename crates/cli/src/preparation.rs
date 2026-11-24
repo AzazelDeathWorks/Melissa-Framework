@@ -299,7 +299,7 @@ impl App {
         let mut plan = crate::engine::plan(&t.contract, &revised)?;
         plan.revision = old.plan.revision.checked_add(1).ok_or(Error::Store)?;
         plan.parent_digest = Some(old.plan.digest().map_err(|_| Error::Store)?);
-        keep_started_instructions(&old, &mut plan);
+        keep_admitted_instructions(&old, &mut plan);
         plan.validate(&t.contract, &crate::resources::catalog()?)
             .map_err(|_| Error::Denied("Yeni plan görev yetkisi dışında."))?;
         preserve_started(&old, &plan)?;
@@ -325,19 +325,33 @@ impl App {
     }
 }
 
-fn keep_started_instructions(
+fn keep_admitted_instructions(
     old: &melissa_workflow::scheduler::State,
     plan: &mut melissa_workflow::plan::Plan,
 ) {
-    for previous in &old.plan.nodes {
-        if matches!(
-            old.slots[&previous.id].phase,
-            melissa_workflow::scheduler::Phase::Candidate
-                | melissa_workflow::scheduler::Phase::Leased
-        ) {
-            if let Some(node) = plan.nodes.iter_mut().find(|n| n.id == previous.id) {
-                node.literal_input["instructions"] = previous.literal_input["instructions"].clone();
-            }
+    for node in &mut plan.nodes {
+        let previous = if let Some(ledger) = &old.adaptive {
+            ledger.templates.values().find(|template| {
+                let mut input = node.literal_input.clone();
+                input["instructions"] = template.literal_input["instructions"].clone();
+                template.profile == node.profile && template.literal_input == input
+            })
+        } else if old.slots.get(&node.id).is_some_and(|slot| {
+            matches!(
+                slot.phase,
+                melissa_workflow::scheduler::Phase::Candidate
+                    | melissa_workflow::scheduler::Phase::Leased
+            )
+        }) {
+            old.plan
+                .nodes
+                .iter()
+                .find(|previous| previous.id == node.id)
+        } else {
+            None
+        };
+        if let Some(previous) = previous {
+            node.literal_input["instructions"] = previous.literal_input["instructions"].clone();
         }
     }
 }
@@ -370,6 +384,107 @@ mod replan_tests {
     };
 
     #[test]
+    fn legacy_adaptive_templates_admit_revised_and_additional_pending_steps() {
+        use melissa_core_contracts::{TaskState, wire::TaskContractV1};
+        use melissa_local_store::{LocalStore, StoreKey};
+        use melissa_workflow::scheduler::{Freshness, Scheduler};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut task: TaskContractV1 = serde_json::from_slice(include_bytes!(
+            "../../../tests/fixtures/code01/wire/task-contract-v1.json"
+        ))
+        .unwrap();
+        task.selected_profile_ids = vec![
+            "melissa.code.implementer".into(),
+            "melissa.code.test-engineer".into(),
+            "melissa.code.reviewer".into(),
+        ];
+        task.allowed_effects = vec!["workspace.read".into()];
+        let recipe = serde_json::from_value(json!({"schema_version":"melissa.cli-recipe/v1",
+            "agents":task.selected_profile_ids.iter().map(|profile| json!({"profile":profile,"goal":"inspect","write":false})).collect::<Vec<_>>(),
+            "writable_paths":[],"protected_paths":[],"language":"python","entry":"main.py",
+            "negative_workspace":root.join("negative"),"checks":[{"id":"one","input":1,"expected":1},{"id":"two","input":2,"expected":2}],
+            "max_cost_micro_usd":1000000,"wall_time_ms":60000})).unwrap();
+        let mut execution = crate::recipe::Execution {
+            recipe,
+            settings_digest: digest(b"policy"),
+            expires_at_ms: crate::app::now().unwrap() + 60000,
+            negative_files: Default::default(),
+            runtime_digest: None,
+        };
+        let mut plan = crate::engine::plan(&task, &execution).unwrap();
+        for node in &mut plan.nodes {
+            node.literal_input["instructions"] = json!(format!("legacy {}", node.profile));
+        }
+        let fresh = Freshness {
+            workspace_digest: plan.workspace_digest.clone(),
+            policy_digest: plan.policy_digest.clone(),
+        };
+        let mut store = LocalStore::open(
+            &root.join("state"),
+            StoreKey::from_bytes([82; 32]),
+            Default::default(),
+        )
+        .unwrap();
+        store.journal_mut().create_task(&task).unwrap();
+        for state in [
+            TaskState::Planned,
+            TaskState::Queued,
+            TaskState::Leased,
+            TaskState::Running,
+        ] {
+            let version = store.journal().task(&task.task_id).unwrap().record.version;
+            store
+                .transition_task(&task.task_id, version, state, None)
+                .unwrap();
+        }
+        let catalog = crate::resources::catalog().unwrap();
+        let mut scheduler = Scheduler::create(
+            store,
+            plan,
+            &catalog,
+            Arc::new(move || Ok(fresh.clone())),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let old = scheduler.state().unwrap();
+        let budget = scheduler
+            .store()
+            .journal()
+            .model_budget(&task.task_id)
+            .unwrap();
+        execution.recipe.agents[1].goal = "revised checks".into();
+        execution
+            .recipe
+            .agents
+            .insert(2, execution.recipe.agents[1].clone());
+        let mut revised = crate::engine::plan(&task, &execution).unwrap();
+        revised.revision = old.plan.revision + 1;
+        revised.parent_digest = Some(old.plan.digest().unwrap());
+        assert!(scheduler.revise(revised.clone(), &catalog).is_err());
+        let mut invalid = revised.clone();
+        invalid.nodes[1].literal_input["protected_paths"] = json!(["changed"]);
+        keep_admitted_instructions(&old, &mut invalid);
+        assert!(scheduler.revise(invalid, &catalog).is_err());
+        keep_admitted_instructions(&old, &mut revised);
+        let after = scheduler.revise(revised, &catalog).unwrap();
+        assert_eq!(after.plan.nodes.len(), 4);
+        assert_eq!(after.deadline_ms, old.deadline_ms);
+        assert_eq!(
+            after.adaptive.unwrap().templates,
+            old.adaptive.unwrap().templates
+        );
+        assert_eq!(
+            scheduler
+                .store()
+                .journal()
+                .model_budget(&task.task_id)
+                .unwrap(),
+            budget
+        );
+    }
+
+    #[test]
     fn legacy_started_instructions_are_frozen_without_hiding_node_changes() {
         let node = json!({"id":"step-0","profile":"implementer","goal":"original",
             "after":[],"bindings":[],"literal_input":{"instructions":"legacy"},
@@ -396,7 +511,7 @@ mod replan_tests {
                 node.literal_input["instructions"] = json!("new compiler guidance");
             }
             revised.nodes[1].goal = "revised pending work".into();
-            keep_started_instructions(&old, &mut revised);
+            keep_admitted_instructions(&old, &mut revised);
             preserve_started(&old, &revised).unwrap();
             assert_eq!(revised.nodes[0], old.plan.nodes[0]);
             assert_eq!(
@@ -412,11 +527,11 @@ mod replan_tests {
                     _ => continue,
                 };
                 let mut changed: Plan = serde_json::from_value(changed).unwrap();
-                keep_started_instructions(&old, &mut changed);
+                keep_admitted_instructions(&old, &mut changed);
                 assert!(preserve_started(&old, &changed).is_err(), "{field}");
             }
             revised.nodes.remove(0);
-            keep_started_instructions(&old, &mut revised);
+            keep_admitted_instructions(&old, &mut revised);
             assert!(preserve_started(&old, &revised).is_err());
         }
     }
